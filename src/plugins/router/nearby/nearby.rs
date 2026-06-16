@@ -1,4 +1,4 @@
-// Tencent is pleased to support the open source community by making Polaris available.
+// Tencent is pleased to support the open source community by making Pole available.
 //
 // Copyright (C) 2019 THL A29 Limited, a Tencent company. All rights reserved.
 //
@@ -19,7 +19,7 @@ use std::collections::HashMap;
 use crate::core::{
     config::consumer::ServiceRouterPluginConfig,
     model::{
-        error::{ErrorCode, PolarisError},
+        error::{ErrorCode, PoleError},
         naming::{Instance, Location, ServiceInstances},
         router::{RouteResult, RouteState, DEFAULT_ROUTER_NEARBY},
     },
@@ -134,33 +134,20 @@ impl NearbyRouter {
         let mut total_weight: u64 = 0;
         let mut health_ins_cnt = 0 as u32;
         for (_, ins) in instances.instances.iter().enumerate() {
+            let matched = match match_level {
+                "campus" => local_loc.campus == "" || ins.location.campus == local_loc.campus,
+                "zone" => local_loc.zone == "" || ins.location.zone == local_loc.zone,
+                "region" => local_loc.region == "" || ins.location.region == local_loc.region,
+                _ => true,
+            };
+            if !matched {
+                continue;
+            }
             if ins.health {
                 health_ins_cnt += 1;
             }
-            match match_level {
-                "campus" => {
-                    if local_loc.campus == "" || ins.location.campus == local_loc.campus {
-                        total_weight += ins.weight as u64;
-                        ret.push(ins.clone());
-                    }
-                }
-                "zone" => {
-                    if local_loc.zone == "" || ins.location.zone == local_loc.zone {
-                        total_weight += ins.weight as u64;
-                        ret.push(ins.clone());
-                    }
-                }
-                "region" => {
-                    if local_loc.region == "" || ins.location.region == local_loc.region {
-                        total_weight += ins.weight as u64;
-                        ret.push(ins.clone());
-                    }
-                }
-                _ => {
-                    total_weight += ins.weight as u64;
-                    ret.push(ins.clone());
-                }
-            }
+            total_weight += ins.weight as u64;
+            ret.push(ins.clone());
         }
 
         (
@@ -172,48 +159,47 @@ impl NearbyRouter {
             health_ins_cnt,
         )
     }
-}
 
-impl Plugin for NearbyRouter {
-    fn init(&mut self) {}
-
-    fn destroy(&self) {}
-
-    fn name(&self) -> String {
-        DEFAULT_ROUTER_NEARBY.to_string()
-    }
-}
-
-#[async_trait::async_trait]
-impl ServiceRouter for NearbyRouter {
-    /// choose_instances 实例路由
-    async fn choose_instances(
+    fn should_degrade(
         &self,
-        route_info: RouteContext,
+        match_level: &str,
+        instances: &ServiceInstances,
+        health_cnt: u32,
+    ) -> bool {
+        if !self.enable_degrade_unhealthy_percent || match_level == DEFAULT_NEARBY_MAX_MATCH_LEVEL {
+            return false;
+        }
+        if instances.instances.is_empty() {
+            return true;
+        }
+        let unhealthy_cnt = instances.instances.len() as u32 - health_cnt;
+        let unhealthy_percent = unhealthy_cnt * 100 / instances.instances.len() as u32;
+        unhealthy_percent >= self.unhealthy_percent_to_degrade as u32
+    }
+
+    fn choose_instances_with_location(
+        &self,
+        location: Location,
         instances: ServiceInstances,
-    ) -> Result<RouteResult, PolarisError> {
+    ) -> Result<RouteResult, PoleError> {
         let mut min_available_level = self.match_level.clone();
         if min_available_level.is_empty() {
             min_available_level = DEFAULT_NEARBY_MATCH_LEVEL.to_string();
         }
-        let mut max_match_level = self.max_match_level.clone();
+        let mut max_match_level = if self.strict_nearby {
+            min_available_level.clone()
+        } else {
+            self.max_match_level.clone()
+        };
         if max_match_level.is_empty() {
             max_match_level = DEFAULT_NEARBY_MAX_MATCH_LEVEL.to_string();
         }
-
-        let locatin_provider = route_info
-            .extensions
-            .clone()
-            .unwrap()
-            .get_location_provider();
-
-        let location = locatin_provider.get_location();
 
         if grater_match_level(min_available_level.as_str(), max_match_level.as_str()) {
             let (ret_ins, _health_cnt) =
                 self.select_instances(location.clone(), min_available_level.as_str(), &instances);
             if ret_ins.instances.is_empty() {
-                return Err(PolarisError::new(ErrorCode::LocationMismatch, format!("")));
+                return Err(PoleError::new(ErrorCode::LocationMismatch, format!("")));
             }
             return Ok(RouteResult {
                 instances: ret_ins,
@@ -234,39 +220,60 @@ impl ServiceRouter for NearbyRouter {
             let (tmp_ins, health_cnt) =
                 self.select_instances(location.clone(), cur_match_level, &instances);
             cur_level = cur_match_level.to_string().clone();
-            if !tmp_ins.instances.is_empty() {
-                ret_ins = Some(tmp_ins);
-            } else {
-                min_available_level = cur_match_level.to_string().clone();
+            if tmp_ins.instances.is_empty() {
+                continue;
+            }
+            let should_degrade = self.should_degrade(cur_match_level, &tmp_ins, health_cnt);
+            ret_ins = Some(tmp_ins);
+            if !should_degrade {
+                break;
             }
         }
 
         if ret_ins.is_none() {
-            return Err(PolarisError::new(
+            return Err(PoleError::new(
                 ErrorCode::LocationMismatch,
                 format!("can not find any instance by level {}", cur_level),
             ));
         }
 
-        // if !self.enable_degrade_unhealthy_percent
-        //     || cur_level == DEFAULT_NEARBY_MAX_MATCH_LEVEL.to_string()
-        // {
-        //     return Ok(RouteResult {
-        //         instances: ret_ins.unwrap(),
-        //         state: RouteState::Next,
-        //     });
-        // }
-
-        //TODO 需要做健康降级检查判断
-
-        return Ok(RouteResult {
+        Ok(RouteResult {
             instances: ret_ins.unwrap(),
             state: RouteState::Next,
-        });
+        })
+    }
+}
+
+impl Plugin for NearbyRouter {
+    fn init(&mut self) {}
+
+    fn destroy(&self) {}
+
+    fn name(&self) -> String {
+        DEFAULT_ROUTER_NEARBY.to_string()
+    }
+}
+
+#[async_trait::async_trait]
+impl ServiceRouter for NearbyRouter {
+    /// choose_instances 实例路由
+    async fn choose_instances(
+        &self,
+        route_info: RouteContext,
+        instances: ServiceInstances,
+    ) -> Result<RouteResult, PoleError> {
+        let locatin_provider = route_info
+            .extensions
+            .clone()
+            .unwrap()
+            .get_location_provider();
+
+        let location = locatin_provider.get_location();
+        self.choose_instances_with_location(location, instances)
     }
 
     /// enable 是否启用
-    async fn enable(&self, route_info: RouteContext, instances: ServiceInstances) -> bool {
+    async fn enable(&self, _route_info: RouteContext, instances: ServiceInstances) -> bool {
         let svc_info = instances.service.clone();
         let meta_val = svc_info.metadata.get(KEY_METADATA_NEARBY);
         if meta_val.is_none() {
@@ -280,4 +287,108 @@ fn grater_match_level(a: &str, b: &str) -> bool {
     let a_level = MATCH_LEVEL.get(a).unwrap();
     let b_level = MATCH_LEVEL.get(b).unwrap();
     a_level > b_level
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::model::naming::ServiceInfo;
+
+    fn router(enable_degrade: bool, strict_nearby: bool) -> NearbyRouter {
+        NearbyRouter {
+            strict_nearby,
+            match_level: "zone".to_string(),
+            max_match_level: "all".to_string(),
+            enable_degrade_unhealthy_percent: enable_degrade,
+            unhealthy_percent_to_degrade: 100,
+        }
+    }
+
+    fn location(region: &str, zone: &str, campus: &str) -> Location {
+        Location {
+            region: region.to_string(),
+            zone: zone.to_string(),
+            campus: campus.to_string(),
+        }
+    }
+
+    fn instance(id: &str, region: &str, zone: &str, healthy: bool) -> Instance {
+        Instance {
+            id: id.to_string(),
+            namespace: "default".to_string(),
+            service: "svc-a".to_string(),
+            health: healthy,
+            weight: 100,
+            location: location(region, zone, ""),
+            ..Instance::default()
+        }
+    }
+
+    fn service_instances(instances: Vec<Instance>) -> ServiceInstances {
+        ServiceInstances::new(
+            ServiceInfo {
+                namespace: "default".to_string(),
+                name: "svc-a".to_string(),
+                ..ServiceInfo::default()
+            },
+            instances,
+        )
+    }
+
+    fn selected_ids(result: RouteResult) -> Vec<String> {
+        result
+            .instances
+            .instances
+            .into_iter()
+            .map(|ins| ins.id)
+            .collect()
+    }
+
+    #[test]
+    fn nearby_router_keeps_zone_when_healthy_instances_are_available() {
+        let result = router(true, false)
+            .choose_instances_with_location(
+                location("r1", "z1", ""),
+                service_instances(vec![
+                    instance("zone-healthy", "r1", "z1", true),
+                    instance("region-healthy", "r1", "z2", true),
+                ]),
+            )
+            .expect("zone should match");
+
+        assert_eq!(selected_ids(result), vec!["zone-healthy"]);
+    }
+
+    #[test]
+    fn nearby_router_degrades_when_selected_level_is_fully_unhealthy() {
+        let result = router(true, false)
+            .choose_instances_with_location(
+                location("r1", "z1", ""),
+                service_instances(vec![
+                    instance("zone-unhealthy", "r1", "z1", false),
+                    instance("region-healthy", "r1", "z2", true),
+                ]),
+            )
+            .expect("region should match after zone degradation");
+
+        assert_eq!(
+            selected_ids(result),
+            vec!["zone-unhealthy", "region-healthy"]
+        );
+    }
+
+    #[test]
+    fn strict_nearby_router_does_not_degrade_to_wider_level() {
+        let result = router(true, true)
+            .choose_instances_with_location(
+                location("r1", "z1", ""),
+                service_instances(vec![
+                    instance("zone-unhealthy", "r1", "z1", false),
+                    instance("region-healthy", "r1", "z2", true),
+                ]),
+            )
+            .expect("strict nearby should still return nearest level");
+
+        assert_eq!(selected_ids(result), vec!["zone-unhealthy"]);
+    }
 }

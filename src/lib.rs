@@ -1,4 +1,4 @@
-// Tencent is pleased to support the open source community by making Polaris available.
+// Tencent is pleased to support the open source community by making Pole available.
 //
 // Copyright (C) 2019 THL A29 Limited, a Tencent company. All rights reserved.
 //
@@ -17,9 +17,11 @@ pub mod circuitbreaker;
 pub mod config;
 pub mod core;
 pub mod discovery;
+pub mod faultdetect;
 pub mod plugins;
 pub mod ratelimit;
 pub mod router;
+pub mod traffic;
 #[macro_use]
 mod macros;
 
@@ -43,14 +45,14 @@ mod tests {
 
     pub(crate) fn setup_log() {
         LOGGER_INIT.call_once(|| {
-            tracing_subscriber::fmt()
+            let _ = tracing_subscriber::fmt()
                 .with_thread_names(true)
                 .with_file(true)
                 .with_level(true)
                 .with_line_number(true)
                 .with_thread_ids(true)
                 .with_max_level(LevelFilter::DEBUG)
-                .init()
+                .try_init();
         });
     }
 
@@ -72,7 +74,7 @@ mod tests {
                     timeout: Duration::from_secs(1),
                     id: None,
                     namespace: "rust-demo".to_string(),
-                    service: "polaris-rust-provider".to_string(),
+                    service: "pole_rust-provider".to_string(),
                     ip: "1.1.1.1".to_string(),
                     port: 8080,
                     vpc_id: "1".to_string(),
@@ -112,7 +114,7 @@ mod tests {
                                 flow_id: "1".to_string(),
                                 id: None,
                                 namespace: "rust-demo".to_string(),
-                                service: "polaris-rust-provider".to_string(),
+                                service: "pole_rust-provider".to_string(),
                                 ip: "1.1.1.1".to_string(),
                                 port: 8080,
                                 vpc_id: "1".to_string(),
@@ -128,7 +130,7 @@ mod tests {
                     flow_id: uuid::Uuid::new_v4().to_string(),
                     timeout: Duration::from_secs(1),
                     namespace: "rust-demo".to_string(),
-                    service: "polaris-rust-provider".to_string(),
+                    service: "pole_rust-provider".to_string(),
                     ip: "1.1.1.1".to_string(),
                     port: 8080,
                     vpc_id: "1".to_string(),

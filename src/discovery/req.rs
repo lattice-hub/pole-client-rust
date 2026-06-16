@@ -1,4 +1,4 @@
-// Tencent is pleased to support the open source community by making Polaris available.
+// Tencent is pleased to support the open source community by making Pole available.
 //
 // Copyright (C) 2019 THL A29 Limited, a Tencent company. All rights reserved.
 //
@@ -13,15 +13,15 @@
 // CONDITIONS OF ANY KIND, either express or implied. See the License for the
 // specific language governing permissions and limitations under the License.
 
-use prost::Message;
-
 use crate::core::model::cache::EventType;
-use crate::core::model::error::{ErrorCode, PolarisError};
+use crate::core::model::circuitbreaker::RetStatus;
+use crate::core::model::error::{ErrorCode, PoleError};
 use crate::core::model::loadbalance::Criteria;
 use crate::core::model::naming::{
-    Instance, Location, ServiceContract, ServiceInstances, ServiceInstancesChangeEvent,
+    Instance, Location, ServiceContract, ServiceInstances, ServiceInstancesChangeEvent, ServiceKey,
 };
 use crate::core::model::router::RouteInfo;
+use pole_specification::v1::MockResponse;
 use std::any::Any;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -217,16 +217,16 @@ pub struct GetOneInstanceRequest {
 }
 
 impl GetOneInstanceRequest {
-    pub fn check_valid(&self) -> Result<(), PolarisError> {
+    pub fn check_valid(&self) -> Result<(), PoleError> {
         if self.service.is_empty() {
-            return Err(PolarisError::new(
+            return Err(PoleError::new(
                 ErrorCode::ApiInvalidArgument,
                 "service is empty".to_string(),
             ));
         }
 
         if self.namespace.is_empty() {
-            return Err(PolarisError::new(
+            return Err(PoleError::new(
                 ErrorCode::ApiInvalidArgument,
                 "namespace is empty".to_string(),
             ));
@@ -243,16 +243,16 @@ pub struct GetHealthInstanceRequest {
 }
 
 impl GetHealthInstanceRequest {
-    pub fn check_valid(&self) -> Result<(), PolarisError> {
+    pub fn check_valid(&self) -> Result<(), PoleError> {
         if self.service.is_empty() {
-            return Err(PolarisError::new(
+            return Err(PoleError::new(
                 ErrorCode::ApiInvalidArgument,
                 "service is empty".to_string(),
             ));
         }
 
         if self.namespace.is_empty() {
-            return Err(PolarisError::new(
+            return Err(PoleError::new(
                 ErrorCode::ApiInvalidArgument,
                 "namespace is empty".to_string(),
             ));
@@ -270,16 +270,16 @@ pub struct GetAllInstanceRequest {
 }
 
 impl GetAllInstanceRequest {
-    pub fn check_valid(&self) -> Result<(), PolarisError> {
+    pub fn check_valid(&self) -> Result<(), PoleError> {
         if self.service.is_empty() {
-            return Err(PolarisError::new(
+            return Err(PoleError::new(
                 ErrorCode::ApiInvalidArgument,
                 "service is empty".to_string(),
             ));
         }
 
         if self.namespace.is_empty() {
-            return Err(PolarisError::new(
+            return Err(PoleError::new(
                 ErrorCode::ApiInvalidArgument,
                 "namespace is empty".to_string(),
             ));
@@ -291,6 +291,7 @@ impl GetAllInstanceRequest {
 #[derive(Clone, Debug)]
 pub struct InstanceResponse {
     pub instance: Instance,
+    pub mock_response: Option<MockResponse>,
 }
 
 #[derive(Clone, Debug)]
@@ -305,16 +306,16 @@ pub struct WatchInstanceRequest {
 }
 
 impl WatchInstanceRequest {
-    pub fn check_valid(&self) -> Result<(), PolarisError> {
+    pub fn check_valid(&self) -> Result<(), PoleError> {
         if self.service.is_empty() {
-            return Err(PolarisError::new(
+            return Err(PoleError::new(
                 ErrorCode::ApiInvalidArgument,
                 "service is empty".to_string(),
             ));
         }
 
         if self.namespace.is_empty() {
-            return Err(PolarisError::new(
+            return Err(PoleError::new(
                 ErrorCode::ApiInvalidArgument,
                 "namespace is empty".to_string(),
             ));
@@ -351,7 +352,17 @@ impl WatchInstanceResponse {
     }
 }
 
-pub struct ServiceCallResult {}
+#[derive(Clone, Debug)]
+pub struct ServiceCallResult {
+    pub caller_service: Option<ServiceKey>,
+    pub callee_service: ServiceKey,
+    pub delay: Duration,
+    pub ret_code: String,
+    pub status: RetStatus,
+    pub protocol: Option<String>,
+    pub method: Option<String>,
+    pub path: Option<String>,
+}
 
 pub enum ServiceRuleType {
     Router,
@@ -359,6 +370,10 @@ pub enum ServiceRuleType {
     RateLimit,
     FaultDetector,
     Lane,
+    Lossless,
+    TrafficSecurity,
+    TrafficMirror,
+    TrafficMock,
 }
 
 impl ServiceRuleType {
@@ -369,6 +384,32 @@ impl ServiceRuleType {
             ServiceRuleType::RateLimit => EventType::RateLimitRule,
             ServiceRuleType::FaultDetector => EventType::FaultDetectRule,
             ServiceRuleType::Lane => EventType::LaneRule,
+            ServiceRuleType::Lossless => EventType::LosslessRule,
+            ServiceRuleType::TrafficSecurity => EventType::TrafficSecurityRule,
+            ServiceRuleType::TrafficMirror => EventType::TrafficMirrorRule,
+            ServiceRuleType::TrafficMock => EventType::TrafficMockRule,
+        }
+    }
+}
+
+#[cfg(test)]
+mod service_rule_type_tests {
+    use super::*;
+
+    #[test]
+    fn service_rule_type_maps_new_spec_rule_types_to_cache_events() {
+        let cases = [
+            (ServiceRuleType::Lossless, EventType::LosslessRule),
+            (
+                ServiceRuleType::TrafficSecurity,
+                EventType::TrafficSecurityRule,
+            ),
+            (ServiceRuleType::TrafficMirror, EventType::TrafficMirrorRule),
+            (ServiceRuleType::TrafficMock, EventType::TrafficMockRule),
+        ];
+
+        for (rule_type, expected) in cases {
+            assert_eq!(rule_type.to_event_type(), expected);
         }
     }
 }
@@ -388,7 +429,7 @@ pub struct ServiceRuleResponse {
 
 pub struct InstanceProperties {}
 
-pub trait BaseInstance {
+pub trait BaseInstance: Send + Sync {
     fn get_namespace(&self) -> String;
 
     fn get_service(&self) -> String;
@@ -398,7 +439,7 @@ pub trait BaseInstance {
     fn get_port(&self) -> u32;
 }
 
-pub trait LosslessActionProvider {
+pub trait LosslessActionProvider: Send + Sync {
     fn get_name(&self) -> String;
 
     fn do_register(&self, prop: InstanceProperties);

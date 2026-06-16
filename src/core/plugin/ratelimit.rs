@@ -1,4 +1,4 @@
-// Tencent is pleased to support the open source community by making Polaris available.
+// Tencent is pleased to support the open source community by making Pole available.
 //
 // Copyright (C) 2019 THL A29 Limited, a Tencent company. All rights reserved.
 //
@@ -13,7 +13,7 @@
 // CONDITIONS OF ANY KIND, either express or implied. See the License for the
 // specific language governing permissions and limitations under the License.
 
-use crate::core::model::error::PolarisError;
+use crate::core::model::error::PoleError;
 
 use super::plugins::Plugin;
 
@@ -21,13 +21,13 @@ use super::plugins::Plugin;
 #[async_trait::async_trait]
 pub trait ServiceRateLimiter: Plugin {
     // allocate_quota 申请配额
-    async fn allocate_quota(&self) -> Result<(), PolarisError>;
+    async fn allocate_quota(&self) -> Result<(), PoleError>;
     // return_quota 归还配额
-    async fn return_quota(&self) -> Result<(), PolarisError>;
+    async fn return_quota(&self) -> Result<(), PoleError>;
     // on_remote_update 远程更新
-    async fn on_remote_update(&self) -> Result<(), PolarisError>;
+    async fn on_remote_update(&self) -> Result<(), PoleError>;
     // fetch_local_usage 获取本地使用情况
-    async fn fetch_local_usage(&self) -> Result<(), PolarisError>;
+    async fn fetch_local_usage(&self) -> Result<(), PoleError>;
     // get_amount 获取数量
-    async fn get_amount(&self) -> Result<(), PolarisError>;
+    async fn get_amount(&self) -> Result<(), PoleError>;
 }

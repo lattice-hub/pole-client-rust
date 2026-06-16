@@ -1,4 +1,4 @@
-// Tencent is pleased to support the open source community by making Polaris available.
+// Tencent is pleased to support the open source community by making Pole available.
 //
 // Copyright (C) 2019 THL A29 Limited, a Tencent company. All rights reserved.
 //
@@ -14,7 +14,7 @@
 // specific language governing permissions and limitations under the License.
 
 use crate::core::{
-    model::error::PolarisError,
+    model::error::PoleError,
     plugin::{plugins::Plugin, ratelimit::ServiceRateLimiter},
 };
 
@@ -44,23 +44,23 @@ impl Plugin for ConcurrencyLimiter {
 
 #[async_trait::async_trait]
 impl ServiceRateLimiter for ConcurrencyLimiter {
-    async fn allocate_quota(&self) -> Result<(), PolarisError> {
+    async fn allocate_quota(&self) -> Result<(), PoleError> {
         Ok(())
     }
 
-    async fn return_quota(&self) -> Result<(), PolarisError> {
+    async fn return_quota(&self) -> Result<(), PoleError> {
         Ok(())
     }
 
-    async fn on_remote_update(&self) -> Result<(), PolarisError> {
+    async fn on_remote_update(&self) -> Result<(), PoleError> {
         Ok(())
     }
 
-    async fn fetch_local_usage(&self) -> Result<(), PolarisError> {
+    async fn fetch_local_usage(&self) -> Result<(), PoleError> {
         Ok(())
     }
 
-    async fn get_amount(&self) -> Result<(), PolarisError> {
+    async fn get_amount(&self) -> Result<(), PoleError> {
         Ok(())
     }
 }

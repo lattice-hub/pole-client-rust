@@ -1,4 +1,4 @@
-// Tencent is pleased to support the open source community by making Polaris available.
+// Tencent is pleased to support the open source community by making Pole available.
 //
 // Copyright (C) 2019 THL A29 Limited, a Tencent company. All rights reserved.
 //
@@ -14,7 +14,7 @@
 // specific language governing permissions and limitations under the License.
 
 use crate::core::model::{
-    error::PolarisError,
+    error::PoleError,
     loadbalance::Criteria,
     naming::{Instance, ServiceInstances},
 };
@@ -31,5 +31,5 @@ where
         &self,
         criteria: Criteria,
         instances: ServiceInstances,
-    ) -> Result<Instance, PolarisError>;
+    ) -> Result<Instance, PoleError>;
 }

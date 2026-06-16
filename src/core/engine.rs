@@ -1,4 +1,4 @@
-// Tencent is pleased to support the open source community by making Polaris available.
+// Tencent is pleased to support the open source community by making Pole available.
 //
 // Copyright (C) 2019 THL A29 Limited, a Tencent company. All rights reserved.
 //
@@ -18,10 +18,9 @@ use std::sync::Arc;
 
 use tokio::runtime::{Builder, Runtime};
 
-use super::flow::{CircuitBreakerFlow, ClientFlow, RouterFlow};
+use super::flow::{CircuitBreakerFlow, ClientFlow};
 use super::model::config::{ConfigFile, ConfigGroup};
 use super::model::naming::{ServiceContractRequest, ServiceInstances};
-use super::model::ClientContext;
 use super::plugin::cache::{Filter, ResourceCache, ResourceListener};
 use super::plugin::connector::Connector;
 use super::plugin::location::{LocationProvider, LocationSupplier};
@@ -31,13 +30,18 @@ use crate::config::req::{
 };
 use crate::core::config::config::Configuration;
 use crate::core::model::cache::{EventType, ResourceEventKey};
-use crate::core::model::error::PolarisError;
+use crate::core::model::error::PoleError;
 use crate::core::model::naming::InstanceRequest;
 use crate::core::plugin::plugins::Extensions;
 use crate::discovery::req::{
     GetAllInstanceRequest, GetServiceRuleRequest, InstanceDeregisterRequest,
     InstanceHeartbeatRequest, InstanceRegisterRequest, InstanceRegisterResponse, InstancesResponse,
     ReportServiceContractRequest, ServiceRuleResponse,
+};
+use crate::traffic::faultdetect::{
+    register_fault_detect_resource_listeners, CircuitBreakerFaultDetectReporter,
+    DefaultFaultDetectProbeExecutor, FaultDetectLifecycleOwner, FaultDetectScheduler,
+    FaultDetectTarget,
 };
 
 pub struct Engine
@@ -49,16 +53,16 @@ where
     local_cache: Arc<Box<dyn ResourceCache>>,
     server_connector: Arc<Box<dyn Connector>>,
     location_provider: Arc<LocationProvider>,
-    client_ctx: Arc<ClientContext>,
-    client_flow: ClientFlow,
+    _client_flow: ClientFlow,
+    fault_detect_owner: Arc<FaultDetectLifecycleOwner>,
 }
 
 impl Engine {
-    pub fn new(arc_conf: Arc<Configuration>) -> Result<Self, PolarisError> {
+    pub fn new(arc_conf: Arc<Configuration>) -> Result<Self, PoleError> {
         let runtime = Arc::new(
             Builder::new_multi_thread()
                 .enable_all()
-                .thread_name("polaris-client-thread-pool")
+                .thread_name("pole-client-thread-pool")
                 .worker_threads(4)
                 .build()
                 .unwrap(),
@@ -80,6 +84,22 @@ impl Engine {
 
         let mut client_flow = ClientFlow::new(client_ctx.clone(), extension.clone());
         client_flow.run_flow();
+        let circuit_breaker_flow = Arc::new(CircuitBreakerFlow::new(extension.clone()));
+        let fault_detect_owner = Arc::new(FaultDetectLifecycleOwner::new(Arc::new(
+            FaultDetectScheduler::new(
+                Arc::new(DefaultFaultDetectProbeExecutor),
+                Arc::new(CircuitBreakerFaultDetectReporter::new(circuit_breaker_flow)),
+            ),
+        )));
+        let fault_detect_cache = local_cache.clone();
+        let fault_detect_owner_for_listener = fault_detect_owner.clone();
+        runtime.spawn(async move {
+            register_fault_detect_resource_listeners(
+                fault_detect_cache,
+                fault_detect_owner_for_listener,
+            )
+            .await;
+        });
 
         Ok(Self {
             extensions: extension.clone(),
@@ -87,8 +107,8 @@ impl Engine {
             local_cache,
             server_connector,
             location_provider: location_provider,
-            client_ctx: client_ctx,
-            client_flow,
+            _client_flow: client_flow,
+            fault_detect_owner,
         })
     }
 
@@ -96,7 +116,7 @@ impl Engine {
     pub async fn register_instance(
         &self,
         req: InstanceRegisterRequest,
-    ) -> Result<InstanceRegisterResponse, PolarisError> {
+    ) -> Result<InstanceRegisterResponse, PoleError> {
         let mut instance = req.convert_instance();
 
         if instance.location.is_empty() {
@@ -131,7 +151,7 @@ impl Engine {
     pub async fn deregister_instance(
         &self,
         req: InstanceDeregisterRequest,
-    ) -> Result<(), PolarisError> {
+    ) -> Result<(), PoleError> {
         let connector = self.server_connector.clone();
         let rsp = connector
             .deregister_instance(InstanceRequest {
@@ -154,10 +174,7 @@ impl Engine {
     }
 
     /// instance_heartbeat 同步实例心跳
-    pub async fn instance_heartbeat(
-        &self,
-        req: InstanceHeartbeatRequest,
-    ) -> Result<(), PolarisError> {
+    pub async fn instance_heartbeat(&self, req: InstanceHeartbeatRequest) -> Result<(), PoleError> {
         let connector = self.server_connector.clone();
         let rsp = connector
             .heartbeat_instance(InstanceRequest {
@@ -184,7 +201,7 @@ impl Engine {
         &self,
         req: GetAllInstanceRequest,
         only_available: bool,
-    ) -> Result<InstancesResponse, PolarisError> {
+    ) -> Result<InstancesResponse, PoleError> {
         let mut filter = HashMap::<String, String>::new();
         filter.insert("service".to_string(), req.service.clone());
 
@@ -220,7 +237,7 @@ impl Engine {
     pub async fn report_service_contract(
         &self,
         req: ReportServiceContractRequest,
-    ) -> Result<bool, PolarisError> {
+    ) -> Result<bool, PoleError> {
         let connector = self.server_connector.clone();
         return connector
             .report_service_contract(ServiceContractRequest {
@@ -240,7 +257,7 @@ impl Engine {
     pub async fn get_service_rule(
         &self,
         req: GetServiceRuleRequest,
-    ) -> Result<ServiceRuleResponse, PolarisError> {
+    ) -> Result<ServiceRuleResponse, PoleError> {
         let local_cache = self.local_cache.clone();
         let mut filter = HashMap::<String, String>::new();
         filter.insert("service".to_string(), req.service.clone());
@@ -270,7 +287,7 @@ impl Engine {
     pub async fn get_config_file(
         &self,
         req: GetConfigFileRequest,
-    ) -> Result<ConfigFile, PolarisError> {
+    ) -> Result<ConfigFile, PoleError> {
         let local_cache = self.local_cache.clone();
         let mut filter = HashMap::<String, String>::new();
         filter.insert("group".to_string(), req.group.clone());
@@ -299,7 +316,7 @@ impl Engine {
     pub async fn create_config_file(
         &self,
         req: CreateConfigFileRequest,
-    ) -> Result<bool, PolarisError> {
+    ) -> Result<bool, PoleError> {
         let config_file = req.to_config_request();
 
         let connector = self.server_connector.clone();
@@ -315,7 +332,7 @@ impl Engine {
     pub async fn update_config_file(
         &self,
         req: UpdateConfigFileRequest,
-    ) -> Result<bool, PolarisError> {
+    ) -> Result<bool, PoleError> {
         let config_file = req.to_config_request();
 
         let connector = self.server_connector.clone();
@@ -331,7 +348,7 @@ impl Engine {
     pub async fn publish_config_file(
         &self,
         req: PublishConfigFileRequest,
-    ) -> Result<bool, PolarisError> {
+    ) -> Result<bool, PoleError> {
         let config_file = req.to_config_request();
 
         let connector = self.server_connector.clone();
@@ -347,7 +364,7 @@ impl Engine {
     pub async fn upsert_publish_config_file(
         &self,
         req: UpsertAndPublishConfigFileRequest,
-    ) -> Result<bool, PolarisError> {
+    ) -> Result<bool, PoleError> {
         let config_file = req.to_config_request();
 
         let connector = self.server_connector.clone();
@@ -362,7 +379,7 @@ impl Engine {
     pub async fn get_config_group_files(
         &self,
         req: GetConfigGroupRequest,
-    ) -> Result<ConfigGroup, PolarisError> {
+    ) -> Result<ConfigGroup, PoleError> {
         let local_cache = self.local_cache.clone();
         let mut filter = HashMap::<String, String>::new();
         filter.insert("group".to_string(), req.group.clone());
@@ -397,5 +414,13 @@ impl Engine {
 
     pub fn get_extensions(&self) -> Arc<Extensions> {
         self.extensions.clone()
+    }
+
+    pub fn start_fault_detect_targets(&self, targets: Vec<FaultDetectTarget>) {
+        self.fault_detect_owner.start_targets(targets);
+    }
+
+    pub fn get_fault_detect_lifecycle_owner(&self) -> Arc<FaultDetectLifecycleOwner> {
+        self.fault_detect_owner.clone()
     }
 }

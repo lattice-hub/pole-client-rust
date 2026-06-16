@@ -1,4 +1,4 @@
-// Tencent is pleased to support the open source community by making Polaris available.
+// Tencent is pleased to support the open source community by making Pole available.
 //
 // Copyright (C) 2019 THL A29 Limited, a Tencent company. All rights reserved.
 //
@@ -23,12 +23,13 @@ use std::{
 
 use tokio::sync::RwLock;
 
-use polaris_specification::v1::{
+use pole_specification::v1::{
     config_discover_request::ConfigDiscoverRequestType,
     config_discover_response::ConfigDiscoverResponseType, discover_request::DiscoverRequestType,
-    discover_response::DiscoverResponseType, CircuitBreaker, ClientConfigFileInfo,
-    ConfigDiscoverRequest, ConfigDiscoverResponse, DiscoverFilter, DiscoverRequest,
-    DiscoverResponse, FaultDetector, LaneGroup, RateLimit, Routing, Service,
+    discover_response::DiscoverResponseType, CircuitBreakerRule, ConfigDiscoverRequest,
+    ConfigDiscoverResponse, ConfigFile as SpecConfigFile, ConfigFileRelease, DiscoverFilter,
+    DiscoverRequest, DiscoverResponse, FaultDetector, LaneGroup, LosslessRule, RateLimit,
+    RouteRule, Service, TrafficMirror, TrafficMock, TrafficSecurityRule,
 };
 
 use super::{
@@ -47,6 +48,10 @@ pub enum EventType {
     FaultDetectRule,
     ServiceContract,
     LaneRule,
+    LosslessRule,
+    TrafficSecurityRule,
+    TrafficMirrorRule,
+    TrafficMockRule,
     Namespaces,
     ConfigFile,
     ConfigGroup,
@@ -64,6 +69,10 @@ impl EventType {
             EventType::FaultDetectRule => "fault_detect_rule.data".to_string(),
             EventType::ServiceContract => "service_contract.data".to_string(),
             EventType::LaneRule => "lane_rule.data".to_string(),
+            EventType::LosslessRule => "lossless_rule.data".to_string(),
+            EventType::TrafficSecurityRule => "traffic_security_rule.data".to_string(),
+            EventType::TrafficMirrorRule => "traffic_mirror_rule.data".to_string(),
+            EventType::TrafficMockRule => "traffic_mock_rule.data".to_string(),
             EventType::Namespaces => "namespaces.data".to_string(),
             EventType::ConfigFile => "config_file.data".to_string(),
             EventType::ConfigGroup => "config_group.data".to_string(),
@@ -74,12 +83,16 @@ impl EventType {
     pub fn naming_spec_to_persist_file(t: DiscoverResponseType) -> String {
         match t {
             DiscoverResponseType::Instance => "instance.data".to_string(),
-            DiscoverResponseType::Routing => "router_rule.data".to_string(),
+            DiscoverResponseType::CustomRouteRule => "router_rule.data".to_string(),
             DiscoverResponseType::CircuitBreaker => "circuit_breaker_rule.data".to_string(),
             DiscoverResponseType::RateLimit => "rate_limit_rule.data".to_string(),
             DiscoverResponseType::Services => "service.data".to_string(),
             DiscoverResponseType::FaultDetector => "fault_detect_rule.data".to_string(),
             DiscoverResponseType::Lane => "lane_rule.data".to_string(),
+            DiscoverResponseType::Lossless => "lossless_rule.data".to_string(),
+            DiscoverResponseType::TrafficSecurityRule => "traffic_security_rule.data".to_string(),
+            DiscoverResponseType::TrafficMirrorRule => "traffic_mirror_rule.data".to_string(),
+            DiscoverResponseType::TrafficMockRule => "traffic_mock_rule.data".to_string(),
             DiscoverResponseType::Namespaces => "namespaces.data".to_string(),
             _ => "unknown".to_string(),
         }
@@ -113,6 +126,10 @@ impl ToString for EventType {
             EventType::FaultDetectRule => "FaultDetectRule".to_string(),
             EventType::ServiceContract => "ServiceContract".to_string(),
             EventType::LaneRule => "LaneRule".to_string(),
+            EventType::LosslessRule => "LosslessRule".to_string(),
+            EventType::TrafficSecurityRule => "TrafficSecurityRule".to_string(),
+            EventType::TrafficMirrorRule => "TrafficMirrorRule".to_string(),
+            EventType::TrafficMockRule => "TrafficMockRule".to_string(),
             EventType::Namespaces => "Namespaces".to_string(),
             EventType::ConfigFile => "ConfigFile".to_string(),
             EventType::ConfigGroup => "ConfigGroup".to_string(),
@@ -131,6 +148,10 @@ pub enum CacheItemType {
     Service(ServicesCacheItem),
     FaultDetectRule(FaultDetectRulesCacheItem),
     LaneRule(LaneRulesCacheItem),
+    LosslessRule(LosslessRulesCacheItem),
+    TrafficSecurityRule(TrafficSecurityRulesCacheItem),
+    TrafficMirrorRule(TrafficMirrorRulesCacheItem),
+    TrafficMockRule(TrafficMockRulesCacheItem),
     ConfigFile(ConfigFileCacheItem),
     ConfigGroup(ConfigGroupCacheItem),
 }
@@ -145,6 +166,10 @@ impl Display for CacheItemType {
             CacheItemType::Service(_) => write!(f, "Service"),
             CacheItemType::FaultDetectRule(_) => write!(f, "FaultDetectRule"),
             CacheItemType::LaneRule(_) => write!(f, "LaneRule"),
+            CacheItemType::LosslessRule(_) => write!(f, "LosslessRule"),
+            CacheItemType::TrafficSecurityRule(_) => write!(f, "TrafficSecurityRule"),
+            CacheItemType::TrafficMirrorRule(_) => write!(f, "TrafficMirrorRule"),
+            CacheItemType::TrafficMockRule(_) => write!(f, "TrafficMockRule"),
             CacheItemType::ConfigFile(_) => write!(f, "ConfigFile"),
             CacheItemType::ConfigGroup(_) => write!(f, "ConfigGroup"),
             _ => write!(f, "Unknown"),
@@ -212,7 +237,7 @@ impl ResourceEventKey {
                 filter: Some(DiscoverFilter::default()),
             }),
             crate::core::model::cache::EventType::RouterRule => Some(DiscoverRequest {
-                r#type: DiscoverRequestType::Routing.into(),
+                r#type: DiscoverRequestType::CustomRouteRule.into(),
                 service: Some(self.to_spec_service(revision)),
                 filter: Some(DiscoverFilter::default()),
             }),
@@ -241,6 +266,26 @@ impl ResourceEventKey {
                 service: Some(self.to_spec_service(revision)),
                 filter: Some(DiscoverFilter::default()),
             }),
+            crate::core::model::cache::EventType::LosslessRule => Some(DiscoverRequest {
+                r#type: DiscoverRequestType::Lossless.into(),
+                service: Some(self.to_spec_service(revision)),
+                filter: Some(DiscoverFilter::default()),
+            }),
+            crate::core::model::cache::EventType::TrafficSecurityRule => Some(DiscoverRequest {
+                r#type: DiscoverRequestType::TrafficSecurityRule.into(),
+                service: Some(self.to_spec_service(revision)),
+                filter: Some(DiscoverFilter::default()),
+            }),
+            crate::core::model::cache::EventType::TrafficMirrorRule => Some(DiscoverRequest {
+                r#type: DiscoverRequestType::TrafficMirrorRule.into(),
+                service: Some(self.to_spec_service(revision)),
+                filter: Some(DiscoverFilter::default()),
+            }),
+            crate::core::model::cache::EventType::TrafficMockRule => Some(DiscoverRequest {
+                r#type: DiscoverRequestType::TrafficMockRule.into(),
+                service: Some(self.to_spec_service(revision)),
+                filter: Some(DiscoverFilter::default()),
+            }),
             _ => None,
         }
     }
@@ -249,13 +294,15 @@ impl ResourceEventKey {
         match self.event_type {
             crate::core::model::cache::EventType::ConfigFile => Some(ConfigDiscoverRequest {
                 r#type: ConfigDiscoverRequestType::ConfigFile.into(),
-                config_file: Some(self.to_spec_config_file()),
+                file: Some(self.to_spec_config_file()),
                 revision,
+                filter: None,
             }),
             crate::core::model::cache::EventType::ConfigGroup => Some(ConfigDiscoverRequest {
                 r#type: ConfigDiscoverRequestType::ConfigFileNames.into(),
-                config_file: Some(self.to_spec_config_group()),
+                file: Some(self.to_spec_config_group()),
                 revision,
+                filter: None,
             }),
             _ => None,
         }
@@ -264,30 +311,30 @@ impl ResourceEventKey {
     pub fn to_spec_service(&self, revision: String) -> Service {
         let svc = self.filter.get("service").unwrap().to_string();
         Service {
-            namespace: Some(self.namespace.clone()),
-            name: Some(svc),
-            revision: Some(revision),
+            namespace: self.namespace.clone(),
+            name: svc,
+            revision,
             ..Service::default()
         }
     }
 
-    pub fn to_spec_config_file(&self) -> ClientConfigFileInfo {
+    pub fn to_spec_config_file(&self) -> SpecConfigFile {
         let group = self.filter.get("group").unwrap().to_string();
         let file_name = self.filter.get("file").unwrap().to_string();
-        ClientConfigFileInfo {
-            namespace: Some(self.namespace.clone()),
-            group: Some(group),
-            name: Some(file_name),
-            ..ClientConfigFileInfo::default()
+        SpecConfigFile {
+            namespace: self.namespace.clone(),
+            group,
+            name: file_name,
+            ..SpecConfigFile::default()
         }
     }
 
-    pub fn to_spec_config_group(&self) -> ClientConfigFileInfo {
+    pub fn to_spec_config_group(&self) -> SpecConfigFile {
         let group = self.filter.get("group").unwrap().to_string();
-        ClientConfigFileInfo {
-            namespace: Some(self.namespace.clone()),
-            group: Some(group),
-            ..ClientConfigFileInfo::default()
+        SpecConfigFile {
+            namespace: self.namespace.clone(),
+            group,
+            ..SpecConfigFile::default()
         }
     }
 }
@@ -317,6 +364,121 @@ impl ToString for ResourceEventKey {
             }
         }
         key
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pole_specification::v1::{
+        discover_request::DiscoverRequestType, discover_response::DiscoverResponseType,
+    };
+
+    fn service_key(event_type: EventType) -> ResourceEventKey {
+        ResourceEventKey {
+            namespace: "default".to_string(),
+            event_type,
+            filter: HashMap::from([("service".to_string(), "svc-a".to_string())]),
+        }
+    }
+
+    #[test]
+    fn to_discover_request_maps_all_service_rule_event_types() {
+        let cases = [
+            (EventType::RouterRule, DiscoverRequestType::CustomRouteRule),
+            (EventType::RateLimitRule, DiscoverRequestType::RateLimit),
+            (
+                EventType::CircuitBreakerRule,
+                DiscoverRequestType::CircuitBreaker,
+            ),
+            (
+                EventType::FaultDetectRule,
+                DiscoverRequestType::FaultDetector,
+            ),
+            (EventType::LaneRule, DiscoverRequestType::Lane),
+            (EventType::LosslessRule, DiscoverRequestType::Lossless),
+            (
+                EventType::TrafficSecurityRule,
+                DiscoverRequestType::TrafficSecurityRule,
+            ),
+            (
+                EventType::TrafficMirrorRule,
+                DiscoverRequestType::TrafficMirrorRule,
+            ),
+            (
+                EventType::TrafficMockRule,
+                DiscoverRequestType::TrafficMockRule,
+            ),
+        ];
+
+        for (event_type, expected) in cases {
+            let request = service_key(event_type)
+                .to_discover_request("rev-1".to_string())
+                .expect("service rule event should build discover request");
+
+            assert_eq!(request.r#type(), expected);
+            let service = request.service.expect("request should include service");
+            assert_eq!(service.namespace, "default");
+            assert_eq!(service.name, "svc-a");
+            assert_eq!(service.revision, "rev-1");
+        }
+    }
+
+    #[test]
+    fn naming_spec_to_persist_file_maps_all_service_rule_response_types() {
+        let cases = [
+            (DiscoverResponseType::CustomRouteRule, "router_rule.data"),
+            (DiscoverResponseType::RateLimit, "rate_limit_rule.data"),
+            (
+                DiscoverResponseType::CircuitBreaker,
+                "circuit_breaker_rule.data",
+            ),
+            (
+                DiscoverResponseType::FaultDetector,
+                "fault_detect_rule.data",
+            ),
+            (DiscoverResponseType::Lane, "lane_rule.data"),
+            (DiscoverResponseType::Lossless, "lossless_rule.data"),
+            (
+                DiscoverResponseType::TrafficSecurityRule,
+                "traffic_security_rule.data",
+            ),
+            (
+                DiscoverResponseType::TrafficMirrorRule,
+                "traffic_mirror_rule.data",
+            ),
+            (
+                DiscoverResponseType::TrafficMockRule,
+                "traffic_mock_rule.data",
+            ),
+        ];
+
+        for (response_type, expected_file) in cases {
+            assert_eq!(
+                EventType::naming_spec_to_persist_file(response_type),
+                expected_file
+            );
+        }
+    }
+
+    #[test]
+    fn resource_event_key_string_supports_new_service_rule_event_types() {
+        let cases = [
+            (EventType::LosslessRule, "LosslessRule#default#svc-a"),
+            (
+                EventType::TrafficSecurityRule,
+                "TrafficSecurityRule#default#svc-a",
+            ),
+            (
+                EventType::TrafficMirrorRule,
+                "TrafficMirrorRule#default#svc-a",
+            ),
+            (EventType::TrafficMockRule, "TrafficMockRule#default#svc-a"),
+        ];
+
+        for (event_type, expected) in cases {
+            assert_eq!(service_key(event_type).to_string(), expected);
+        }
     }
 }
 
@@ -384,7 +546,7 @@ impl Clone for ServicesCacheItem {
 #[async_trait::async_trait]
 impl RegistryCacheValue for ServicesCacheItem {
     fn is_loaded_from_file(&self) -> bool {
-        todo!()
+        false
     }
 
     fn event_type(&self) -> crate::core::model::cache::EventType {
@@ -400,7 +562,7 @@ impl RegistryCacheValue for ServicesCacheItem {
     }
 
     fn revision(&self) -> String {
-        todo!()
+        self.revision.clone()
     }
 }
 
@@ -456,11 +618,11 @@ impl ServiceInstancesCacheItem {
         let revision = svc_info.revision.clone();
 
         ServiceInfo {
-            id: id.unwrap_or_default().clone(),
-            namespace: namespace.unwrap_or_default().to_string(),
-            name: name.unwrap_or_default().to_string(),
+            id,
+            namespace,
+            name,
             metadata: self.svc_info.metadata.clone(),
-            revision: revision.unwrap_or_default().clone(),
+            revision,
         }
     }
 }
@@ -481,7 +643,7 @@ impl Clone for ServiceInstancesCacheItem {
 #[async_trait::async_trait]
 impl RegistryCacheValue for ServiceInstancesCacheItem {
     fn is_loaded_from_file(&self) -> bool {
-        todo!()
+        false
     }
 
     fn event_type(&self) -> crate::core::model::cache::EventType {
@@ -505,7 +667,7 @@ impl RegistryCacheValue for ServiceInstancesCacheItem {
 pub struct RouterRulesCacheItem {
     initialized: Arc<AtomicBool>,
     pub revision: String,
-    pub value: Arc<RwLock<Vec<Routing>>>,
+    pub value: Arc<RwLock<Vec<RouteRule>>>,
 }
 
 impl Default for RouterRulesCacheItem {
@@ -546,7 +708,7 @@ impl Clone for RouterRulesCacheItem {
 #[async_trait::async_trait]
 impl RegistryCacheValue for RouterRulesCacheItem {
     fn is_loaded_from_file(&self) -> bool {
-        todo!()
+        false
     }
 
     fn event_type(&self) -> crate::core::model::cache::EventType {
@@ -569,14 +731,39 @@ impl RegistryCacheValue for RouterRulesCacheItem {
 // LaneRulesCacheItem 泳道规则
 pub struct LaneRulesCacheItem {
     initialized: Arc<AtomicBool>,
-    value: Vec<LaneGroup>,
-    revision: String,
+    pub value: Vec<LaneGroup>,
+    pub revision: String,
+}
+
+impl Default for LaneRulesCacheItem {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl LaneRulesCacheItem {
+    pub fn new() -> Self {
+        Self {
+            initialized: Arc::new(AtomicBool::new(false)),
+            value: Vec::new(),
+            revision: String::new(),
+        }
+    }
+
+    pub fn finish_initialize(&self) {
+        let _ = self.initialized.compare_exchange(
+            false,
+            true,
+            std::sync::atomic::Ordering::SeqCst,
+            std::sync::atomic::Ordering::SeqCst,
+        );
+    }
 }
 
 impl Clone for LaneRulesCacheItem {
     fn clone(&self) -> Self {
         Self {
-            initialized: Arc::new(AtomicBool::new(false)),
+            initialized: self.initialized.clone(),
             value: self.value.clone(),
             revision: self.revision.clone(),
         }
@@ -586,7 +773,7 @@ impl Clone for LaneRulesCacheItem {
 #[async_trait::async_trait]
 impl RegistryCacheValue for LaneRulesCacheItem {
     fn is_loaded_from_file(&self) -> bool {
-        todo!()
+        false
     }
 
     fn event_type(&self) -> crate::core::model::cache::EventType {
@@ -606,10 +793,99 @@ impl RegistryCacheValue for LaneRulesCacheItem {
     }
 }
 
+macro_rules! define_rule_list_cache_item {
+    ($name:ident, $rule_type:ty, $event_type:expr) => {
+        pub struct $name {
+            initialized: Arc<AtomicBool>,
+            pub value: Vec<$rule_type>,
+            pub revision: String,
+        }
+
+        impl Default for $name {
+            fn default() -> Self {
+                Self::new()
+            }
+        }
+
+        impl $name {
+            pub fn new() -> Self {
+                Self {
+                    initialized: Arc::new(AtomicBool::new(false)),
+                    value: Vec::new(),
+                    revision: String::new(),
+                }
+            }
+
+            pub fn finish_initialize(&self) {
+                let _ = self.initialized.compare_exchange(
+                    false,
+                    true,
+                    std::sync::atomic::Ordering::SeqCst,
+                    std::sync::atomic::Ordering::SeqCst,
+                );
+            }
+        }
+
+        impl Clone for $name {
+            fn clone(&self) -> Self {
+                Self {
+                    initialized: self.initialized.clone(),
+                    value: self.value.clone(),
+                    revision: self.revision.clone(),
+                }
+            }
+        }
+
+        #[async_trait::async_trait]
+        impl RegistryCacheValue for $name {
+            fn is_loaded_from_file(&self) -> bool {
+                false
+            }
+
+            fn event_type(&self) -> crate::core::model::cache::EventType {
+                $event_type
+            }
+
+            async fn wait_initialize(&self, timeout: Duration) -> Box<dyn Fn() + Send> {
+                build_waiter(self.initialized.clone(), timeout)
+            }
+
+            fn is_initialized(&self) -> bool {
+                self.initialized.load(std::sync::atomic::Ordering::Acquire)
+            }
+
+            fn revision(&self) -> String {
+                self.revision.clone()
+            }
+        }
+    };
+}
+
+define_rule_list_cache_item!(
+    LosslessRulesCacheItem,
+    LosslessRule,
+    crate::core::model::cache::EventType::LosslessRule
+);
+define_rule_list_cache_item!(
+    TrafficSecurityRulesCacheItem,
+    TrafficSecurityRule,
+    crate::core::model::cache::EventType::TrafficSecurityRule
+);
+define_rule_list_cache_item!(
+    TrafficMirrorRulesCacheItem,
+    TrafficMirror,
+    crate::core::model::cache::EventType::TrafficMirrorRule
+);
+define_rule_list_cache_item!(
+    TrafficMockRulesCacheItem,
+    TrafficMock,
+    crate::core::model::cache::EventType::TrafficMockRule
+);
+
 // RatelimitRulesCacheItem 限流规则
 pub struct RatelimitRulesCacheItem {
     initialized: Arc<AtomicBool>,
-    pub value: RateLimit,
+    pub value: Vec<RateLimit>,
     pub revision: String,
 }
 
@@ -623,7 +899,7 @@ impl RatelimitRulesCacheItem {
     pub fn new() -> Self {
         Self {
             initialized: Arc::new(AtomicBool::new(false)),
-            value: RateLimit::default(),
+            value: Vec::new(),
             revision: String::new(),
         }
     }
@@ -651,7 +927,7 @@ impl Clone for RatelimitRulesCacheItem {
 #[async_trait::async_trait]
 impl RegistryCacheValue for RatelimitRulesCacheItem {
     fn is_loaded_from_file(&self) -> bool {
-        todo!()
+        false
     }
 
     fn event_type(&self) -> crate::core::model::cache::EventType {
@@ -674,7 +950,7 @@ impl RegistryCacheValue for RatelimitRulesCacheItem {
 // CircuitBreakerRulesCacheItem 熔断规则
 pub struct CircuitBreakerRulesCacheItem {
     initialized: Arc<AtomicBool>,
-    pub value: CircuitBreaker,
+    pub value: Vec<CircuitBreakerRule>,
     pub revision: String,
 }
 
@@ -688,7 +964,7 @@ impl CircuitBreakerRulesCacheItem {
     pub fn new() -> Self {
         Self {
             initialized: Arc::new(AtomicBool::new(false)),
-            value: CircuitBreaker::default(),
+            value: Vec::new(),
             revision: String::new(),
         }
     }
@@ -716,7 +992,7 @@ impl Clone for CircuitBreakerRulesCacheItem {
 #[async_trait::async_trait]
 impl RegistryCacheValue for CircuitBreakerRulesCacheItem {
     fn is_loaded_from_file(&self) -> bool {
-        todo!()
+        false
     }
 
     fn event_type(&self) -> crate::core::model::cache::EventType {
@@ -781,7 +1057,7 @@ impl Clone for FaultDetectRulesCacheItem {
 #[async_trait::async_trait]
 impl RegistryCacheValue for FaultDetectRulesCacheItem {
     fn is_loaded_from_file(&self) -> bool {
-        todo!()
+        false
     }
 
     fn event_type(&self) -> crate::core::model::cache::EventType {
@@ -867,7 +1143,7 @@ impl Clone for ConfigGroupCacheItem {
 #[async_trait::async_trait]
 impl RegistryCacheValue for ConfigGroupCacheItem {
     fn is_loaded_from_file(&self) -> bool {
-        todo!()
+        false
     }
 
     fn event_type(&self) -> crate::core::model::cache::EventType {
@@ -890,7 +1166,7 @@ impl RegistryCacheValue for ConfigGroupCacheItem {
 // ConfigFileCacheItem 单个配置文件的最新发布信息
 pub struct ConfigFileCacheItem {
     initialized: Arc<AtomicBool>,
-    pub value: ClientConfigFileInfo,
+    pub value: ConfigFileRelease,
     pub revision: String,
 }
 
@@ -904,25 +1180,20 @@ impl ConfigFileCacheItem {
     pub fn new() -> Self {
         Self {
             initialized: Arc::new(AtomicBool::new(false)),
-            value: ClientConfigFileInfo::default(),
+            value: ConfigFileRelease::default(),
             revision: String::new(),
         }
     }
 
     pub fn to_config_file(&self) -> ConfigFile {
-        let mut labels = HashMap::<String, String>::new();
-        for label in self.value.tags.iter() {
-            labels.insert(label.key.clone().unwrap(), label.value.clone().unwrap());
-        }
-
         ConfigFile {
-            namespace: self.value.namespace.clone().unwrap_or_default(),
-            group: self.value.group.clone().unwrap_or_default(),
-            name: self.value.file_name.clone().unwrap_or_default(),
-            version: self.value.version.unwrap_or_default(),
-            content: self.value.content.clone().unwrap_or_default(),
-            labels,
-            encrypt_algo: String::new(),
+            namespace: self.value.namespace.clone(),
+            group: self.value.group.clone(),
+            name: self.value.file_name.clone(),
+            version: self.value.version,
+            content: self.value.content.clone(),
+            labels: self.value.labels.clone(),
+            encrypt_algo: self.value.encrypt_algo.clone(),
             encrypt_key: String::new(),
         }
     }
@@ -950,7 +1221,7 @@ impl Clone for ConfigFileCacheItem {
 #[async_trait::async_trait]
 impl RegistryCacheValue for ConfigFileCacheItem {
     fn is_loaded_from_file(&self) -> bool {
-        todo!()
+        false
     }
 
     fn event_type(&self) -> crate::core::model::cache::EventType {
@@ -967,5 +1238,61 @@ impl RegistryCacheValue for ConfigFileCacheItem {
 
     fn revision(&self) -> String {
         self.revision.clone()
+    }
+}
+
+#[cfg(test)]
+mod cache_item_state_tests {
+    use super::*;
+
+    fn assert_memory_cache_state<T: RegistryCacheValue>(item: &T, expected_revision: &str) {
+        assert!(!item.is_loaded_from_file());
+        assert_eq!(item.revision(), expected_revision);
+    }
+
+    #[test]
+    fn service_cache_item_state_methods_do_not_panic() {
+        let mut item = ServicesCacheItem::new();
+        item.revision = "svc-rev".to_string();
+
+        assert_memory_cache_state(&item, "svc-rev");
+    }
+
+    #[test]
+    fn registry_cache_item_state_methods_do_not_panic() {
+        let mut instances = ServiceInstancesCacheItem::new();
+        instances.revision = "instances-rev".to_string();
+        assert_memory_cache_state(&instances, "instances-rev");
+
+        let mut router = RouterRulesCacheItem::new();
+        router.revision = "router-rev".to_string();
+        assert_memory_cache_state(&router, "router-rev");
+
+        let mut lane = LaneRulesCacheItem::new();
+        lane.revision = "lane-rev".to_string();
+        assert_memory_cache_state(&lane, "lane-rev");
+
+        let mut ratelimit = RatelimitRulesCacheItem::new();
+        ratelimit.revision = "ratelimit-rev".to_string();
+        assert_memory_cache_state(&ratelimit, "ratelimit-rev");
+
+        let mut circuitbreaker = CircuitBreakerRulesCacheItem::new();
+        circuitbreaker.revision = "circuitbreaker-rev".to_string();
+        assert_memory_cache_state(&circuitbreaker, "circuitbreaker-rev");
+
+        let mut faultdetect = FaultDetectRulesCacheItem::new();
+        faultdetect.revision = "faultdetect-rev".to_string();
+        assert_memory_cache_state(&faultdetect, "faultdetect-rev");
+    }
+
+    #[test]
+    fn config_cache_item_state_methods_do_not_panic() {
+        let mut group = ConfigGroupCacheItem::new();
+        group.revision = "group-rev".to_string();
+        assert_memory_cache_state(&group, "group-rev");
+
+        let mut file = ConfigFileCacheItem::new();
+        file.revision = "file-rev".to_string();
+        assert_memory_cache_state(&file, "file-rev");
     }
 }

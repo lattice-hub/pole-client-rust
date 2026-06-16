@@ -1,4 +1,4 @@
-// Tencent is pleased to support the open source community by making Polaris available.
+// Tencent is pleased to support the open source community by making Pole available.
 //
 // Copyright (C) 2019 THL A29 Limited, a Tencent company. All rights reserved.
 //
@@ -25,11 +25,12 @@ use std::{
 use tokio::{sync::RwLock, task::JoinHandle, time::sleep};
 
 use crate::core::plugin::router::ServiceRouter;
+use pole_specification::v1::CircuitBreakerRule;
 
 use super::{
     model::{
         circuitbreaker::{CheckResult, CircuitBreakerStatus, Resource, ResourceStat, Status},
-        error::PolarisError,
+        error::PoleError,
         naming::ServiceInstances,
         router::RouteInfo,
         ClientContext, ReportClientRequest,
@@ -112,7 +113,7 @@ impl CircuitBreakerFlow {
         CircuitBreakerFlow { extensions }
     }
 
-    pub async fn check_resource(&self, resource: Resource) -> Result<CheckResult, PolarisError> {
+    pub async fn check_resource(&self, resource: Resource) -> Result<CheckResult, PoleError> {
         let circuit_breaker_opt = self.extensions.circuit_breaker.clone();
         // 没有熔断插件，直接结束流程
         if circuit_breaker_opt.is_none() {
@@ -124,7 +125,7 @@ impl CircuitBreakerFlow {
         Ok(CircuitBreakerFlow::convert_from_status(status))
     }
 
-    pub async fn report_stat(&self, stat: ResourceStat) -> Result<(), PolarisError> {
+    pub async fn report_stat(&self, stat: ResourceStat) -> Result<(), PoleError> {
         let circuit_breaker_opt = self.extensions.circuit_breaker.clone();
         if circuit_breaker_opt.is_none() {
             return Ok(());
@@ -134,13 +135,44 @@ impl CircuitBreakerFlow {
         circuit_breaker.report_stat(stat).await
     }
 
+    pub fn update_rules(&self, rules: Vec<CircuitBreakerRule>) {
+        let Some(circuit_breaker) = self.extensions.circuit_breaker.clone() else {
+            return;
+        };
+        circuit_breaker.update_rules(rules);
+    }
+
     fn convert_from_status(ret: CircuitBreakerStatus) -> CheckResult {
         let status = ret.status;
         CheckResult {
-            pass: status == Status::Open,
+            pass: status != Status::Open,
             rule_name: ret.circuit_breaker,
             fallback_info: ret.fallback_info.clone(),
         }
+    }
+}
+
+#[cfg(test)]
+mod circuit_breaker_flow_tests {
+    use super::*;
+
+    fn status(status: Status) -> CircuitBreakerStatus {
+        CircuitBreakerStatus {
+            circuit_breaker: "rule-a".to_string(),
+            status,
+            start_ms: 0,
+            fallback_info: None,
+            destroy: false,
+        }
+    }
+
+    #[test]
+    fn convert_from_status_blocks_open_and_passes_close() {
+        let open = CircuitBreakerFlow::convert_from_status(status(Status::Open));
+        let close = CircuitBreakerFlow::convert_from_status(status(Status::Close));
+
+        assert!(!open.pass);
+        assert!(close.pass);
     }
 }
 
@@ -168,7 +200,7 @@ impl RouterFlow {
         &self,
         route_info: RouteInfo,
         instances: ServiceInstances,
-    ) -> Result<ServiceInstances, PolarisError> {
+    ) -> Result<ServiceInstances, PoleError> {
         let router_container = self.extensions.get_router_container();
 
         let route_ctx = RouteContext {
@@ -228,18 +260,5 @@ impl RouterFlow {
         }
 
         Ok(tmp_instance)
-    }
-}
-
-/// RatelimitFlow 限流流程
-pub struct RatelimitFlow {
-    extensions: Arc<Extensions>,
-}
-
-impl RatelimitFlow {
-    pub fn new(extensions: Arc<Extensions>) -> Self {
-        Self {
-            extensions,
-        }
     }
 }

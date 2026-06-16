@@ -1,4 +1,4 @@
-// Tencent is pleased to support the open source community by making Polaris available.
+// Tencent is pleased to support the open source community by making Pole available.
 //
 // Copyright (C) 2019 THL A29 Limited, a Tencent company. All rights reserved.
 //
@@ -15,12 +15,18 @@
 
 use std::{
     collections::HashMap,
-    sync::{atomic::AtomicU32, Arc, RwLock},
+    sync::{
+        atomic::{AtomicI64, AtomicU32},
+        Arc, RwLock,
+    },
     time::Instant,
 };
 
 use crate::core::{
-    model::naming::Instance,
+    model::{
+        error::{ErrorCode, PoleError},
+        naming::Instance,
+    },
     plugin::{loadbalance::LoadBalancer, plugins::Plugin},
 };
 
@@ -48,13 +54,9 @@ impl Plugin for WeightedRoundRobinBalancer {
         PLUGIN_NAME.to_string()
     }
 
-    fn init(&mut self) {
-        todo!()
-    }
+    fn init(&mut self) {}
 
-    fn destroy(&self) {
-        todo!()
-    }
+    fn destroy(&self) {}
 }
 
 impl LoadBalancer for WeightedRoundRobinBalancer {
@@ -62,7 +64,14 @@ impl LoadBalancer for WeightedRoundRobinBalancer {
         &self,
         _criteria: crate::core::model::loadbalance::Criteria,
         instances: crate::core::model::naming::ServiceInstances,
-    ) -> Result<crate::core::model::naming::Instance, crate::core::model::error::PolarisError> {
+    ) -> Result<crate::core::model::naming::Instance, crate::core::model::error::PoleError> {
+        if instances.instances.is_empty() || instances.get_total_weight() == 0 {
+            return Err(PoleError::new(
+                ErrorCode::InstanceInfoError,
+                "instances is empty or total weight is 0".to_string(),
+            ));
+        }
+
         let cache_key = instances.get_cache_key();
         {
             let mut round_robin_cache = self.round_robin_cache.write().unwrap();
@@ -87,12 +96,13 @@ impl LoadBalancer for WeightedRoundRobinBalancer {
                             weight_robin.reset(instance.weight);
                         }
                     }
-                });
+                })
+                .or_insert_with(|| WeightedRoundRobins::new(&instances.instances));
         }
 
         let mut selected_wrr: Option<WeightedRoundRobin> = None;
         let mut selected_ins: Option<&Instance> = None;
-        let mut max_weight: i32 = -1;
+        let mut max_weight: i64 = i64::MIN;
 
         let svc_ins_cache_repo = self.round_robin_cache.read().unwrap();
         let svc_ins_cache = svc_ins_cache_repo.get(&cache_key).unwrap();
@@ -103,22 +113,19 @@ impl LoadBalancer for WeightedRoundRobinBalancer {
 
             weight_robin.update_last_fetch();
 
-            if cur_weight as i32 > max_weight {
-                max_weight = cur_weight as i32;
+            if cur_weight > max_weight {
+                max_weight = cur_weight;
                 selected_wrr = Some(weight_robin.clone());
                 selected_ins = Some(ins);
             }
         }
 
-        if selected_ins.is_none() {
-            // 直接返回第一个
-            return Ok(instances.instances[0].clone());
-        }
-
         selected_wrr
-            .unwrap()
+            .expect("weighted round robin should select from non-empty instances")
             .decrease_cur_weight(instances.get_total_weight() as u32);
-        Ok(selected_ins.unwrap().clone())
+        Ok(selected_ins
+            .expect("weighted round robin should select from non-empty instances")
+            .clone())
     }
 }
 
@@ -126,9 +133,24 @@ struct WeightedRoundRobins {
     round_robins: Arc<RwLock<HashMap<String, WeightedRoundRobin>>>,
 }
 
+impl WeightedRoundRobins {
+    fn new(instances: &[Instance]) -> Self {
+        Self {
+            round_robins: Arc::new(RwLock::new(HashMap::from_iter(instances.iter().map(
+                |instance| {
+                    (
+                        instance.id.clone(),
+                        WeightedRoundRobin::new(instance.weight),
+                    )
+                },
+            )))),
+        }
+    }
+}
+
 #[derive(Clone)]
 struct WeightedRoundRobin {
-    cur_weight: Arc<AtomicU32>,
+    cur_weight: Arc<AtomicI64>,
     weight: Arc<AtomicU32>,
     last_fetch: Arc<RwLock<Instant>>,
 }
@@ -136,7 +158,7 @@ struct WeightedRoundRobin {
 impl WeightedRoundRobin {
     fn new(weight: u32) -> Self {
         Self {
-            cur_weight: Arc::new(AtomicU32::new(0)),
+            cur_weight: Arc::new(AtomicI64::new(0)),
             weight: Arc::new(AtomicU32::new(weight)),
             last_fetch: Arc::new(RwLock::new(Instant::now())),
         }
@@ -153,16 +175,16 @@ impl WeightedRoundRobin {
         self.weight.load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    fn increase_cur_weight(&self) -> u32 {
-        self.cur_weight.fetch_add(
-            self.weight.load(std::sync::atomic::Ordering::Relaxed),
-            std::sync::atomic::Ordering::Relaxed,
-        )
+    fn increase_cur_weight(&self) -> i64 {
+        let weight = self.weight.load(std::sync::atomic::Ordering::Relaxed) as i64;
+        self.cur_weight
+            .fetch_add(weight, std::sync::atomic::Ordering::Relaxed)
+            + weight
     }
 
     fn decrease_cur_weight(&self, weight: u32) {
         self.cur_weight
-            .fetch_sub(weight, std::sync::atomic::Ordering::Relaxed);
+            .fetch_sub(weight as i64, std::sync::atomic::Ordering::Relaxed);
     }
 
     fn update_last_fetch(&self) {
@@ -172,5 +194,73 @@ impl WeightedRoundRobin {
     /// is_expire 超过 60s 未被使用则认为过期
     fn is_expire(&self) -> bool {
         self.last_fetch.read().unwrap().elapsed().as_secs() > 60
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::model::{
+        loadbalance::Criteria,
+        naming::{Instance, ServiceInfo, ServiceInstances},
+    };
+
+    fn instance(id: &str, weight: u32) -> Instance {
+        Instance {
+            id: id.to_string(),
+            namespace: "default".to_string(),
+            service: "orders".to_string(),
+            ip: format!("127.0.0.{}", weight),
+            port: 8080 + weight,
+            weight,
+            health: true,
+            ..Instance::default()
+        }
+    }
+
+    fn service_instances() -> ServiceInstances {
+        ServiceInstances::new(
+            ServiceInfo {
+                namespace: "default".to_string(),
+                name: "orders".to_string(),
+                revision: "rev-1".to_string(),
+                ..ServiceInfo::default()
+            },
+            vec![instance("a", 1), instance("b", 2)],
+        )
+    }
+
+    fn criteria() -> Criteria {
+        Criteria {
+            policy: "weightedRoundRobin".to_string(),
+            hash_key: "".to_string(),
+        }
+    }
+
+    #[test]
+    fn weighted_round_robin_lifecycle_methods_do_not_panic() {
+        let (supplier, _) = WeightedRoundRobinBalancer::builder();
+        let mut balancer = supplier();
+
+        balancer.init();
+        balancer.destroy();
+    }
+
+    #[test]
+    fn weighted_round_robin_first_call_initializes_cache_and_honors_weight() {
+        let (supplier, _) = WeightedRoundRobinBalancer::builder();
+        let balancer = supplier();
+
+        let selected = (0..3)
+            .map(|_| {
+                balancer
+                    .choose_instance(criteria(), service_instances())
+                    .unwrap()
+                    .id
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(selected.iter().filter(|id| id.as_str() == "a").count(), 1);
+        assert_eq!(selected.iter().filter(|id| id.as_str() == "b").count(), 2);
     }
 }

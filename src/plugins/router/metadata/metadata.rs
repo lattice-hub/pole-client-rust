@@ -1,4 +1,4 @@
-// Tencent is pleased to support the open source community by making Polaris available.
+// Tencent is pleased to support the open source community by making Pole available.
 //
 // Copyright (C) 2019 THL A29 Limited, a Tencent company. All rights reserved.
 //
@@ -13,16 +13,12 @@
 // CONDITIONS OF ANY KIND, either express or implied. See the License for the
 // specific language governing permissions and limitations under the License.
 
-use std::collections::HashMap;
-
 use crate::core::{
     config::consumer::ServiceRouterPluginConfig,
     model::{
-        error::PolarisError,
-        naming::{Instance, ServiceInfo, ServiceInstances},
-        router::{
-            MetadataFailoverType, RouteInfo, RouteResult, RouteState, DEFAULT_ROUTER_METADATA,
-        },
+        error::PoleError,
+        naming::{Instance, ServiceInstances},
+        router::{MetadataFailoverType, RouteResult, RouteState, DEFAULT_ROUTER_METADATA},
     },
     plugin::{
         plugins::Plugin,
@@ -73,7 +69,7 @@ impl ServiceRouter for MetadataRouter {
         &self,
         route_ctx: RouteContext,
         instances: ServiceInstances,
-    ) -> Result<RouteResult, PolarisError> {
+    ) -> Result<RouteResult, PoleError> {
         let mut failover_type = route_ctx.route_info.metadata_failover.clone();
         let svc_info = instances.service.clone();
         if let Some(_custom_failover_type) = svc_info.metadata.get(KEY_METADATA_FAILOVER) {
@@ -137,7 +133,7 @@ impl ServiceRouter for MetadataRouter {
                 }
             }
             _ => {
-                return Err(PolarisError::new(
+                return Err(PoleError::new(
                     crate::core::model::error::ErrorCode::MetadataMismatch,
                     format!(
                         "can not find any instance by service namespace({}) name({})",
@@ -158,8 +154,8 @@ impl ServiceRouter for MetadataRouter {
     }
 
     /// enable 是否启用
-    async fn enable(&self, route_info: RouteContext, instances: ServiceInstances) -> bool {
-        return true;
+    async fn enable(&self, _route_info: RouteContext, _instances: ServiceInstances) -> bool {
+        true
     }
 }
 
@@ -174,27 +170,28 @@ fn paese_custom_failover_type(v: &str) -> MetadataFailoverType {
 
 #[cfg(test)]
 mod tests {
-    use crate::core::plugin::plugins::Extensions;
-    use std::sync::Arc;
+    use std::collections::HashMap;
     use std::sync::Once;
 
     use super::*;
 
-    use tracing::metadata::LevelFilter;
+    use crate::core::model::naming::ServiceInfo;
+    use crate::core::model::router::RouteInfo;
     use crate::info;
+    use tracing::metadata::LevelFilter;
 
     static LOGGER_INIT: Once = Once::new();
 
     pub(crate) fn setup_log() {
         LOGGER_INIT.call_once(|| {
-            tracing_subscriber::fmt()
+            let _ = tracing_subscriber::fmt()
                 .with_thread_names(true)
                 .with_file(true)
                 .with_level(true)
                 .with_line_number(true)
                 .with_thread_ids(true)
                 .with_max_level(LevelFilter::DEBUG)
-                .init()
+                .try_init();
         });
     }
 

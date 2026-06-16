@@ -1,10 +1,10 @@
-# Polaris rust sdk
+# Pole rust sdk
 
-[![Build](https://github.com/polaris-contrib/polaris-rust/workflows/Build/badge.svg)](https://github.com/polarismesh/polaris-rust/actions?query=workflow%3ABuild)
-[![docs.rs](https://docs.rs/polaris-rust/badge.svg)](https://docs.rs/polaris-rust/)
-[![License](https://img.shields.io/crates/l/polaris-rust)](LICENSE)
-[![Crates.io](https://img.shields.io/crates/v/polaris-rust)](https://crates.io/crates/polaris-rust)
-[![Crates.io](https://img.shields.io/crates/d/polaris-rust)](https://crates.io/crates/polaris-rust)
+[![Build](https://github.com/pole-io/pole-client-rust/workflows/Build/badge.svg)](https://github.com/pole-io/pole-client-rust/actions?query=workflow%3ABuild)
+[![docs.rs](https://docs.rs/pole_rust/badge.svg)](https://docs.rs/pole_rust/)
+[![License](https://img.shields.io/crates/l/pole_rust)](LICENSE)
+[![Crates.io](https://img.shields.io/crates/v/pole_rust)](https://crates.io/crates/pole_rust)
+[![Crates.io](https://img.shields.io/crates/d/pole_rust)](https://crates.io/crates/pole_rust)
 
 ## Introduction
 
@@ -16,7 +16,7 @@ Add the following to your `Cargo.toml`:
 
 ```toml 
 [dependencies]
-polaris-rust = "0.2.0"
+pole_rust = "0.2.0"
 ```
 
 ## Quickstart

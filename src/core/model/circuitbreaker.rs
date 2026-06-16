@@ -1,4 +1,4 @@
-// Tencent is pleased to support the open source community by making Polaris available.
+// Tencent is pleased to support the open source community by making Pole available.
 //
 // Copyright (C) 2019 THL A29 Limited, a Tencent company. All rights reserved.
 //
@@ -14,12 +14,15 @@
 // specific language governing permissions and limitations under the License.
 
 use std::{
-    fmt::{self, format, Display},
+    fmt::{self, Display},
     iter::Map,
-    str, time::Duration,
+    time::Duration,
 };
 
-use super::{error::{ErrorCode, PolarisError}, naming::ServiceKey};
+use super::{
+    error::{ErrorCode, PoleError},
+    naming::ServiceKey,
+};
 
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub enum Status {
@@ -73,15 +76,19 @@ pub struct ServiceResource {
 }
 
 impl ServiceResource {
-
     pub fn new(callee: ServiceKey) -> Self {
-        ServiceResource { caller: None, callee }
+        ServiceResource {
+            caller: None,
+            callee,
+        }
     }
 
     pub fn new_waith_caller(caller: ServiceKey, callee: ServiceKey) -> Self {
-        ServiceResource { caller: Some(caller), callee }
+        ServiceResource {
+            caller: Some(caller),
+            callee,
+        }
     }
-
 }
 
 /// MethodResource 方法资源
@@ -94,15 +101,31 @@ pub struct MethodResource {
 }
 
 impl MethodResource {
-
     pub fn new(callee: ServiceKey, protocol: String, method: String, path: String) -> Self {
-        MethodResource { caller: None, callee, protocol, method, path }
+        MethodResource {
+            caller: None,
+            callee,
+            protocol,
+            method,
+            path,
+        }
     }
 
-    pub fn new_waith_caller(caller: ServiceKey, callee: ServiceKey, protocol: String, method: String, path: String) -> Self {
-        MethodResource { caller: Some(caller), callee, protocol, method, path }
+    pub fn new_waith_caller(
+        caller: ServiceKey,
+        callee: ServiceKey,
+        protocol: String,
+        method: String,
+        path: String,
+    ) -> Self {
+        MethodResource {
+            caller: Some(caller),
+            callee,
+            protocol,
+            method,
+            path,
+        }
     }
-
 }
 
 pub struct InstanceResource {}
@@ -136,7 +159,7 @@ pub struct CallAbortedError
 where
     Self: Display + Send + Sync,
 {
-    err: PolarisError,
+    err: PoleError,
     pub rule_name: String,
     pub fallback_info: Option<FallbackInfo>,
 }
@@ -144,7 +167,7 @@ where
 impl CallAbortedError {
     pub fn new(rule_name: String, fallback_info: Option<FallbackInfo>) -> Self {
         CallAbortedError {
-            err: PolarisError::new(
+            err: PoleError::new(
                 ErrorCode::CircuitBreakError,
                 format!("rule {}, fallbackInfo {:?}", rule_name, fallback_info),
             ),

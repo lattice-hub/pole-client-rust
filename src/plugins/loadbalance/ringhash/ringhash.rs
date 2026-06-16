@@ -1,4 +1,4 @@
-// Tencent is pleased to support the open source community by making Polaris available.
+// Tencent is pleased to support the open source community by making Pole available.
 //
 // Copyright (C) 2019 THL A29 Limited, a Tencent company. All rights reserved.
 //
@@ -61,7 +61,7 @@ impl LoadBalancer for ConsistentHashLoadBalancer {
         &self,
         criteria: crate::core::model::loadbalance::Criteria,
         instances: crate::core::model::naming::ServiceInstances,
-    ) -> Result<crate::core::model::naming::Instance, crate::core::model::error::PolarisError> {
+    ) -> Result<crate::core::model::naming::Instance, crate::core::model::error::PoleError> {
         let ring_cache_key = instances.get_cache_key();
 
         // 先判断 ring hash 是否已经存在，如果不存在则创建并初始化一个

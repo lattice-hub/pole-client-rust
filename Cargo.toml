@@ -1,25 +1,25 @@
 [package]
 edition = "2021"
-name = "polaris-rust"
+name = "pole_rust"
 version = "0.2.0-alpha.0"
 
-authors = ["polaris-contrib", "houseme <housemecn@gmail.com>", "liaochuntao <liaochuntao@live.com>"]
+authors = ["pole-io", "houseme <housemecn@gmail.com>", "liaochuntao <liaochuntao@live.com>"]
 categories = ["network-programming", "development-tools"]
 description = "Lightweight Rust SDK used as Proxyless Service Governance Solution."
-documentation = "https://docs.rs/polaris-rust"
-homepage = "https://polarismesh.cn"
-keywords = ["polaris", "discovery", "configuration", "governance"]
+documentation = "https://docs.rs/pole_rust"
+homepage = "https://github.com/pole-io/pole-client-rust"
+keywords = ["pole", "discovery", "configuration", "governance"]
 license = "BSD-3-Clause OR MIT OR Apache-2.0"
 readme = "README.md"
-repository = "https://github.com/polaris-contrib/polaris-rust"
+repository = "https://github.com/pole-io/pole-client-rust"
 # Crate build related
-exclude = ["examples/*", "benches/*", "tests/*", ".gitignore"]
+exclude = ["examples/*", "benches/*", "tests/*", "e2e_tests/*", ".gitignore"]
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 [dependencies]
 
-# polaris-spec dep
-polaris-specification = {version = "=1.5.4-2"}
+# pole spec dep
+pole-specification = { package = "pole-specification", git = "https://github.com/pole-io/specification.git", tag = "v0.1.0-ALPHA.26" }
 
 # common dep
 bytes = {version = "1.4.0"}
@@ -43,7 +43,7 @@ reqwest = {version = "0.12.8", features = ["blocking"]}
 
 # async
 async-trait = {version = "0.1"}
-http = {version = "0.2.12"}
+http = {version = "1.4.0"}
 hyper = {version = "1.5.0", features = ["full"]}
 tokio = {version = "1.37.0", features = ["full"]}
 tokio-stream = {version = "0.1.16"}
@@ -51,11 +51,13 @@ tower = {version = "0.4.13"}
 
 # gRPC dep
 futures = {version = "0.3.30"}
+h2 = {version = "0.4.14"}
 once_cell = {version = "1.19.0"}
-prost = {version = "0.12.4"}
-prost-build = {version = "0.12.4"}
-prost-types = {version = "0.12.4"}
-tonic = {version = "0.11.0"}
+prost = {version = "0.14.4"}
+prost-build = {version = "0.14.4"}
+prost-types = {version = "0.14.4"}
+tonic = {version = "0.14.6"}
+tonic-prost = {version = "0.14.2"}
 
 # logging
 tracing = {version = "0.1.36"}
@@ -79,3 +81,6 @@ path = "examples/discover.rs"
 [[example]]
 name = "config"
 path = "examples/config.rs"
+
+[workspace]
+members = ["e2e_tests"]

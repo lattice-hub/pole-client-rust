@@ -1,4 +1,4 @@
-// Tencent is pleased to support the open source community by making Polaris available.
+// Tencent is pleased to support the open source community by making Pole available.
 //
 // Copyright (C) 2019 THL A29 Limited, a Tencent company. All rights reserved.
 //
@@ -15,23 +15,27 @@
 
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
-use polaris_rust::{config::{
-    api::{new_config_file_api_by_context, ConfigFileAPI},
-    req::{
-        CreateConfigFileRequest, PublishConfigFileRequest, UpdateConfigFileRequest,
-        UpsertAndPublishConfigFileRequest, WatchConfigFileRequest,
+use pole_rust::{
+    config::{
+        api::{new_config_file_api_by_context, ConfigFileAPI},
+        req::{
+            CreateConfigFileRequest, PublishConfigFileRequest, UpdateConfigFileRequest,
+            UpsertAndPublishConfigFileRequest, WatchConfigFileRequest,
+        },
     },
-}, core::{
-    context::SDKContext,
-    model::{
-        config::{ConfigFile, ConfigFileRelease},
-        error::PolarisError,
+    core::{
+        context::SDKContext,
+        model::{
+            config::{ConfigFile, ConfigFileRelease},
+            error::PoleError,
+        },
     },
-}, info};
+    info,
+};
 use tracing::level_filters::LevelFilter;
 
 #[tokio::main]
-async fn main() -> Result<(), PolarisError> {
+async fn main() -> Result<(), PoleError> {
     tracing_subscriber::fmt()
         // all spans/events with a level higher than TRACE (e.g, info, warn, etc.)
         // will be written to stdout.
@@ -52,8 +56,8 @@ async fn main() -> Result<(), PolarisError> {
             "create sdk context fail: {}",
             sdk_context_ret.err().unwrap()
         );
-        return Err(PolarisError::new(
-            polaris_rust::core::model::error::ErrorCode::UnknownServerError,
+        return Err(PoleError::new(
+            pole_rust::core::model::error::ErrorCode::UnknownServerError,
             "".to_string(),
         ));
     }
@@ -65,8 +69,8 @@ async fn main() -> Result<(), PolarisError> {
             "create config_file api fail: {}",
             config_file_api_ret.err().unwrap()
         );
-        return Err(PolarisError::new(
-            polaris_rust::core::model::error::ErrorCode::UnknownServerError,
+        return Err(PoleError::new(
+            pole_rust::core::model::error::ErrorCode::UnknownServerError,
             "".to_string(),
         ));
     }
@@ -100,8 +104,8 @@ async fn main() -> Result<(), PolarisError> {
 
     if ret.is_err() {
         tracing::error!("create config_file fail: {}", ret.err().unwrap());
-        return Err(PolarisError::new(
-            polaris_rust::core::model::error::ErrorCode::UnknownServerError,
+        return Err(PoleError::new(
+            pole_rust::core::model::error::ErrorCode::UnknownServerError,
             "".to_string(),
         ));
     }
@@ -124,8 +128,8 @@ async fn main() -> Result<(), PolarisError> {
 
     if ret.is_err() {
         tracing::error!("update config_file fail: {}", ret.err().unwrap());
-        return Err(PolarisError::new(
-            polaris_rust::core::model::error::ErrorCode::UnknownServerError,
+        return Err(PoleError::new(
+            pole_rust::core::model::error::ErrorCode::UnknownServerError,
             "".to_string(),
         ));
     }
@@ -147,8 +151,8 @@ async fn main() -> Result<(), PolarisError> {
 
     if ret.is_err() {
         tracing::error!("publish config_file fail: {}", ret.err().unwrap());
-        return Err(PolarisError::new(
-            polaris_rust::core::model::error::ErrorCode::UnknownServerError,
+        return Err(PoleError::new(
+            pole_rust::core::model::error::ErrorCode::UnknownServerError,
             "".to_string(),
         ));
     }
@@ -189,8 +193,8 @@ async fn main() -> Result<(), PolarisError> {
                 "upsert and publish config_file fail: {}",
                 ret.err().unwrap()
             );
-            return Err(PolarisError::new(
-                polaris_rust::core::model::error::ErrorCode::UnknownServerError,
+            return Err(PoleError::new(
+                pole_rust::core::model::error::ErrorCode::UnknownServerError,
                 "".to_string(),
             ));
         }

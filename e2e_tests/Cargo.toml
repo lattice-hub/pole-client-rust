@@ -1,0 +1,14 @@
+[package]
+edition = "2021"
+name = "e2e_tests"
+version = "0.1.0"
+publish = false
+
+[dependencies]
+pole_rust = { path = ".." }
+pole-specification = { package = "pole-specification", git = "https://github.com/pole-io/specification.git", tag = "v0.1.0-ALPHA.26" }
+reqwest = { version = "0.12.8", features = ["json"] }
+serde = { version = "1.0.198", features = ["derive"] }
+serde_json = { version = "1.0.116" }
+tokio = { version = "1.37.0", features = ["macros", "rt-multi-thread", "time"] }
+uuid = { version = "1.8.0", features = ["v4", "fast-rng"] }

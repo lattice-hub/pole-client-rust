@@ -1,4 +1,4 @@
-// Tencent is pleased to support the open source community by making Polaris available.
+// Tencent is pleased to support the open source community by making Pole available.
 //
 // Copyright (C) 2019 THL A29 Limited, a Tencent company. All rights reserved.
 //
@@ -16,6 +16,7 @@
 use crate::core::model::loadbalance::Criteria;
 use crate::core::model::naming::{Instance, ServiceInstances};
 use crate::core::model::router::RouteInfo;
+use crate::traffic::policy::req::{MirrorRequest, TrafficGovernanceResult};
 
 // 负载均衡相关请求
 #[derive(Debug)]
@@ -33,8 +34,26 @@ pub struct ProcessLoadBalanceResponse {
 pub struct ProcessRouteRequest {
     pub service_instances: ServiceInstances,
     pub route_info: RouteInfo,
+    pub mirror_request: Option<MirrorRequest>,
 }
 
 pub struct ProcessRouteResponse {
     pub service_instances: ServiceInstances,
+    pub traffic_governance: TrafficGovernanceResult,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::traffic::policy::req::TrafficGovernanceResult;
+
+    #[test]
+    fn process_route_response_carries_traffic_governance_result() {
+        let response = ProcessRouteResponse {
+            service_instances: ServiceInstances::default(),
+            traffic_governance: TrafficGovernanceResult::default(),
+        };
+
+        assert!(response.traffic_governance.security.allowed);
+    }
 }

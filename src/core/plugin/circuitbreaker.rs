@@ -1,4 +1,4 @@
-// Tencent is pleased to support the open source community by making Polaris available.
+// Tencent is pleased to support the open source community by making Pole available.
 //
 // Copyright (C) 2019 THL A29 Limited, a Tencent company. All rights reserved.
 //
@@ -14,17 +14,18 @@
 // specific language governing permissions and limitations under the License.
 
 use crate::core::model::circuitbreaker::{Resource, ResourceStat};
-use crate::core::model::{circuitbreaker::CircuitBreakerStatus, error::PolarisError};
+use crate::core::model::{circuitbreaker::CircuitBreakerStatus, error::PoleError};
 
 use crate::core::plugin::plugins::Plugin;
+use pole_specification::v1::CircuitBreakerRule;
 
 #[async_trait::async_trait]
 pub trait CircuitBreaker: Plugin {
+    /// update_rules 更新远程熔断规则
+    fn update_rules(&self, _rules: Vec<CircuitBreakerRule>) {}
+
     /// check_resource 检查资源
-    async fn check_resource(
-        &self,
-        resource: Resource,
-    ) -> Result<CircuitBreakerStatus, PolarisError>;
+    async fn check_resource(&self, resource: Resource) -> Result<CircuitBreakerStatus, PoleError>;
     /// report_stat 上报统计信息
-    async fn report_stat(&self, stat: ResourceStat) -> Result<(), PolarisError>;
+    async fn report_stat(&self, stat: ResourceStat) -> Result<(), PoleError>;
 }

@@ -1,4 +1,4 @@
-// Tencent is pleased to support the open source community by making Polaris available.
+// Tencent is pleased to support the open source community by making Pole available.
 //
 // Copyright (C) 2019 THL A29 Limited, a Tencent company. All rights reserved.
 //
@@ -117,15 +117,6 @@ pub struct StatReporterPluginConfig {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct LocationConfig {
     pub providers: Option<Vec<LocationProviderConfig>>,
-}
-
-fn default_location_providers() -> Vec<LocationProviderConfig> {
-    let mut providers = Vec::new();
-    providers.push(LocationProviderConfig {
-        name: "local".to_string(),
-        options: HashMap::new(),
-    });
-    providers
 }
 
 #[derive(Deserialize, Debug, Clone)]

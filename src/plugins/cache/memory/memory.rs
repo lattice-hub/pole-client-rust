@@ -1,4 +1,4 @@
-// Tencent is pleased to support the open source community by making Polaris available.
+// Tencent is pleased to support the open source community by making Pole available.
 //
 // Copyright (C) 2019 THL A29 Limited, a Tencent company. All rights reserved.
 //
@@ -13,29 +13,29 @@
 // CONDITIONS OF ANY KIND, either express or implied. See the License for the
 // specific language governing permissions and limitations under the License.
 
-use prost::Message;
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use tokio::sync::RwLock;
 
+use super::failover::DiskCacheFailover;
 use crate::core::model::cache::{
     CacheItemType, CircuitBreakerRulesCacheItem, ConfigFileCacheItem, ConfigGroupCacheItem,
-    EventType, FaultDetectRulesCacheItem, RatelimitRulesCacheItem, RegistryCacheValue, RemoteData,
-    ResourceEventKey, RouterRulesCacheItem, ServerEvent, ServiceInstancesCacheItem,
-    ServicesCacheItem,
+    EventType, FaultDetectRulesCacheItem, LaneRulesCacheItem, LosslessRulesCacheItem,
+    RatelimitRulesCacheItem, RegistryCacheValue, RemoteData, ResourceEventKey,
+    RouterRulesCacheItem, ServerEvent, ServiceInstancesCacheItem, ServicesCacheItem,
+    TrafficMirrorRulesCacheItem, TrafficMockRulesCacheItem, TrafficSecurityRulesCacheItem,
 };
 use crate::core::model::config::{ConfigFile, ConfigGroup};
-use crate::core::model::error::{ErrorCode, PolarisError};
+use crate::core::model::error::{ErrorCode, PoleError};
 use crate::core::model::naming::{Instance, ServiceRule, Services};
 use crate::core::plugin::cache::{
     Action, Filter, InitResourceCacheOption, ResourceCache, ResourceCacheFailover, ResourceListener,
 };
 use crate::core::plugin::connector::{Connector, ResourceHandler};
 use crate::core::plugin::plugins::Plugin;
+use crate::{error, info};
 use std::any::Any;
 use std::collections::HashMap;
 use std::sync::Arc;
-use crate::{error, info};
-use super::failover::DiskCacheFailover;
 
 static MEMORY_CACHE_NAME: &str = "memory";
 
@@ -55,6 +55,16 @@ struct MemoryResourceHandler {
     circuitbreaker_rules: Arc<RwLock<HashMap<String, CircuitBreakerRulesCacheItem>>>,
     // faultdetect_rules 主动探测规则缓存 key: namespace#service
     faultdetect_rules: Arc<RwLock<HashMap<String, FaultDetectRulesCacheItem>>>,
+    // lane_rules 泳道规则缓存 key: namespace#service
+    lane_rules: Arc<RwLock<HashMap<String, LaneRulesCacheItem>>>,
+    // lossless_rules 优雅上下线规则缓存 key: namespace#service
+    lossless_rules: Arc<RwLock<HashMap<String, LosslessRulesCacheItem>>>,
+    // traffic_security_rules 流量安全规则缓存 key: namespace#service
+    traffic_security_rules: Arc<RwLock<HashMap<String, TrafficSecurityRulesCacheItem>>>,
+    // traffic_mirror_rules 流量镜像规则缓存 key: namespace#service
+    traffic_mirror_rules: Arc<RwLock<HashMap<String, TrafficMirrorRulesCacheItem>>>,
+    // traffic_mock_rules 流量 Mock 规则缓存 key: namespace#service
+    traffic_mock_rules: Arc<RwLock<HashMap<String, TrafficMockRulesCacheItem>>>,
     // config_groups 配置分组缓存 key: namespace#group_name
     config_groups: Arc<RwLock<HashMap<String, ConfigGroupCacheItem>>>,
     // config_files 配置文件缓存 key: namespace#group_name#file_name
@@ -97,7 +107,7 @@ impl MemoryCache {
     fn submit_resource_watch(&self, event_type: EventType, resource_key: ResourceEventKey) {
         let search_namespace = resource_key.namespace.clone();
         info!(
-            "[polaris][resource_cache][memory] load remote resource: {:?}",
+            "[pole][resource_cache][memory] load remote resource: {:?}",
             resource_key
         );
         let server_connector = self.server_connector.clone();
@@ -116,19 +126,16 @@ impl MemoryCache {
                 .await;
             if register_ret.is_err() {
                 error!(
-                "[polaris][resource_cache][memory] register resource handler failed: {}, err: {}",
-                resource_key.namespace.clone(),
-                register_ret.err().unwrap()
-            );
+                    "[pole][resource_cache][memory] register resource handler failed: {}, err: {}",
+                    resource_key.namespace.clone(),
+                    register_ret.err().unwrap()
+                );
             }
         });
     }
 
     async fn on_spec_event(handler: Arc<MemoryResourceHandler>, event: RemoteData) {
-        info!(
-            "[polaris][resource_cache][memory] on spec event: {:?}",
-            event
-        );
+        info!("[pole][resource_cache][memory] on spec event: {:?}", event);
         let mut notify_event = ServerEvent {
             event_key: event.event_key.clone(),
             value: CacheItemType::Unknown,
@@ -146,19 +153,13 @@ impl MemoryCache {
                 let remote_val = event.discover_value.unwrap();
                 let svc = remote_val.service.unwrap();
                 let mut safe_map = handler.instances.write().await;
-                let cache_val_opt = safe_map.get_mut(
-                    format!(
-                        "{}#{}",
-                        svc.namespace.clone().unwrap(),
-                        svc.name.clone().unwrap()
-                    )
-                    .as_str(),
-                );
+                let cache_val_opt = safe_map
+                    .get_mut(format!("{}#{}", svc.namespace.clone(), svc.name.clone()).as_str());
                 if cache_val_opt.is_none() {
                     error!(
-                        "[polaris][resource_cache][memory] service_instance cache not found: namespace={} service={}",
-                        svc.namespace.unwrap(),
-                        svc.name.unwrap()
+                        "[pole][resource_cache][memory] service_instance cache not found: namespace={} service={}",
+                        svc.namespace,
+                        svc.name
                     );
                     return;
                 }
@@ -171,7 +172,7 @@ impl MemoryCache {
                     instances.push(Instance::convert_from_spec(val.clone()));
                 }
 
-                cache_val.revision = svc.revision.unwrap();
+                cache_val.revision = svc.revision;
                 cache_val.finish_initialize();
                 notify_event.value = CacheItemType::Instance(cache_val.clone());
             }
@@ -179,29 +180,22 @@ impl MemoryCache {
                 let remote_val = event.discover_value.unwrap();
                 let svc = remote_val.service.unwrap();
                 let mut safe_map = handler.router_rules.write().await;
-                let cache_val_opt = safe_map.get_mut(
-                    format!(
-                        "{}#{}",
-                        svc.namespace.clone().unwrap(),
-                        svc.name.clone().unwrap()
-                    )
-                    .as_str(),
-                );
+                let cache_val_opt = safe_map
+                    .get_mut(format!("{}#{}", svc.namespace.clone(), svc.name.clone()).as_str());
                 if cache_val_opt.is_none() {
                     error!(
-                        "[polaris][resource_cache][memory] router_rule cache not found: namespace={} service={}",
-                        svc.namespace.unwrap(),
-                        svc.name.unwrap()
+                        "[pole][resource_cache][memory] router_rule cache not found: namespace={} service={}",
+                        svc.namespace,
+                        svc.name
                     );
                     return;
                 }
                 let cache_val = cache_val_opt.unwrap();
                 let mut rules = cache_val.value.write().await;
                 rules.clear();
-                let remote_rules = remote_val.routing.unwrap_or_default();
-                rules.push(remote_rules);
+                rules.extend(remote_val.custom_route_rules);
 
-                cache_val.revision = svc.revision.unwrap();
+                cache_val.revision = svc.revision;
                 cache_val.finish_initialize();
                 notify_event.value = CacheItemType::RouterRule(cache_val.clone());
             }
@@ -209,28 +203,20 @@ impl MemoryCache {
                 let remote_val = event.discover_value.unwrap();
                 let svc = remote_val.service.unwrap();
                 let mut safe_map = handler.circuitbreaker_rules.write().await;
-                let cache_val_opt = safe_map.get_mut(
-                    format!(
-                        "{}#{}",
-                        svc.namespace.clone().unwrap(),
-                        svc.name.clone().unwrap()
-                    )
-                    .as_str(),
-                );
+                let cache_val_opt = safe_map
+                    .get_mut(format!("{}#{}", svc.namespace.clone(), svc.name.clone()).as_str());
                 if cache_val_opt.is_none() {
                     error!(
-                        "[polaris][resource_cache][memory] circuit_breaker cache not found: namespace={} service={}",
-                        svc.namespace.unwrap(),
-                        svc.name.unwrap()
+                        "[pole][resource_cache][memory] circuit_breaker cache not found: namespace={} service={}",
+                        svc.namespace,
+                        svc.name
                     );
                     return;
                 }
                 let cache_val = cache_val_opt.unwrap();
-                let rules = &cache_val.value;
-                let remote_rules = remote_val.circuit_breaker.unwrap_or_default();
-                rules.to_owned().clone_from(&remote_rules);
+                cache_val.value.clone_from(&remote_val.circuit_breaker);
 
-                cache_val.revision = svc.revision.unwrap();
+                cache_val.revision = svc.revision;
                 cache_val.finish_initialize();
                 notify_event.value = CacheItemType::CircuitBreakerRule(cache_val.clone());
             }
@@ -238,28 +224,20 @@ impl MemoryCache {
                 let remote_val = event.discover_value.unwrap();
                 let svc = remote_val.service.unwrap();
                 let mut safe_map = handler.ratelimit_rules.write().await;
-                let cache_val_opt = safe_map.get_mut(
-                    format!(
-                        "{}#{}",
-                        svc.namespace.clone().unwrap(),
-                        svc.name.clone().unwrap()
-                    )
-                    .as_str(),
-                );
+                let cache_val_opt = safe_map
+                    .get_mut(format!("{}#{}", svc.namespace.clone(), svc.name.clone()).as_str());
                 if cache_val_opt.is_none() {
                     error!(
-                        "[polaris][resource_cache][memory] ratelimit cache not found: namespace={} service={}",
-                        svc.namespace.unwrap(),
-                        svc.name.unwrap()
+                        "[pole][resource_cache][memory] ratelimit cache not found: namespace={} service={}",
+                        svc.namespace,
+                        svc.name
                     );
                     return;
                 }
                 let cache_val = cache_val_opt.unwrap();
-                let rules = &cache_val.value;
-                let remote_rules = remote_val.rate_limit.unwrap_or_default();
-                rules.to_owned().clone_from(&remote_rules);
+                cache_val.value.clone_from(&remote_val.rate_limit);
 
-                cache_val.revision = svc.revision.unwrap();
+                cache_val.revision = svc.revision;
                 cache_val.finish_initialize();
                 notify_event.value = CacheItemType::RateLimitRule(cache_val.clone());
             }
@@ -267,30 +245,130 @@ impl MemoryCache {
                 let remote_val = event.discover_value.unwrap();
                 let svc = remote_val.service.unwrap();
                 let mut safe_map = handler.faultdetect_rules.write().await;
-                let cache_val_opt = safe_map.get_mut(
-                    format!(
-                        "{}#{}",
-                        svc.namespace.clone().unwrap(),
-                        svc.name.clone().unwrap()
-                    )
-                    .as_str(),
-                );
+                let cache_val_opt = safe_map
+                    .get_mut(format!("{}#{}", svc.namespace.clone(), svc.name.clone()).as_str());
                 if cache_val_opt.is_none() {
                     error!(
-                        "[polaris][resource_cache][memory] fault_detect cache not found: namespace={} service={}",
-                        svc.namespace.unwrap(),
-                        svc.name.unwrap()
+                        "[pole][resource_cache][memory] fault_detect cache not found: namespace={} service={}",
+                        svc.namespace,
+                        svc.name
                     );
                     return;
                 }
                 let cache_val = cache_val_opt.unwrap();
-                let rules = &cache_val.value;
                 let remote_rules = remote_val.fault_detector.unwrap_or_default();
-                rules.to_owned().clone_from(&remote_rules);
+                cache_val.value.clone_from(&remote_rules);
 
-                cache_val.revision = svc.revision.unwrap();
+                cache_val.revision = svc.revision;
                 cache_val.finish_initialize();
                 notify_event.value = CacheItemType::FaultDetectRule(cache_val.clone());
+            }
+            EventType::LaneRule => {
+                let remote_val = event.discover_value.unwrap();
+                let svc = remote_val.service.unwrap();
+                let mut safe_map = handler.lane_rules.write().await;
+                let cache_val_opt = safe_map
+                    .get_mut(format!("{}#{}", svc.namespace.clone(), svc.name.clone()).as_str());
+                if cache_val_opt.is_none() {
+                    error!(
+                        "[pole][resource_cache][memory] lane cache not found: namespace={} service={}",
+                        svc.namespace,
+                        svc.name
+                    );
+                    return;
+                }
+                let cache_val = cache_val_opt.unwrap();
+                cache_val.value.clone_from(&remote_val.lanes);
+
+                cache_val.revision = svc.revision;
+                cache_val.finish_initialize();
+                notify_event.value = CacheItemType::LaneRule(cache_val.clone());
+            }
+            EventType::LosslessRule => {
+                let remote_val = event.discover_value.unwrap();
+                let svc = remote_val.service.unwrap();
+                let mut safe_map = handler.lossless_rules.write().await;
+                let cache_val_opt = safe_map
+                    .get_mut(format!("{}#{}", svc.namespace.clone(), svc.name.clone()).as_str());
+                if cache_val_opt.is_none() {
+                    error!(
+                        "[pole][resource_cache][memory] lossless cache not found: namespace={} service={}",
+                        svc.namespace,
+                        svc.name
+                    );
+                    return;
+                }
+                let cache_val = cache_val_opt.unwrap();
+                cache_val.value.clone_from(&remote_val.lossless_rules);
+
+                cache_val.revision = svc.revision;
+                cache_val.finish_initialize();
+                notify_event.value = CacheItemType::LosslessRule(cache_val.clone());
+            }
+            EventType::TrafficSecurityRule => {
+                let remote_val = event.discover_value.unwrap();
+                let svc = remote_val.service.unwrap();
+                let mut safe_map = handler.traffic_security_rules.write().await;
+                let cache_val_opt = safe_map
+                    .get_mut(format!("{}#{}", svc.namespace.clone(), svc.name.clone()).as_str());
+                if cache_val_opt.is_none() {
+                    error!(
+                        "[pole][resource_cache][memory] traffic_security cache not found: namespace={} service={}",
+                        svc.namespace,
+                        svc.name
+                    );
+                    return;
+                }
+                let cache_val = cache_val_opt.unwrap();
+                cache_val
+                    .value
+                    .clone_from(&remote_val.traffic_security_rules);
+
+                cache_val.revision = svc.revision;
+                cache_val.finish_initialize();
+                notify_event.value = CacheItemType::TrafficSecurityRule(cache_val.clone());
+            }
+            EventType::TrafficMirrorRule => {
+                let remote_val = event.discover_value.unwrap();
+                let svc = remote_val.service.unwrap();
+                let mut safe_map = handler.traffic_mirror_rules.write().await;
+                let cache_val_opt = safe_map
+                    .get_mut(format!("{}#{}", svc.namespace.clone(), svc.name.clone()).as_str());
+                if cache_val_opt.is_none() {
+                    error!(
+                        "[pole][resource_cache][memory] traffic_mirror cache not found: namespace={} service={}",
+                        svc.namespace,
+                        svc.name
+                    );
+                    return;
+                }
+                let cache_val = cache_val_opt.unwrap();
+                cache_val.value.clone_from(&remote_val.traffic_mirror_rules);
+
+                cache_val.revision = svc.revision;
+                cache_val.finish_initialize();
+                notify_event.value = CacheItemType::TrafficMirrorRule(cache_val.clone());
+            }
+            EventType::TrafficMockRule => {
+                let remote_val = event.discover_value.unwrap();
+                let svc = remote_val.service.unwrap();
+                let mut safe_map = handler.traffic_mock_rules.write().await;
+                let cache_val_opt = safe_map
+                    .get_mut(format!("{}#{}", svc.namespace.clone(), svc.name.clone()).as_str());
+                if cache_val_opt.is_none() {
+                    error!(
+                        "[pole][resource_cache][memory] traffic_mock cache not found: namespace={} service={}",
+                        svc.namespace,
+                        svc.name
+                    );
+                    return;
+                }
+                let cache_val = cache_val_opt.unwrap();
+                cache_val.value.clone_from(&remote_val.traffic_mock_rules);
+
+                cache_val.revision = svc.revision;
+                cache_val.finish_initialize();
+                notify_event.value = CacheItemType::TrafficMockRule(cache_val.clone());
             }
             EventType::ConfigFile => {
                 let search_key = format!(
@@ -304,7 +382,7 @@ impl MemoryCache {
                 let cache_val_opt = safe_map.get_mut(search_key.as_str());
                 if cache_val_opt.is_none() {
                     error!(
-                        "[polaris][resource_cache][memory] config_file cache not found: namespace={} group={} file={}",
+                        "[pole][resource_cache][memory] config_file cache not found: namespace={} group={} file={}",
                         event_key.namespace.clone(),
                         filter.get("group").unwrap(),
                         filter.get("file").unwrap()
@@ -312,11 +390,10 @@ impl MemoryCache {
                     return;
                 }
                 let cache_val = cache_val_opt.unwrap();
-                let rules = &cache_val.value;
-                let remote_rules = event.config_value.unwrap().config_file.unwrap_or_default();
-                rules.to_owned().clone_from(&remote_rules);
+                let remote_rules = event.config_value.unwrap().file.unwrap_or_default();
+                cache_val.value.clone_from(&remote_rules);
 
-                cache_val.revision = remote_rules.version.unwrap().to_string();
+                cache_val.revision = remote_rules.version.to_string();
                 cache_val.finish_initialize();
                 notify_event.value = CacheItemType::ConfigFile(cache_val.clone());
             }
@@ -332,7 +409,7 @@ impl MemoryCache {
                 let cache_val_opt = safe_map.get_mut(search_key.as_str());
                 if cache_val_opt.is_none() {
                     error!(
-                        "[polaris][resource_cache][memory] config_group cache not found: namespace={} group={}",
+                        "[pole][resource_cache][memory] config_group cache not found: namespace={} group={}",
                         event_key.namespace.clone(),
                         filter.get("group").unwrap()
                     );
@@ -340,7 +417,7 @@ impl MemoryCache {
                 }
                 let cache_val = cache_val_opt.unwrap();
                 let files = &mut cache_val.files.write().await;
-                let remote_rules = remote_val.config_file_names;
+                let remote_rules = remote_val.file_names;
                 files.clear();
                 for ele in remote_rules {
                     files.push(ConfigFile::convert_from_spec(ele));
@@ -401,6 +478,11 @@ fn new_resource_cache(opt: InitResourceCacheOption) -> Box<dyn ResourceCache> {
             ratelimit_rules: Arc::new(RwLock::new(HashMap::new())),
             circuitbreaker_rules: Arc::new(RwLock::new(HashMap::new())),
             faultdetect_rules: Arc::new(RwLock::new(HashMap::new())),
+            lane_rules: Arc::new(RwLock::new(HashMap::new())),
+            lossless_rules: Arc::new(RwLock::new(HashMap::new())),
+            traffic_security_rules: Arc::new(RwLock::new(HashMap::new())),
+            traffic_mirror_rules: Arc::new(RwLock::new(HashMap::new())),
+            traffic_mock_rules: Arc::new(RwLock::new(HashMap::new())),
             config_groups: Arc::new(RwLock::new(HashMap::new())),
             config_files: Arc::new(RwLock::new(HashMap::new())),
         }),
@@ -433,7 +515,7 @@ impl ResourceCache for MemoryCache {
         self.failover = Some(failover);
     }
 
-    async fn load_service_rule(&self, filter: Filter) -> Result<ServiceRule, PolarisError> {
+    async fn load_service_rule(&self, filter: Filter) -> Result<ServiceRule, PoleError> {
         let event_type = filter.get_event_type();
         let search_namespace = filter.resource_key.namespace.clone();
         let search_service = filter.resource_key.filter.get("service").unwrap();
@@ -464,7 +546,7 @@ impl ResourceCache for MemoryCache {
                 let cache_val = safe_map.get(&search_key).unwrap();
                 // 如果还是没有初始化
                 if !cache_val.is_initialized() {
-                    return Err(PolarisError::new(
+                    return Err(PoleError::new(
                         ErrorCode::InternalError,
                         "load remote resource timeout".to_string(),
                     ));
@@ -504,14 +586,18 @@ impl ResourceCache for MemoryCache {
                 let cache_val = safe_map.get(&search_key).unwrap();
                 // 如果还是没有初始化
                 if !cache_val.is_initialized() {
-                    return Err(PolarisError::new(
+                    return Err(PoleError::new(
                         ErrorCode::InternalError,
                         "load remote resource timeout".to_string(),
                     ));
                 }
 
                 Ok(ServiceRule {
-                    rules: vec![Box::new(cache_val.value.clone()) as Box<dyn Any + Send>],
+                    rules: cache_val
+                        .value
+                        .iter()
+                        .map(|val| Box::new(val.clone()) as Box<dyn Any + Send>)
+                        .collect(),
                     revision: cache_val.revision(),
                     initialized: cache_val.is_initialized(),
                 })
@@ -540,14 +626,18 @@ impl ResourceCache for MemoryCache {
                 let cache_val = safe_map.get(&search_key).unwrap();
                 // 如果还是没有初始化
                 if !cache_val.is_initialized() {
-                    return Err(PolarisError::new(
+                    return Err(PoleError::new(
                         ErrorCode::InternalError,
                         "load remote resource timeout".to_string(),
                     ));
                 }
 
                 Ok(ServiceRule {
-                    rules: vec![Box::new(cache_val.value.clone()) as Box<dyn Any + Send>],
+                    rules: cache_val
+                        .value
+                        .iter()
+                        .map(|val| Box::new(val.clone()) as Box<dyn Any + Send>)
+                        .collect(),
                     revision: cache_val.revision(),
                     initialized: cache_val.is_initialized(),
                 })
@@ -576,7 +666,7 @@ impl ResourceCache for MemoryCache {
                 let cache_val = safe_map.get(&search_key).unwrap();
                 // 如果还是没有初始化
                 if !cache_val.is_initialized() {
-                    return Err(PolarisError::new(
+                    return Err(PoleError::new(
                         ErrorCode::InternalError,
                         "load remote resource timeout".to_string(),
                     ));
@@ -588,8 +678,193 @@ impl ResourceCache for MemoryCache {
                     initialized: cache_val.is_initialized(),
                 })
             }
+            EventType::LaneRule => {
+                {
+                    let resource_key = filter.resource_key.clone();
+                    let mut safe_map = self.handler.lane_rules.write().await;
+                    let _ = safe_map.entry(search_key.clone()).or_insert_with(|| {
+                        self.submit_resource_watch(EventType::LaneRule, resource_key);
+                        LaneRulesCacheItem::new()
+                    });
+                }
+
+                let waiter = {
+                    let safe_map = self.handler.lane_rules.read().await;
+                    let cache_val = safe_map.get(&search_key).unwrap();
+
+                    cache_val.wait_initialize(filter.timeout).await
+                };
+                waiter();
+
+                let safe_map = self.handler.lane_rules.read().await;
+                let cache_val = safe_map.get(&search_key).unwrap();
+                if !cache_val.is_initialized() {
+                    return Err(PoleError::new(
+                        ErrorCode::InternalError,
+                        "load remote resource timeout".to_string(),
+                    ));
+                }
+
+                Ok(ServiceRule {
+                    rules: cache_val
+                        .value
+                        .iter()
+                        .map(|val| Box::new(val.clone()) as Box<dyn Any + Send>)
+                        .collect(),
+                    revision: cache_val.revision(),
+                    initialized: cache_val.is_initialized(),
+                })
+            }
+            EventType::LosslessRule => {
+                {
+                    let resource_key = filter.resource_key.clone();
+                    let mut safe_map = self.handler.lossless_rules.write().await;
+                    let _ = safe_map.entry(search_key.clone()).or_insert_with(|| {
+                        self.submit_resource_watch(EventType::LosslessRule, resource_key);
+                        LosslessRulesCacheItem::new()
+                    });
+                }
+
+                let waiter = {
+                    let safe_map = self.handler.lossless_rules.read().await;
+                    let cache_val = safe_map.get(&search_key).unwrap();
+
+                    cache_val.wait_initialize(filter.timeout).await
+                };
+                waiter();
+
+                let safe_map = self.handler.lossless_rules.read().await;
+                let cache_val = safe_map.get(&search_key).unwrap();
+                if !cache_val.is_initialized() {
+                    return Err(PoleError::new(
+                        ErrorCode::InternalError,
+                        "load remote resource timeout".to_string(),
+                    ));
+                }
+
+                Ok(ServiceRule {
+                    rules: cache_val
+                        .value
+                        .iter()
+                        .map(|val| Box::new(val.clone()) as Box<dyn Any + Send>)
+                        .collect(),
+                    revision: cache_val.revision(),
+                    initialized: cache_val.is_initialized(),
+                })
+            }
+            EventType::TrafficSecurityRule => {
+                {
+                    let resource_key = filter.resource_key.clone();
+                    let mut safe_map = self.handler.traffic_security_rules.write().await;
+                    let _ = safe_map.entry(search_key.clone()).or_insert_with(|| {
+                        self.submit_resource_watch(EventType::TrafficSecurityRule, resource_key);
+                        TrafficSecurityRulesCacheItem::new()
+                    });
+                }
+
+                let waiter = {
+                    let safe_map = self.handler.traffic_security_rules.read().await;
+                    let cache_val = safe_map.get(&search_key).unwrap();
+
+                    cache_val.wait_initialize(filter.timeout).await
+                };
+                waiter();
+
+                let safe_map = self.handler.traffic_security_rules.read().await;
+                let cache_val = safe_map.get(&search_key).unwrap();
+                if !cache_val.is_initialized() {
+                    return Err(PoleError::new(
+                        ErrorCode::InternalError,
+                        "load remote resource timeout".to_string(),
+                    ));
+                }
+
+                Ok(ServiceRule {
+                    rules: cache_val
+                        .value
+                        .iter()
+                        .map(|val| Box::new(val.clone()) as Box<dyn Any + Send>)
+                        .collect(),
+                    revision: cache_val.revision(),
+                    initialized: cache_val.is_initialized(),
+                })
+            }
+            EventType::TrafficMirrorRule => {
+                {
+                    let resource_key = filter.resource_key.clone();
+                    let mut safe_map = self.handler.traffic_mirror_rules.write().await;
+                    let _ = safe_map.entry(search_key.clone()).or_insert_with(|| {
+                        self.submit_resource_watch(EventType::TrafficMirrorRule, resource_key);
+                        TrafficMirrorRulesCacheItem::new()
+                    });
+                }
+
+                let waiter = {
+                    let safe_map = self.handler.traffic_mirror_rules.read().await;
+                    let cache_val = safe_map.get(&search_key).unwrap();
+
+                    cache_val.wait_initialize(filter.timeout).await
+                };
+                waiter();
+
+                let safe_map = self.handler.traffic_mirror_rules.read().await;
+                let cache_val = safe_map.get(&search_key).unwrap();
+                if !cache_val.is_initialized() {
+                    return Err(PoleError::new(
+                        ErrorCode::InternalError,
+                        "load remote resource timeout".to_string(),
+                    ));
+                }
+
+                Ok(ServiceRule {
+                    rules: cache_val
+                        .value
+                        .iter()
+                        .map(|val| Box::new(val.clone()) as Box<dyn Any + Send>)
+                        .collect(),
+                    revision: cache_val.revision(),
+                    initialized: cache_val.is_initialized(),
+                })
+            }
+            EventType::TrafficMockRule => {
+                {
+                    let resource_key = filter.resource_key.clone();
+                    let mut safe_map = self.handler.traffic_mock_rules.write().await;
+                    let _ = safe_map.entry(search_key.clone()).or_insert_with(|| {
+                        self.submit_resource_watch(EventType::TrafficMockRule, resource_key);
+                        TrafficMockRulesCacheItem::new()
+                    });
+                }
+
+                let waiter = {
+                    let safe_map = self.handler.traffic_mock_rules.read().await;
+                    let cache_val = safe_map.get(&search_key).unwrap();
+
+                    cache_val.wait_initialize(filter.timeout).await
+                };
+                waiter();
+
+                let safe_map = self.handler.traffic_mock_rules.read().await;
+                let cache_val = safe_map.get(&search_key).unwrap();
+                if !cache_val.is_initialized() {
+                    return Err(PoleError::new(
+                        ErrorCode::InternalError,
+                        "load remote resource timeout".to_string(),
+                    ));
+                }
+
+                Ok(ServiceRule {
+                    rules: cache_val
+                        .value
+                        .iter()
+                        .map(|val| Box::new(val.clone()) as Box<dyn Any + Send>)
+                        .collect(),
+                    revision: cache_val.revision(),
+                    initialized: cache_val.is_initialized(),
+                })
+            }
             _ => {
-                return Err(PolarisError::new(
+                return Err(PoleError::new(
                     ErrorCode::InternalError,
                     "load remote resource timeout".to_string(),
                 ));
@@ -597,7 +872,7 @@ impl ResourceCache for MemoryCache {
         }
     }
 
-    async fn load_services(&self, filter: Filter) -> Result<Services, PolarisError> {
+    async fn load_services(&self, filter: Filter) -> Result<Services, PoleError> {
         let search_key = filter.resource_key.namespace.clone();
         {
             let resource_key = filter.resource_key.clone();
@@ -621,7 +896,7 @@ impl ResourceCache for MemoryCache {
         let cache_val = safe_map.get(&search_key).unwrap();
         // 如果还是没有初始化
         if !cache_val.is_initialized() {
-            return Err(PolarisError::new(
+            return Err(PoleError::new(
                 ErrorCode::InternalError,
                 "load remote resource timeout".to_string(),
             ));
@@ -639,7 +914,7 @@ impl ResourceCache for MemoryCache {
     async fn load_service_instances(
         &self,
         filter: Filter,
-    ) -> Result<ServiceInstancesCacheItem, PolarisError> {
+    ) -> Result<ServiceInstancesCacheItem, PoleError> {
         let search_namespace = filter.resource_key.namespace.clone();
         let search_service = filter.resource_key.filter.get("service").unwrap();
         let search_key = format!("{}#{}", search_namespace.clone(), search_service);
@@ -666,7 +941,7 @@ impl ResourceCache for MemoryCache {
         // 等待资源，这里直接 clone 出来一个对象做数据拷贝，避免 read 锁长期持有
         // 如果还是没有初始化
         if !cache_val.is_initialized() {
-            return Err(PolarisError::new(
+            return Err(PoleError::new(
                 ErrorCode::InternalError,
                 "load remote resource timeout".to_string(),
             ));
@@ -675,7 +950,7 @@ impl ResourceCache for MemoryCache {
         Ok(cache_val.clone())
     }
 
-    async fn load_config_file(&self, filter: Filter) -> Result<ConfigFile, PolarisError> {
+    async fn load_config_file(&self, filter: Filter) -> Result<ConfigFile, PoleError> {
         let search_namespace = filter.resource_key.namespace.clone();
         let search_group = filter.resource_key.filter.get("group").unwrap();
         let search_file = filter.resource_key.filter.get("file").unwrap();
@@ -706,32 +981,16 @@ impl ResourceCache for MemoryCache {
         let cache_val = safe_map.get(&search_key).unwrap();
         // 如果还是没有初始化
         if !cache_val.is_initialized() {
-            return Err(PolarisError::new(
+            return Err(PoleError::new(
                 ErrorCode::InternalError,
                 "load remote resource timeout".to_string(),
             ));
         }
 
-        let spec_conf = cache_val.value.clone();
-        let mut labels = HashMap::<String, String>::new();
-
-        for ele in spec_conf.tags {
-            labels.insert(ele.key.clone().unwrap(), ele.value.clone().unwrap());
-        }
-
-        Ok(ConfigFile {
-            namespace: spec_conf.namespace.clone().unwrap(),
-            group: spec_conf.group.clone().unwrap(),
-            name: spec_conf.name.clone().unwrap(),
-            version: spec_conf.version.unwrap(),
-            content: spec_conf.content.clone().unwrap(),
-            labels,
-            encrypt_algo: "".to_string(),
-            encrypt_key: "".to_string(),
-        })
+        Ok(cache_val.to_config_file())
     }
 
-    async fn load_config_group_files(&self, filter: Filter) -> Result<ConfigGroup, PolarisError> {
+    async fn load_config_group_files(&self, filter: Filter) -> Result<ConfigGroup, PoleError> {
         let search_namespace = filter.resource_key.namespace.clone();
         let search_group = filter.resource_key.filter.get("group").unwrap();
         let search_key = format!("{}#{}", search_namespace.clone(), search_group);
@@ -757,7 +1016,7 @@ impl ResourceCache for MemoryCache {
         let cache_val = safe_map.get(&search_key).unwrap();
         // 如果还是没有初始化
         if !cache_val.is_initialized() {
-            return Err(PolarisError::new(
+            return Err(PoleError::new(
                 ErrorCode::InternalError,
                 "load remote resource timeout".to_string(),
             ));
@@ -802,7 +1061,7 @@ impl ResourceHandler for MemoryResourceWatcher {
             Ok(_) => {}
             Err(err) => {
                 error!(
-                    "[polaris][resource_cache][memory] send event to processor failed: {}",
+                    "[pole][resource_cache][memory] send event to processor failed: {}",
                     err
                 );
             }
@@ -811,5 +1070,263 @@ impl ResourceHandler for MemoryResourceWatcher {
 
     fn interest_resource(&self) -> ResourceEventKey {
         self.event_key.clone()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::model::cache::{
+        FaultDetectRulesCacheItem, LaneRulesCacheItem, LosslessRulesCacheItem,
+        TrafficMirrorRulesCacheItem, TrafficMockRulesCacheItem, TrafficSecurityRulesCacheItem,
+    };
+    use crate::core::plugin::cache::ResourceCacheFailover;
+    use pole_specification::v1::{
+        discover_response::DiscoverResponseType, Code, ConfigDiscoverResponse, DiscoverResponse,
+        FaultDetectRule, FaultDetector, LaneGroup, LosslessRule, Service, TrafficMirror,
+        TrafficMock, TrafficSecurityRule,
+    };
+
+    struct NoopFailover;
+
+    #[async_trait::async_trait]
+    impl ResourceCacheFailover for NoopFailover {
+        async fn failover_naming_load(
+            &self,
+            _filter: Filter,
+        ) -> Result<DiscoverResponse, PoleError> {
+            Ok(DiscoverResponse::default())
+        }
+
+        async fn save_naming_failover(&self, _value: DiscoverResponse) -> Result<(), PoleError> {
+            Ok(())
+        }
+
+        async fn failover_config_load(
+            &self,
+            _filter: Filter,
+        ) -> Result<ConfigDiscoverResponse, PoleError> {
+            Ok(ConfigDiscoverResponse::default())
+        }
+
+        async fn save_config_failover(
+            &self,
+            _value: ConfigDiscoverResponse,
+        ) -> Result<(), PoleError> {
+            Ok(())
+        }
+    }
+
+    fn handler_for_rule_tests() -> Arc<MemoryResourceHandler> {
+        let service_key = "default#svc-a".to_string();
+
+        Arc::new(MemoryResourceHandler {
+            failover: Some(Arc::new(NoopFailover)),
+            listeners: Arc::new(RwLock::new(HashMap::new())),
+            services: Arc::new(RwLock::new(HashMap::new())),
+            instances: Arc::new(RwLock::new(HashMap::new())),
+            router_rules: Arc::new(RwLock::new(HashMap::new())),
+            ratelimit_rules: Arc::new(RwLock::new(HashMap::new())),
+            circuitbreaker_rules: Arc::new(RwLock::new(HashMap::new())),
+            faultdetect_rules: Arc::new(RwLock::new(HashMap::from([(
+                service_key.clone(),
+                FaultDetectRulesCacheItem::new(),
+            )]))),
+            lane_rules: Arc::new(RwLock::new(HashMap::from([(
+                service_key.clone(),
+                LaneRulesCacheItem::new(),
+            )]))),
+            lossless_rules: Arc::new(RwLock::new(HashMap::from([(
+                service_key.clone(),
+                LosslessRulesCacheItem::new(),
+            )]))),
+            traffic_security_rules: Arc::new(RwLock::new(HashMap::from([(
+                service_key.clone(),
+                TrafficSecurityRulesCacheItem::new(),
+            )]))),
+            traffic_mirror_rules: Arc::new(RwLock::new(HashMap::from([(
+                service_key.clone(),
+                TrafficMirrorRulesCacheItem::new(),
+            )]))),
+            traffic_mock_rules: Arc::new(RwLock::new(HashMap::from([(
+                service_key,
+                TrafficMockRulesCacheItem::new(),
+            )]))),
+            config_groups: Arc::new(RwLock::new(HashMap::new())),
+            config_files: Arc::new(RwLock::new(HashMap::new())),
+        })
+    }
+
+    fn event_key(event_type: EventType) -> ResourceEventKey {
+        ResourceEventKey {
+            namespace: "default".to_string(),
+            event_type,
+            filter: HashMap::from([("service".to_string(), "svc-a".to_string())]),
+        }
+    }
+
+    fn service() -> Service {
+        Service {
+            namespace: "default".to_string(),
+            name: "svc-a".to_string(),
+            revision: "rev-2".to_string(),
+            ..Service::default()
+        }
+    }
+
+    async fn emit(
+        handler: Arc<MemoryResourceHandler>,
+        event_type: EventType,
+        resp: DiscoverResponse,
+    ) {
+        MemoryCache::on_spec_event(
+            handler,
+            RemoteData {
+                event_key: event_key(event_type),
+                discover_value: Some(resp),
+                config_value: None,
+            },
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn on_spec_event_updates_new_service_rule_caches() {
+        let handler = handler_for_rule_tests();
+
+        emit(
+            handler.clone(),
+            EventType::LaneRule,
+            DiscoverResponse {
+                code: Code::ExecuteSuccess as u32,
+                r#type: DiscoverResponseType::Lane.into(),
+                service: Some(service()),
+                lanes: vec![LaneGroup {
+                    name: "lane-a".to_string(),
+                    ..LaneGroup::default()
+                }],
+                ..DiscoverResponse::default()
+            },
+        )
+        .await;
+
+        emit(
+            handler.clone(),
+            EventType::LosslessRule,
+            DiscoverResponse {
+                code: Code::ExecuteSuccess as u32,
+                r#type: DiscoverResponseType::Lossless.into(),
+                service: Some(service()),
+                lossless_rules: vec![LosslessRule {
+                    id: "lossless-a".to_string(),
+                    ..LosslessRule::default()
+                }],
+                ..DiscoverResponse::default()
+            },
+        )
+        .await;
+
+        emit(
+            handler.clone(),
+            EventType::FaultDetectRule,
+            DiscoverResponse {
+                code: Code::ExecuteSuccess as u32,
+                r#type: DiscoverResponseType::FaultDetector.into(),
+                service: Some(service()),
+                fault_detector: Some(FaultDetector {
+                    rules: vec![FaultDetectRule {
+                        name: "fault-detect-a".to_string(),
+                        ..FaultDetectRule::default()
+                    }],
+                    ..FaultDetector::default()
+                }),
+                ..DiscoverResponse::default()
+            },
+        )
+        .await;
+
+        emit(
+            handler.clone(),
+            EventType::TrafficSecurityRule,
+            DiscoverResponse {
+                code: Code::ExecuteSuccess as u32,
+                r#type: DiscoverResponseType::TrafficSecurityRule.into(),
+                service: Some(service()),
+                traffic_security_rules: vec![TrafficSecurityRule {
+                    id: "security-a".to_string(),
+                    ..TrafficSecurityRule::default()
+                }],
+                ..DiscoverResponse::default()
+            },
+        )
+        .await;
+
+        emit(
+            handler.clone(),
+            EventType::TrafficMirrorRule,
+            DiscoverResponse {
+                code: Code::ExecuteSuccess as u32,
+                r#type: DiscoverResponseType::TrafficMirrorRule.into(),
+                service: Some(service()),
+                traffic_mirror_rules: vec![TrafficMirror {
+                    id: "mirror-a".to_string(),
+                    ..TrafficMirror::default()
+                }],
+                ..DiscoverResponse::default()
+            },
+        )
+        .await;
+
+        emit(
+            handler.clone(),
+            EventType::TrafficMockRule,
+            DiscoverResponse {
+                code: Code::ExecuteSuccess as u32,
+                r#type: DiscoverResponseType::TrafficMockRule.into(),
+                service: Some(service()),
+                traffic_mock_rules: vec![TrafficMock {
+                    id: "mock-a".to_string(),
+                    ..TrafficMock::default()
+                }],
+                ..DiscoverResponse::default()
+            },
+        )
+        .await;
+
+        let lane_rules = handler.lane_rules.read().await;
+        let lane_item = lane_rules.get("default#svc-a").unwrap();
+        assert!(lane_item.is_initialized());
+        assert_eq!(lane_item.revision(), "rev-2");
+        assert_eq!(lane_item.value[0].name, "lane-a");
+
+        let lossless_rules = handler.lossless_rules.read().await;
+        let lossless_item = lossless_rules.get("default#svc-a").unwrap();
+        assert!(lossless_item.is_initialized());
+        assert_eq!(lossless_item.revision(), "rev-2");
+        assert_eq!(lossless_item.value[0].id, "lossless-a");
+
+        let faultdetect_rules = handler.faultdetect_rules.read().await;
+        let faultdetect_item = faultdetect_rules.get("default#svc-a").unwrap();
+        assert!(faultdetect_item.is_initialized());
+        assert_eq!(faultdetect_item.revision(), "rev-2");
+        assert_eq!(faultdetect_item.value.rules[0].name, "fault-detect-a");
+
+        let security_rules = handler.traffic_security_rules.read().await;
+        let security_item = security_rules.get("default#svc-a").unwrap();
+        assert!(security_item.is_initialized());
+        assert_eq!(security_item.revision(), "rev-2");
+        assert_eq!(security_item.value[0].id, "security-a");
+
+        let mirror_rules = handler.traffic_mirror_rules.read().await;
+        let mirror_item = mirror_rules.get("default#svc-a").unwrap();
+        assert!(mirror_item.is_initialized());
+        assert_eq!(mirror_item.revision(), "rev-2");
+        assert_eq!(mirror_item.value[0].id, "mirror-a");
+
+        let mock_rules = handler.traffic_mock_rules.read().await;
+        let mock_item = mock_rules.get("default#svc-a").unwrap();
+        assert!(mock_item.is_initialized());
+        assert_eq!(mock_item.revision(), "rev-2");
+        assert_eq!(mock_item.value[0].id, "mock-a");
     }
 }

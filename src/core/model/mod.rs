@@ -1,4 +1,4 @@
-// Tencent is pleased to support the open source community by making Polaris available.
+// Tencent is pleased to support the open source community by making Pole available.
 //
 // Copyright (C) 2019 THL A29 Limited, a Tencent company. All rights reserved.
 //
@@ -14,8 +14,8 @@
 // specific language governing permissions and limitations under the License.
 
 use naming::Location;
-use polaris_specification::v1::client::ClientType;
-use polaris_specification::v1::{
+use pole_specification::v1::client::ClientType;
+use pole_specification::v1::{
     ConfigDiscoverRequest, ConfigDiscoverResponse, DiscoverRequest, DiscoverResponse,
 };
 
@@ -36,7 +36,7 @@ use std::hash::Hash;
 use super::config::global::ClientConfig;
 
 static RUST_CLIENT_VERSION: &str = "v0.0.1";
-static RUST_CLIENT_TYPE: &str = "polaris-rust";
+static RUST_CLIENT_TYPE: &str = "pole_rust";
 
 #[derive(Clone)]
 pub enum DiscoverRequestInfo {
@@ -64,7 +64,7 @@ pub enum DiscoverResponseInfo {
 }
 
 impl DiscoverResponseInfo {
-    pub fn to_config_response(&self) -> polaris_specification::v1::ConfigDiscoverResponse {
+    pub fn to_config_response(&self) -> pole_specification::v1::ConfigDiscoverResponse {
         match self {
             DiscoverResponseInfo::Configuration(resp) => resp.clone(),
             _ => {
@@ -223,16 +223,16 @@ pub struct ReportClientRequest {
 }
 
 impl ReportClientRequest {
-    pub fn convert_spec(&self) -> polaris_specification::v1::Client {
-        polaris_specification::v1::Client {
-            id: Some(self.client_id.clone()),
-            host: Some(self.host.clone()),
-            version: Some(self.version.clone()),
+    pub fn convert_spec(&self) -> pole_specification::v1::Client {
+        pole_specification::v1::Client {
+            id: self.client_id.clone(),
+            host: self.host.clone(),
+            version: self.version.clone(),
             location: Some(self.location.convert_spec()),
             r#type: ClientType::Sdk.into(),
             stat: vec![],
-            ctime: None,
-            mtime: None,
+            ctime: String::new(),
+            mtime: String::new(),
         }
     }
 }

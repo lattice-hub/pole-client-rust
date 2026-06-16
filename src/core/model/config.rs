@@ -1,4 +1,4 @@
-// Tencent is pleased to support the open source community by making Polaris available.
+// Tencent is pleased to support the open source community by making Pole available.
 //
 // Copyright (C) 2019 THL A29 Limited, a Tencent company. All rights reserved.
 //
@@ -15,8 +15,6 @@
 
 use std::collections::HashMap;
 
-// CONFIG_FILE_TAG_KEY_USE_ENCRYPTED 配置加密开关标识，value 为 boolean
-const CONFIG_FILE_TAG_KEY_USE_ENCRYPTED: &str = "internal-encrypted";
 // CONFIG_FILE_TAG_KEY_DATA_KEY 加密密钥 tag key
 const CONFIG_FILE_TAG_KEY_DATA_KEY: &str = "internal-datakey";
 // CONFIG_FILE_TAG_KEY_ENCRYPT_ALGO 加密算法 tag key
@@ -29,33 +27,15 @@ pub struct ConfigFileRequest {
 }
 
 impl ConfigFileRequest {
-    pub fn convert_spec(&self) -> polaris_specification::v1::ConfigFile {
-        let mut tags = Vec::<polaris_specification::v1::ConfigFileTag>::new();
-        self.config_file.labels.iter().for_each(|(k, v)| {
-            tags.push(polaris_specification::v1::ConfigFileTag {
-                key: Some(k.clone()),
-                value: Some(v.clone()),
-            });
-        });
-
-        polaris_specification::v1::ConfigFile {
-            id: None,
-            name: Some(self.config_file.name.clone()),
-            namespace: Some(self.config_file.namespace.clone()),
-            group: Some(self.config_file.group.clone()),
-            content: Some(self.config_file.content.clone()),
-            format: None,
-            comment: None,
-            status: None,
-            tags,
-            create_time: None,
-            create_by: None,
-            modify_time: None,
-            modify_by: None,
-            release_time: None,
-            release_by: None,
-            encrypted: None,
-            encrypt_algo: None,
+    pub fn convert_spec(&self) -> pole_specification::v1::ConfigFile {
+        pole_specification::v1::ConfigFile {
+            id: String::new(),
+            name: self.config_file.name.clone(),
+            namespace: self.config_file.namespace.clone(),
+            group: self.config_file.group.clone(),
+            content: self.config_file.content.clone(),
+            labels: self.config_file.labels.clone(),
+            ..Default::default()
         }
     }
 }
@@ -67,27 +47,15 @@ pub struct ConfigReleaseRequest {
 }
 
 impl ConfigReleaseRequest {
-    pub fn convert_spec(&self) -> polaris_specification::v1::ConfigFileRelease {
-        polaris_specification::v1::ConfigFileRelease {
-            id: None,
-            name: Some(self.config_file.release_name.clone()),
-            namespace: Some(self.config_file.namespace.clone()),
-            group: Some(self.config_file.group.clone()),
-            content: None,
-            format: None,
-            comment: None,
-            file_name: Some(self.config_file.file_name.clone()),
-            version: None,
-            tags: Vec::new(),
-            active: None,
-            release_description: None,
-            release_type: None,
-            beta_labels: Vec::new(),
-            create_time: None,
-            create_by: None,
-            modify_time: None,
-            modify_by: None,
-            md5: None,
+    pub fn convert_spec(&self) -> pole_specification::v1::ConfigFileRelease {
+        pole_specification::v1::ConfigFileRelease {
+            id: String::new(),
+            name: self.config_file.release_name.clone(),
+            namespace: self.config_file.namespace.clone(),
+            group: self.config_file.group.clone(),
+            file_name: self.config_file.file_name.clone(),
+            md5: self.config_file.md5.clone(),
+            ..Default::default()
         }
     }
 }
@@ -101,8 +69,39 @@ pub struct ConfigPublishRequest {
 }
 
 impl ConfigPublishRequest {
-    pub fn convert_spec(&self) -> polaris_specification::v1::ConfigFilePublishInfo {
-        todo!()
+    pub fn convert_spec(&self) -> pole_specification::v1::ConfigFilePublishInfo {
+        pole_specification::v1::ConfigFilePublishInfo {
+            release_name: self.release_name.clone(),
+            namespace: self.config_file.namespace.clone(),
+            group: self.config_file.group.clone(),
+            file_name: self.config_file.name.clone(),
+            content: self.config_file.content.clone(),
+            labels: self.config_file.labels.clone(),
+            md5: self.md5.clone(),
+            encrypted: !self.config_file.encrypt_key.is_empty(),
+            encrypt_algo: self.config_file.encrypt_algo.clone(),
+            ..Default::default()
+        }
+    }
+
+    pub fn to_config_file_request(&self) -> ConfigFileRequest {
+        ConfigFileRequest {
+            flow_id: self.flow_id.clone(),
+            config_file: self.config_file.clone(),
+        }
+    }
+
+    pub fn to_config_release_request(&self) -> ConfigReleaseRequest {
+        ConfigReleaseRequest {
+            flow_id: self.flow_id.clone(),
+            config_file: ConfigFileRelease {
+                namespace: self.config_file.namespace.clone(),
+                group: self.config_file.group.clone(),
+                file_name: self.config_file.name.clone(),
+                release_name: self.release_name.clone(),
+                md5: self.md5.clone(),
+            },
+        }
     }
 }
 
@@ -128,18 +127,14 @@ pub struct ConfigFile {
 }
 
 impl ConfigFile {
-    pub fn convert_from_spec(f: polaris_specification::v1::ClientConfigFileInfo) -> ConfigFile {
+    pub fn convert_from_spec(f: pole_specification::v1::ConfigFileRelease) -> ConfigFile {
         ConfigFile {
-            namespace: f.namespace.clone().unwrap(),
-            group: f.group.clone().unwrap(),
-            name: f.name.clone().unwrap(),
-            version: f.version.unwrap(),
-            content: f.content.clone().unwrap(),
-            labels: f
-                .tags
-                .iter()
-                .map(|tag| (tag.key.clone().unwrap(), tag.value.clone().unwrap()))
-                .collect(),
+            namespace: f.namespace.clone(),
+            group: f.group.clone(),
+            name: f.file_name.clone(),
+            version: f.version,
+            content: f.content.clone(),
+            labels: f.labels.clone(),
             encrypt_algo: get_encrypt_algo(&f),
             encrypt_key: get_encrypt_data_key(&f),
         }
@@ -173,22 +168,56 @@ pub struct ConfigGroupChangeEvent {
     pub config_group: ConfigGroup,
 }
 
-pub fn get_encrypt_data_key(file: &polaris_specification::v1::ClientConfigFileInfo) -> String {
-    for (_k, v) in file.tags.iter().enumerate() {
-        let label_key = v.key.clone().unwrap();
-        if label_key == CONFIG_FILE_TAG_KEY_DATA_KEY {
-            return v.value.clone().unwrap();
-        }
-    }
-    "".to_string()
+pub fn get_encrypt_data_key(file: &pole_specification::v1::ConfigFileRelease) -> String {
+    file.labels
+        .get(CONFIG_FILE_TAG_KEY_DATA_KEY)
+        .cloned()
+        .unwrap_or_default()
 }
 
-pub fn get_encrypt_algo(file: &polaris_specification::v1::ClientConfigFileInfo) -> String {
-    for (_k, v) in file.tags.iter().enumerate() {
-        let label_key = v.key.clone().unwrap();
-        if label_key == CONFIG_FILE_TAG_KEY_ENCRYPT_ALGO {
-            return v.value.clone().unwrap();
-        }
+pub fn get_encrypt_algo(file: &pole_specification::v1::ConfigFileRelease) -> String {
+    file.labels
+        .get(CONFIG_FILE_TAG_KEY_ENCRYPT_ALGO)
+        .cloned()
+        .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ConfigFile, ConfigPublishRequest};
+    use std::collections::HashMap;
+
+    #[test]
+    fn config_publish_request_splits_into_file_and_release_requests() {
+        let mut labels = HashMap::new();
+        labels.insert("env".to_string(), "test".to_string());
+        let req = ConfigPublishRequest {
+            flow_id: "flow-1".to_string(),
+            md5: "md5-1".to_string(),
+            release_name: "release-1".to_string(),
+            config_file: ConfigFile {
+                namespace: "default".to_string(),
+                group: "group-a".to_string(),
+                name: "app.toml".to_string(),
+                content: "k=v".to_string(),
+                labels,
+                ..Default::default()
+            },
+        };
+
+        let file_req = req.to_config_file_request();
+        assert_eq!(file_req.flow_id, "flow-1");
+        assert_eq!(file_req.config_file.namespace, "default");
+        assert_eq!(file_req.config_file.group, "group-a");
+        assert_eq!(file_req.config_file.name, "app.toml");
+        assert_eq!(file_req.config_file.content, "k=v");
+
+        let release_req = req.to_config_release_request();
+        assert_eq!(release_req.flow_id, "flow-1");
+        assert_eq!(release_req.config_file.namespace, "default");
+        assert_eq!(release_req.config_file.group, "group-a");
+        assert_eq!(release_req.config_file.file_name, "app.toml");
+        assert_eq!(release_req.config_file.release_name, "release-1");
+        assert_eq!(release_req.config_file.md5, "md5-1");
     }
-    "".to_string()
 }

@@ -1,4 +1,4 @@
-// Tencent is pleased to support the open source community by making Polaris available.
+// Tencent is pleased to support the open source community by making Pole available.
 //
 // Copyright (C) 2019 THL A29 Limited, a Tencent company. All rights reserved.
 //
@@ -15,9 +15,11 @@
 
 use crate::core::config::config::Configuration;
 use crate::core::config::config_file::ConfigFilter;
-use crate::core::config::consumer::{ServiceRouterConfig, ServiceRouterPluginConfig};
+use crate::core::config::consumer::{
+    CircuitBreakerConfig, ServiceRouterConfig, ServiceRouterPluginConfig,
+};
 use crate::core::config::global::{LocalCacheConfig, LocationConfig, ServerConnectorConfig};
-use crate::core::model::error::{ErrorCode, PolarisError};
+use crate::core::model::error::{ErrorCode, PoleError};
 use crate::core::model::ClientContext;
 use crate::core::plugin::cache::ResourceCache;
 use crate::core::plugin::connector::Connector;
@@ -113,12 +115,101 @@ where
     pub load_balancers: Arc<tokio::sync::RwLock<HashMap<String, Arc<Box<dyn LoadBalancer>>>>>,
 }
 
+#[cfg(test)]
+pub(crate) fn test_extensions_without_plugins() -> Arc<Extensions> {
+    let conf: Configuration = serde_yaml::from_str(
+        r#"
+global:
+  api:
+    timeout: 1s
+    maxRetryTimes: 1
+    retryInterval: 1ms
+    reportInterval: 1s
+  serverConnectors:
+    addresses:
+      - discover://127.0.0.1:8091
+    protocol: grpc
+    connectTimeout: 1ms
+    serverSwitchInterval: 1s
+    messageTimeout: 1ms
+    connectionIdleTimeout: 1s
+    reconnectInterval: 1ms
+  statReporter:
+    enable: false
+  location: {}
+  client:
+    id: test-client
+    labels: {}
+consumer:
+  serviceRouter:
+    beforeChain: []
+    coreChain: []
+    afterChain: []
+  circuitBreaker:
+    enable: false
+    enableRemotePull: false
+  loadBalancer:
+    defaultPolicy: weightedRandom
+    plugins: []
+  localCache:
+    name: memory
+    serviceExpireEnable: false
+    serviceExpireTime: 1s
+    serviceRefreshInterval: 1s
+    serviceListRefreshInterval: 1s
+    persistEnable: false
+    persistDir: ./target/test-cache
+provider:
+  rateLimit:
+    enable: false
+    service: pole.limiter
+    namespace: Pole
+    maxWindowCount: 1
+    fallbackOnExceedWindowCount: pass
+    remoteSyncTimeout: 1ms
+    maxQueuingTime: 1ms
+    reportMetrics: false
+  lossless:
+    enable: false
+    host: 127.0.0.1
+    port: 0
+    delayRegisterInterval: 1ms
+    healthCheckInterval: 1ms
+config:
+  propertiesValueCacheSize: 1
+  propertiesValueExpireTime: 1
+  configFilter:
+    enable: false
+    chain: []
+    plugin: {}
+"#,
+    )
+    .unwrap();
+    let conf = Arc::new(conf);
+    Arc::new(Extensions {
+        client_ctx: Arc::new(ClientContext::new(
+            "test-client".to_string(),
+            "127.0.0.1".to_string(),
+            &conf.global.client,
+        )),
+        runtime: Arc::new(Runtime::new().unwrap()),
+        conf,
+        config_filters: None,
+        server_connector: None,
+        locatin_provider: None,
+        circuit_breaker: None,
+        resource_cache: None,
+        service_routers: None,
+        load_balancers: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+    })
+}
+
 impl Extensions {
     pub fn build(
         client_ctx: Arc<ClientContext>,
         conf: Arc<Configuration>,
         runetime: Arc<Runtime>,
-    ) -> Result<Self, PolarisError> {
+    ) -> Result<Self, PoleError> {
         let mut extension = Self {
             client_ctx: client_ctx,
             runtime: runetime,
@@ -140,7 +231,7 @@ impl Extensions {
         Ok(extension)
     }
 
-    fn load_all_plugins(&mut self, conf: Arc<Configuration>) -> Result<(), PolarisError> {
+    fn load_all_plugins(&mut self, conf: Arc<Configuration>) -> Result<(), PoleError> {
         let ret = self.load_config_file_filters(&conf.config.config_filter);
         if ret.is_err() {
             return Err(ret.err().unwrap());
@@ -176,6 +267,12 @@ impl Extensions {
             return Err(ret.err().unwrap());
         }
 
+        // 初始化 circuit_breaker
+        let ret = self.load_circuit_breaker(&conf.consumer.circuit_breaker);
+        if ret.is_err() {
+            return Err(ret.err().unwrap());
+        }
+
         Ok(())
     }
 
@@ -204,9 +301,9 @@ impl Extensions {
     fn load_server_connector(
         &mut self,
         connector_opt: &ServerConnectorConfig,
-    ) -> Result<(), PolarisError> {
+    ) -> Result<(), PoleError> {
         if connector_opt.addresses.is_empty() {
-            return Err(PolarisError::new(
+            return Err(PoleError::new(
                 ErrorCode::InvalidConfig,
                 "server_connector addresses is empty".to_string(),
             ));
@@ -231,10 +328,10 @@ impl Extensions {
         Ok(())
     }
 
-    fn load_resource_cache(&mut self, cache_opt: &LocalCacheConfig) -> Result<(), PolarisError> {
+    fn load_resource_cache(&mut self, cache_opt: &LocalCacheConfig) -> Result<(), PoleError> {
         let cache_name = cache_opt.name.clone();
         if cache_name.is_empty() {
-            return Err(PolarisError::new(ErrorCode::InvalidConfig, "".to_string()));
+            return Err(PoleError::new(ErrorCode::InvalidConfig, "".to_string()));
         }
 
         let supplier = CLIENT_PLUGIN_CONTAINER
@@ -262,7 +359,7 @@ impl Extensions {
         Ok(())
     }
 
-    fn load_config_file_filters(&mut self, filter_conf: &ConfigFilter) -> Result<(), PolarisError> {
+    fn load_config_file_filters(&mut self, filter_conf: &ConfigFilter) -> Result<(), PoleError> {
         let mut filters = Vec::<Box<dyn DiscoverFilter>>::new();
         if filter_conf.enable {
             for (_i, name) in filter_conf.chain.iter().enumerate() {
@@ -284,10 +381,7 @@ impl Extensions {
         Ok(())
     }
 
-    fn load_service_routers(
-        &mut self,
-        route_conf: &ServiceRouterConfig,
-    ) -> Result<(), PolarisError> {
+    fn load_service_routers(&mut self, route_conf: &ServiceRouterConfig) -> Result<(), PoleError> {
         let mut container = RouterContainer::new();
         for (name, supplier) in CLIENT_PLUGIN_CONTAINER
             .read()
@@ -326,7 +420,7 @@ impl Extensions {
         Ok(())
     }
 
-    fn load_loadbalancers(&mut self) -> Result<(), PolarisError> {
+    fn load_loadbalancers(&mut self) -> Result<(), PoleError> {
         let mut loadbalancers = HashMap::<String, Arc<Box<dyn LoadBalancer>>>::new();
         for (name, supplier) in CLIENT_PLUGIN_CONTAINER
             .read()
@@ -341,11 +435,32 @@ impl Extensions {
         Ok(())
     }
 
-    fn load_location_providers(&mut self, opt: &LocationConfig) -> Result<(), PolarisError> {
+    fn load_circuit_breaker(&mut self, opt: &CircuitBreakerConfig) -> Result<(), PoleError> {
+        self.circuit_breaker = Self::build_circuit_breaker(opt)?;
+        Ok(())
+    }
+
+    fn build_circuit_breaker(
+        opt: &CircuitBreakerConfig,
+    ) -> Result<Option<Arc<Box<dyn CircuitBreaker>>>, PoleError> {
+        if !opt.enable {
+            return Ok(None);
+        }
+
+        let supplier = CLIENT_PLUGIN_CONTAINER
+            .read()
+            .unwrap()
+            .get_circuit_breaker_supplier("composite");
+        let mut breaker = supplier();
+        breaker.init();
+        Ok(Some(Arc::new(breaker)))
+    }
+
+    fn load_location_providers(&mut self, opt: &LocationConfig) -> Result<(), PoleError> {
         let mut chain = Vec::<Box<dyn LocationSupplier>>::new();
         let providers = opt.clone().providers;
         if providers.is_none() {
-            return Err(PolarisError::new(
+            return Err(PoleError::new(
                 ErrorCode::ApiInvalidArgument,
                 "".to_string(),
             ));
@@ -385,7 +500,7 @@ pub struct PluginContainer {
     caches: HashMap<String, fn(InitResourceCacheOption) -> Box<dyn ResourceCache>>,
     // discover_filters: 发现过滤器
     discover_filters:
-        HashMap<String, fn(serde_yaml::Value) -> Result<Box<dyn DiscoverFilter>, PolarisError>>,
+        HashMap<String, fn(serde_yaml::Value) -> Result<Box<dyn DiscoverFilter>, PoleError>>,
     /// ------- 治理规则相关插件 -------
     // service_routers: 路由器
     service_routers: HashMap<String, fn(&ServiceRouterPluginConfig) -> Box<dyn ServiceRouter>>,
@@ -493,12 +608,12 @@ impl PluginContainer {
     fn get_discover_filter_supplier(
         &self,
         name: &str,
-    ) -> fn(serde_yaml::Value) -> Result<Box<dyn DiscoverFilter>, PolarisError> {
+    ) -> fn(serde_yaml::Value) -> Result<Box<dyn DiscoverFilter>, PoleError> {
         *self.discover_filters.get(name).unwrap()
     }
 
-    fn get_ratelimiter_supplier(&self, name: &str) -> fn() -> Box<dyn ServiceRateLimiter> {
-        *self.ratelimiter.get(name).unwrap()
+    fn get_circuit_breaker_supplier(&self, name: &str) -> fn() -> Box<dyn CircuitBreaker> {
+        *self.circuit_breakers.get(name).unwrap()
     }
 
     /// register_custom_service_router 注册自定义的服务路由
@@ -551,6 +666,23 @@ pub fn acquire_client_context(conf: Arc<Configuration>) -> ClientContext {
         }
     }
     ClientContext::new(client_id, self_ip, &conf.global.client)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn load_circuit_breaker_installs_composite_when_enabled() {
+        let breaker = Extensions::build_circuit_breaker(&CircuitBreakerConfig {
+            enable: true,
+            enable_remote_pull: true,
+        })
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(breaker.name(), "composite");
+    }
 }
 
 pub fn acquire_client_self_ip(conf: Arc<Configuration>) -> String {
