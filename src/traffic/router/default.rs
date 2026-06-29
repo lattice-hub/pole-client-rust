@@ -101,8 +101,8 @@ fn reject_denied_traffic(governance: &TrafficGovernanceResult) -> Result<(), Pol
         .as_ref()
         .map(|effect| {
             format!(
-                "traffic security denied: status_code={} code={} message={}",
-                effect.status_code, effect.code, effect.message
+                "traffic security denied: code={} message={}",
+                effect.code, effect.message
             )
         })
         .unwrap_or_else(|| "traffic security denied".to_string());
@@ -180,7 +180,6 @@ mod tests {
             security: crate::traffic::policy::req::TrafficSecurityDecision {
                 allowed: false,
                 reject_effect: Some(TrafficSecurityRejectEffect {
-                    status_code: 403,
                     code: "DENIED".to_string(),
                     message: "blocked".to_string(),
                 }),
@@ -199,7 +198,7 @@ mod tests {
     fn mock_governance_short_circuits_route_response() {
         let governance = TrafficGovernanceResult {
             mock: Some(MockResponse {
-                status_code: 200,
+                code: "OK".to_string(),
                 body: "{\"ok\":true}".to_string(),
                 ..MockResponse::default()
             }),
@@ -209,7 +208,7 @@ mod tests {
         let response =
             mock_route_response(&governance, &ServiceInstances::default()).expect("mock matched");
 
-        assert_eq!(response.traffic_governance.mock.unwrap().status_code, 200);
+        assert_eq!(response.traffic_governance.mock.unwrap().code, "OK");
         assert!(response.service_instances.instances.is_empty());
     }
 

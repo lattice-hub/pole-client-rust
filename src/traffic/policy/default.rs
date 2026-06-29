@@ -20,8 +20,8 @@ pub use crate::traffic::{
 use bytes::Bytes;
 use http::{header::HeaderName, HeaderValue, Request as HttpRequest};
 use pole_specification::v1::{
-    Api, MirrorDestination, MockResponse, TrafficMirror, TrafficMock, TrafficSecurityAction,
-    TrafficSecurityRejectEffect, TrafficSecurityRule,
+    Api, MirrorDestination, MockResponse, SourceService, TrafficMirror, TrafficMock,
+    TrafficSecurityAction, TrafficSecurityRejectEffect, TrafficSecurityRule,
 };
 use std::{
     any::Any,
@@ -659,7 +659,6 @@ fn evaluate_security(
             }
             return security_decision(policy.action(), policy.reject_effect.clone());
         }
-        return security_decision(rule.default_action(), None);
     }
 
     TrafficSecurityDecision::default()
@@ -674,23 +673,26 @@ fn evaluate_mirrors(ctx: &RouteContext, mirror_rules: &[TrafficMirror]) -> Vec<M
 
     let mut destinations = Vec::new();
     for rule in rules {
+        if !source_service_matches(rule.caller.as_ref(), ctx) {
+            continue;
+        }
         for mirror_rule in rule.rules.iter() {
             if mirror_rule.disable || mirror_rule.mirror_percent == 0 {
                 continue;
             }
-            let Some(source) = &mirror_rule.source else {
-                continue;
-            };
-            if !matches_service(&source.namespace, &source.service, ctx) {
+            if !api_matches(ctx, mirror_rule.api.as_ref()) {
                 continue;
             }
-            if !traffic_rule_matches(ctx, source.traffic_match_rule.as_ref()) {
+            if !traffic_rule_matches(ctx, mirror_rule.traffic_match_rule.as_ref()) {
                 continue;
             }
             if let Some(destination) = &mirror_rule.destination {
                 let sample_salt = format!(
                     "mirror#{}#{}#{}#{}",
-                    source.namespace, source.service, destination.namespace, destination.service
+                    ctx.route_info.caller.namespace,
+                    ctx.route_info.caller.name,
+                    destination.namespace,
+                    destination.service
                 );
                 if !traffic_sample_hit(ctx, mirror_rule.mirror_percent, &sample_salt) {
                     continue;
@@ -711,26 +713,26 @@ fn evaluate_mock(ctx: &RouteContext, mock_rules: &[TrafficMock]) -> Option<MockR
     rules.sort_by(|a, b| a.priority.cmp(&b.priority));
 
     for rule in rules {
+        if !source_service_matches(rule.caller.as_ref(), ctx) {
+            continue;
+        }
         for mock_rule in rule.rules.iter() {
             if mock_rule.disable || mock_rule.mock_percent == 0 {
                 continue;
             }
-            let Some(source) = &mock_rule.source else {
-                continue;
-            };
-            if !matches_service(&source.namespace, &source.service, ctx) {
+            if !api_matches(ctx, mock_rule.api.as_ref()) {
                 continue;
             }
-            if !api_matches(ctx, source.api.as_ref()) {
-                continue;
-            }
-            if !traffic_rule_matches(ctx, source.traffic_match_rule.as_ref()) {
+            if !traffic_rule_matches(ctx, mock_rule.traffic_match_rule.as_ref()) {
                 continue;
             }
             if let Some(response) = &mock_rule.response {
                 let sample_salt = format!(
                     "mock#{}#{}#{}#{}",
-                    source.namespace, source.service, response.status_code, response.body
+                    ctx.route_info.caller.namespace,
+                    ctx.route_info.caller.name,
+                    response.code,
+                    response.body
                 );
                 if !traffic_sample_hit(ctx, mock_rule.mock_percent, &sample_salt) {
                     continue;
@@ -811,9 +813,13 @@ fn api_matches(ctx: &RouteContext, api: Option<&Api>) -> bool {
     true
 }
 
-fn matches_service(namespace: &str, service: &str, ctx: &RouteContext) -> bool {
-    string_matches_service(namespace, &ctx.route_info.callee.namespace)
-        && string_matches_service(service, &ctx.route_info.callee.name)
+fn source_service_matches(source: Option<&SourceService>, ctx: &RouteContext) -> bool {
+    source
+        .map(|source| {
+            string_matches_service(&source.namespace, &ctx.route_info.caller.namespace)
+                && string_matches_service(&source.service, &ctx.route_info.caller.name)
+        })
+        .unwrap_or(true)
 }
 
 fn string_matches_service(rule_value: &str, actual: &str) -> bool {
@@ -843,9 +849,9 @@ mod tests {
     use pole_specification::v1::{
         match_string::{MatchStringType, ValueType},
         source_match, traffic_match_rule, Api, MatchString, MirrorDestination, MirrorRule,
-        MirrorSource, MockResponse, MockRule, MockSource, SourceMatch, TrafficMatchRule,
-        TrafficMirror, TrafficMock, TrafficSecurityAction, TrafficSecurityPolicy,
-        TrafficSecurityRejectEffect, TrafficSecurityRule,
+        MockResponse, MockRule, SourceMatch, SourceService, TrafficMatchRule, TrafficMirror,
+        TrafficMock, TrafficSecurityAction, TrafficSecurityPolicy, TrafficSecurityRejectEffect,
+        TrafficSecurityRule,
     };
     use std::{
         collections::HashMap,
@@ -887,24 +893,22 @@ mod tests {
                         traffic_match_rule: Some(header_match("x-user", "alice")),
                         action: TrafficSecurityAction::TrafficSecurityDeny.into(),
                         reject_effect: Some(TrafficSecurityRejectEffect {
-                            status_code: 403,
                             code: "DENIED".to_string(),
                             message: "blocked".to_string(),
                         }),
                     }],
-                    default_action: TrafficSecurityAction::TrafficSecurityAllow.into(),
                     ..TrafficSecurityRule::default()
                 })],
                 EventType::TrafficMirrorRule => vec![Box::new(TrafficMirror {
                     id: "mirror-1".to_string(),
                     enable: true,
+                    caller: Some(SourceService {
+                        namespace: "default".to_string(),
+                        service: "frontend".to_string(),
+                    }),
                     rules: vec![MirrorRule {
-                        source: Some(MirrorSource {
-                            namespace: "default".to_string(),
-                            service: "orders".to_string(),
-                            traffic_match_rule: Some(header_match("x-debug", "true")),
-                            api: Some(api()),
-                        }),
+                        traffic_match_rule: Some(header_match("x-debug", "true")),
+                        api: Some(api()),
                         destination: Some(MirrorDestination {
                             namespace: "shadow".to_string(),
                             service: "orders-shadow".to_string(),
@@ -918,15 +922,15 @@ mod tests {
                 EventType::TrafficMockRule => vec![Box::new(TrafficMock {
                     id: "mock-1".to_string(),
                     enable: true,
+                    caller: Some(SourceService {
+                        namespace: "default".to_string(),
+                        service: "frontend".to_string(),
+                    }),
                     rules: vec![MockRule {
-                        source: Some(MockSource {
-                            namespace: "default".to_string(),
-                            service: "orders".to_string(),
-                            api: Some(api()),
-                            traffic_match_rule: Some(header_match("x-user", "alice")),
-                        }),
+                        api: Some(api()),
+                        traffic_match_rule: Some(header_match("x-user", "alice")),
                         response: Some(MockResponse {
-                            status_code: 200,
+                            code: "OK".to_string(),
                             body: "{\"ok\":true}".to_string(),
                             ..MockResponse::default()
                         }),
@@ -1063,12 +1067,10 @@ mod tests {
                         traffic_match_rule: Some(header_match("x-user", "alice")),
                         action: TrafficSecurityAction::TrafficSecurityDeny.into(),
                         reject_effect: Some(TrafficSecurityRejectEffect {
-                            status_code: 403,
                             code: "DENIED".to_string(),
                             message: "blocked".to_string(),
                         }),
                     }],
-                    default_action: TrafficSecurityAction::TrafficSecurityAllow.into(),
                     ..TrafficSecurityRule::default()
                 }],
                 ..TrafficGovernanceRules::default()
@@ -1076,7 +1078,7 @@ mod tests {
         );
 
         assert!(!result.security.allowed);
-        assert_eq!(result.security.reject_effect.unwrap().status_code, 403);
+        assert_eq!(result.security.reject_effect.unwrap().code, "DENIED");
     }
 
     #[test]
@@ -1087,13 +1089,13 @@ mod tests {
                 mirror_rules: vec![TrafficMirror {
                     id: "mirror-1".to_string(),
                     enable: true,
+                    caller: Some(SourceService {
+                        namespace: "default".to_string(),
+                        service: "frontend".to_string(),
+                    }),
                     rules: vec![MirrorRule {
-                        source: Some(MirrorSource {
-                            namespace: "default".to_string(),
-                            service: "orders".to_string(),
-                            traffic_match_rule: Some(header_match("x-debug", "true")),
-                            api: Some(api()),
-                        }),
+                        traffic_match_rule: Some(header_match("x-debug", "true")),
+                        api: Some(api()),
                         destination: Some(MirrorDestination {
                             namespace: "shadow".to_string(),
                             service: "orders-shadow".to_string(),
@@ -1120,15 +1122,15 @@ mod tests {
                 mock_rules: vec![TrafficMock {
                     id: "mock-1".to_string(),
                     enable: true,
+                    caller: Some(SourceService {
+                        namespace: "default".to_string(),
+                        service: "frontend".to_string(),
+                    }),
                     rules: vec![MockRule {
-                        source: Some(MockSource {
-                            namespace: "default".to_string(),
-                            service: "orders".to_string(),
-                            api: Some(api()),
-                            traffic_match_rule: Some(header_match("x-user", "alice")),
-                        }),
+                        api: Some(api()),
+                        traffic_match_rule: Some(header_match("x-user", "alice")),
                         response: Some(MockResponse {
-                            status_code: 200,
+                            code: "OK".to_string(),
                             body: "{\"ok\":true}".to_string(),
                             ..MockResponse::default()
                         }),
@@ -1141,7 +1143,7 @@ mod tests {
             },
         );
 
-        assert_eq!(result.mock.unwrap().status_code, 200);
+        assert_eq!(result.mock.unwrap().code, "OK");
     }
 
     #[test]
@@ -1181,7 +1183,7 @@ mod tests {
 
         assert!(!result.security.allowed);
         assert_eq!(result.mirrors[0].service, "orders-shadow");
-        assert_eq!(result.mock.unwrap().status_code, 200);
+        assert_eq!(result.mock.unwrap().code, "OK");
         let calls = calls.lock().unwrap();
         assert_eq!(calls.len(), 3);
         assert_eq!(calls[0].event_type, EventType::TrafficSecurityRule);

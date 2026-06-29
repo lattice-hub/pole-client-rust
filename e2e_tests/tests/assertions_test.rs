@@ -20,7 +20,6 @@ fn mock_assertion_passes_when_sdk_returns_expected_mock_response() {
     let result = assert_mock_response(Ok(InstanceResponse {
         instance: Default::default(),
         mock_response: Some(MockResponse {
-            status_code: 200,
             code: "E2E_MOCK".to_string(),
             body: "{\"mocked\":true,\"service\":\"svc\"}".to_string(),
             ..Default::default()

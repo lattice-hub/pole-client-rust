@@ -541,7 +541,7 @@ async fn run_fault_detect_behavior(
     use pole_rust::discovery::api::{
         new_consumer_api_by_context, new_provider_api_by_context, ConsumerAPI, ProviderAPI,
     };
-    use pole_specification::v1::FaultDetector;
+    use pole_specification::v1::FaultDetectRule;
     use tokio::{net::TcpListener, time::sleep};
 
     let listener = TcpListener::bind(format!(
@@ -580,13 +580,12 @@ async fn run_fault_detect_behavior(
             {
                 Ok(_) => match consumer.get_service_rule(inputs.get_rule).await {
                     Ok(rule) => {
-                        let has_fault_detector = rule.rules.iter().any(|rule| {
-                            rule.downcast_ref::<FaultDetector>()
-                                .map(|detector| !detector.rules.is_empty())
-                                .unwrap_or(false)
-                        });
-                        if !has_fault_detector {
-                            Err("fault-detect rule did not downcast to FaultDetector".to_string())
+                        let has_fault_detect_rule = rule
+                            .rules
+                            .iter()
+                            .any(|rule| rule.downcast_ref::<FaultDetectRule>().is_some());
+                        if !has_fault_detect_rule {
+                            Err("fault-detect rule did not downcast to FaultDetectRule".to_string())
                         } else {
                             match consumer.get_all_instance(inputs.get_all).await {
                                 Ok(_) => {

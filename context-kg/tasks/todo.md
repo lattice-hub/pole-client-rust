@@ -1,4 +1,97 @@
+---
+title: 切换 pole specification 依赖
+tags: [task, review]
+links: [lessons]
+updated: 2026-06-29
+sources: 1
+---
+
 # 切换 pole specification 依赖
+
+## 本轮计划：更新 spec tag 到 v0.1.0-ALPHA.31
+
+- [x] 将根包和 `e2e_tests` 的 `pole-specification` git tag 从 `v0.1.0-ALPHA.26` 更新到 `v0.1.0-ALPHA.31`
+- [x] 更新本地依赖解析并运行 `RUSTFLAGS=-D warnings cargo check --workspace`
+- [x] 按最新 spec 的 breaking change 适配源码和测试
+- [x] 运行 `cargo fmt`、旧品牌残留扫描、`RUSTFLAGS=-D warnings cargo check --workspace`、`RUSTFLAGS=-D warnings cargo test --workspace`
+- [x] 更新本轮 review
+
+## 本轮 review：更新 spec tag 到 v0.1.0-ALPHA.31
+
+- 已完成：通过 `git ls-remote --tags --refs https://github.com/pole-io/specification.git` 确认最新 tag 为 `v0.1.0-ALPHA.31`。
+- 已完成：根 `Cargo.toml` 和 `e2e_tests/Cargo.toml` 的 `pole-specification` git tag 已更新到 `v0.1.0-ALPHA.31`，Cargo 解析到提交 `7e596e46`。
+- 已完成：适配 spec breaking change：故障探测规则从旧 wrapper 结构切换为 `FaultDetectRule` 列表，并从 `FaultDetectRule.rules` 展开子探测计划；内存缓存和 e2e downcast 同步更新。
+- 已完成：适配熔断规则结构变化，`recover_condition` 和触发条件从规则顶层改为 `CircuitBreakerPolicy` / `block_config` 内读取，测试构造和 e2e 控制面 payload 同步更新。
+- 已完成：适配 mirror/mock/security 规则结构变化，mirror/mock 子规则不再使用 `source` wrapper，改为规则级 `caller` 与子规则 `api` / `traffic_match_rule`；security 移除默认动作和拒绝状态码；mock response 改为业务 `code` / `body` 断言。
+- 已完成：补齐 `source_match::Type::CallerService` 到 `ArgumentType::CallerService` 的映射。
+- 已完成：修复 e2e case execution 测试 mock server 的 keep-alive 抖动，响应头加入 `connection: close`，并保留失败消息上下文。
+- 已验证：旧品牌残留扫描无输出。
+- 已验证：`cargo fmt --all -- --check` 通过。
+- 已验证：`PROTOC=/Users/chuntao.liao/Github/pole-io/specification/source/protoc/protoc-darwin-arm64/bin/protoc RUSTFLAGS='-D warnings' cargo check --workspace` 通过，无 warning。
+- 已验证：`PROTOC=/Users/chuntao.liao/Github/pole-io/specification/source/protoc/protoc-darwin-arm64/bin/protoc RUSTFLAGS='-D warnings' cargo test --workspace` 通过，主库 102 个测试、`tests/public_api.rs` 4 个测试、e2e 测试 64 个测试、doc tests 0 个全部通过。
+
+## 本轮计划：从代码反向更新项目知识库
+
+- [x] 读取现有 `_meta/index.md`、`tasks/lessons.md` 和源码入口，确认当前知识库缺口
+- [x] 从 `Cargo.toml`、`README.md`、`src/lib.rs`、主要模块、测试和 e2e 工程收集证据
+- [x] 新增业务能力概览、技术模块架构、流量治理能力和测试体系知识页
+- [x] 同步 `context-kg/_meta/index.md`、`context-kg/_meta/log.md` 和页面双向链接
+- [x] 运行 `context_kg_lint.py` 和 `git diff --check`
+- [x] 更新本轮 review
+
+## 本轮 review：从代码反向更新项目知识库
+
+- 已完成：新增 `context-kg/_meta/schema.md`，补齐本项目知识库的目录职责、frontmatter、链接和代码反向建库规则。
+- 已完成：新增 `context-kg/business/pole-rust-sdk-capabilities.md`，从 Cargo metadata、README、公开 API 和 e2e README 归纳 SDK 对外能力边界。
+- 已完成：新增 `context-kg/technical/sdk-module-architecture.md`，记录 `SDKContext`、`Engine`、配置加载、公开 API 分层、插件和依赖边界。
+- 已完成：新增 `context-kg/technical/traffic-governance-architecture.md`，记录 traffic 顶层治理域、router/ratelimit/circuitbreaker/faultdetect/policy 子域、规则缓存映射和副作用边界。
+- 已完成：新增 `context-kg/quality/e2e-and-public-api-testing.md`，记录 public API 编译约束、e2e case 矩阵、控制面执行开关、报告和配置。
+- 已完成：更新 `context-kg/_meta/index.md`，新增 Meta、Business、Technical、Quality 分区；更新 `context-kg/_meta/log.md` 记录本次 ingest。
+- 已验证：`python3 /Users/chuntao.liao/.codex/skills/context-kg-maintainer/scripts/context_kg_lint.py ./context-kg` 通过，9 个 Markdown 页面 frontmatter、链接和 index 基础检查通过。
+- 已验证：`git diff --check -- context-kg` 通过。
+
+## 本轮计划：扩展 context-kg-maintainer 支持代码反向建库
+
+- [x] 在 `context-kg-maintainer/SKILL.md` 中新增从代码反向生成知识库的操作规程
+- [x] 明确代码证据来源、可写入内容和禁止过度推断的边界
+- [x] 将该能力纳入 ingest 工作流与触发描述
+- [x] 将本次用户纠正沉淀到 `context-kg/tasks/lessons.md`
+- [x] 更新 `context-kg/_meta/log.md`
+- [x] 运行 skill 校验、context-kg lint、关键规则扫描和空白检查
+- [x] 更新本轮 review
+
+## 本轮 review：扩展 context-kg-maintainer 支持代码反向建库
+
+- 已完成：`/Users/chuntao.liao/.codex/skills/context-kg-maintainer/SKILL.md` 的 frontmatter description 已加入 `reverse-generate structured knowledge`，便于后续在“从代码反向生成知识库”场景触发。
+- 已完成：`Quick Start` 已要求从代码生成知识时先收集入口、模块边界、公开 API、测试、配置、迁移/spec 和依赖元数据等 source evidence。
+- 已完成：新增 `Code Reverse Ingest` 操作，明确先读现有 `_meta/index.md` 和 lessons，再扫描代码面；输出聚焦模块职责、边界、数据流、扩展点和外部契约，不做逐文件流水账。
+- 已完成：新增证据边界：测试和 examples 只能作为行为证据，不能直接推断产品意图；不确定意图必须作为 open question 或省略；页面 `sources` 要按实际使用的文件、manifest、测试、spec 或命令输出计数。
+- 已完成：本次用户纠正已沉淀到 `context-kg/tasks/lessons.md`，并在 `context-kg/_meta/log.md` 追加记录。
+- 已验证：`python3 /Users/chuntao.liao/.codex/skills/.system/skill-creator/scripts/quick_validate.py /Users/chuntao.liao/.codex/skills/context-kg-maintainer` 通过。
+- 已验证：`python3 /Users/chuntao.liao/.codex/skills/context-kg-maintainer/scripts/context_kg_lint.py ./context-kg` 通过，4 个 Markdown 页面 frontmatter、链接和 index 基础检查通过。
+- 已验证：`rg` 扫描确认 `reverse-generate`、`Code Reverse Ingest`、`source evidence`、`public APIs`、`technical/adr`、`## 证据` 等关键规则已写入 skill。
+- 已验证：`git diff --check -- context-kg/tasks/todo.md context-kg/tasks/lessons.md context-kg/_meta/index.md context-kg/_meta/log.md` 通过。
+
+## 本轮计划：更新 context-kg-maintainer skill 内置规则
+
+- [x] 将知识库分层目录说明内置到 `context-kg-maintainer/SKILL.md`
+- [x] 将长期文档归档硬规则内置到 skill 的工作流和放置规则中
+- [x] 补充回答架构问题时优先读取 `_meta/index.md` 的查询规则
+- [x] 将本次用户纠正沉淀到 `context-kg/tasks/lessons.md`
+- [x] 运行 skill 校验与文本扫描验证
+- [x] 更新本轮 review
+
+## 本轮 review：更新 context-kg-maintainer skill 内置规则
+
+- 已完成：`/Users/chuntao.liao/.codex/skills/context-kg-maintainer/SKILL.md` 新增 `Knowledge Base Layout`，内置 `_meta`、`business`、`technical`、`quality`、`tasks` 的默认目录职责。
+- 已完成：skill 的 `Quick Start`、`Placement Rules`、`Hard Archiving Rules` 和 `Query` 已明确长期架构/技术方案归档到 `context-kg/technical/adr/`、业务知识进入 `business/`、质量知识进入 `quality/`、`tasks/` 只保留计划/进度/review/lessons。
+- 已完成：架构和设计问题查询规则已明确从 `context-kg/_meta/index.md` 开始定位相关页面。
+- 已完成：本次用户纠正已沉淀到 `context-kg/tasks/lessons.md`。
+- 已完成：发现当前仓库 `context-kg` 缺少 `_meta/index.md` 且任务页无 frontmatter 后，补齐了最小 `_meta/index.md`、`_meta/log.md`，并为 `todo.md`、`lessons.md` 补充 frontmatter 与 `## 相关页面`。
+- 已验证：`python3 /Users/chuntao.liao/.codex/skills/.system/skill-creator/scripts/quick_validate.py /Users/chuntao.liao/.codex/skills/context-kg-maintainer` 通过。
+- 已验证：`python3 /Users/chuntao.liao/.codex/skills/context-kg-maintainer/scripts/context_kg_lint.py ./context-kg` 通过，4 个 Markdown 页面 frontmatter、链接和 index 基础检查通过。
+- 已验证：`git diff --check -- context-kg/tasks/todo.md context-kg/tasks/lessons.md context-kg/_meta/index.md context-kg/_meta/log.md` 通过。
+- 已验证：`rg` 扫描确认 `Knowledge Base Layout`、`Hard Archiving Rules`、`context-kg/_meta/index.md`、`context-kg/technical/adr`、`docs/design` 等关键规则已写入 skill。
 
 ## 本轮计划：全仓统一改名到 pole
 
@@ -680,3 +773,7 @@
 - 已验证：`PROTOC=/Users/chuntao.liao/Github/pole-io/specification/source/protoc/protoc-darwin-arm64/bin/protoc RUSTFLAGS='-D warnings' cargo check --workspace` 通过，无 warning。
 - 已验证：`PROTOC=/Users/chuntao.liao/Github/pole-io/specification/source/protoc/protoc-darwin-arm64/bin/protoc RUSTFLAGS='-D warnings' cargo test --workspace` 通过，主库 102 个测试、`tests/public_api.rs` 1 个测试、e2e crate 64 个测试、doc tests 0 个全部通过。
 - 剩余风险：fault-detect 使用固定 `127.0.0.1:18080` 探测端口；真实 e2e 环境如果并行运行或端口被占用会失败。当前工作区仍包含大量此前主功能改动和 untracked 新目录，提交前需要按最终变更范围统一 review/stage。
+
+## 相关页面
+
+- [[lessons]]

@@ -74,25 +74,23 @@ fn mock_plan_uses_spec_like_rule_payload() {
     .expect("mock should have a control-plane plan");
     let rule = &plan.create.body[0];
 
-    assert_eq!(rule["namespace"], "e2e-run-2");
-    assert_eq!(rule["service"], "e2e-run-2-mock");
     assert_eq!(rule["enable"], true);
     assert_eq!(rule["rules"][0]["mock_percent"], 100);
-    assert_eq!(rule["rules"][0]["source"]["namespace"], "e2e-run-2");
-    assert_eq!(rule["rules"][0]["source"]["service"], "e2e-run-2-mock");
+    assert_eq!(rule["callee"]["namespace"], "e2e-run-2");
+    assert_eq!(rule["callee"]["service"], "e2e-run-2-mock");
     assert_eq!(
-        rule["rules"][0]["source"]["traffic_match_rule"]["arguments"][0]["type"],
+        rule["rules"][0]["traffic_match_rule"]["arguments"][0]["type"],
         "HEADER"
     );
     assert_eq!(
-        rule["rules"][0]["source"]["traffic_match_rule"]["arguments"][0]["key"],
+        rule["rules"][0]["traffic_match_rule"]["arguments"][0]["key"],
         "x-pole-e2e"
     );
     assert_eq!(
-        rule["rules"][0]["source"]["traffic_match_rule"]["arguments"][0]["value"]["value"],
+        rule["rules"][0]["traffic_match_rule"]["arguments"][0]["value"]["value"],
         "mock"
     );
-    assert_eq!(rule["rules"][0]["response"]["status_code"], 200);
+    assert_eq!(rule["rules"][0]["response"]["code"], "E2E_MOCK");
     assert!(rule["rules"][0]["response"]["body"]
         .as_str()
         .unwrap()
@@ -108,11 +106,10 @@ fn security_plan_uses_spec_like_deny_payload() {
     .expect("security should have a control-plane plan");
     let rule = &plan.create.body[0];
 
-    assert_eq!(rule["namespace"], "e2e-run-2");
-    assert_eq!(rule["service"], "e2e-run-2-auth-security");
-    assert_eq!(rule["default_action"], "TRAFFIC_SECURITY_ALLOW");
+    assert_eq!(rule["target_service"]["namespace"], "e2e-run-2");
+    assert_eq!(rule["target_service"]["service"], "e2e-run-2-auth-security");
     assert_eq!(rule["policies"][0]["action"], "TRAFFIC_SECURITY_DENY");
-    assert_eq!(rule["policies"][0]["reject_effect"]["status_code"], 403);
+    assert_eq!(rule["policies"][0]["reject_effect"]["code"], "E2E_DENIED");
     assert_eq!(
         rule["policies"][0]["traffic_match_rule"]["arguments"][0]["type"],
         "HEADER"
@@ -177,14 +174,17 @@ fn circuitbreaker_plan_uses_spec_like_consecutive_error_payload() {
 
     assert_eq!(rule["level"], "SERVICE");
     assert_eq!(
-        rule["block_configs"][0]["trigger_conditions"][0]["trigger_type"],
+        rule["block_configs"][0]["block_config"]["trigger_conditions"][0]["trigger_type"],
         "CONSECUTIVE_ERROR"
     );
     assert_eq!(
-        rule["block_configs"][0]["trigger_conditions"][0]["error_count"],
+        rule["block_configs"][0]["block_config"]["trigger_conditions"][0]["error_count"],
         2
     );
-    assert_eq!(rule["recover_condition"]["sleep_window"], 1);
+    assert_eq!(
+        rule["block_configs"][0]["recover_condition"]["sleep_window"],
+        1
+    );
 }
 
 #[test]
@@ -248,8 +248,9 @@ fn mirror_plan_uses_spec_like_http_mirror_payload() {
     let rule = &plan.create.body[0];
 
     assert_eq!(rule["rules"][0]["mirror_percent"], 100);
+    assert_eq!(rule["callee"]["service"], "e2e-run-5-mirror");
     assert_eq!(
-        rule["rules"][0]["source"]["traffic_match_rule"]["arguments"][0]["key"],
+        rule["rules"][0]["traffic_match_rule"]["arguments"][0]["key"],
         "x-pole-e2e-mirror"
     );
     assert_eq!(

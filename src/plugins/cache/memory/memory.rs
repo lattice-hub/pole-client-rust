@@ -256,8 +256,7 @@ impl MemoryCache {
                     return;
                 }
                 let cache_val = cache_val_opt.unwrap();
-                let remote_rules = remote_val.fault_detector.unwrap_or_default();
-                cache_val.value.clone_from(&remote_rules);
+                cache_val.value.clone_from(&remote_val.fault_detect_rules);
 
                 cache_val.revision = svc.revision;
                 cache_val.finish_initialize();
@@ -1083,8 +1082,8 @@ mod tests {
     use crate::core::plugin::cache::ResourceCacheFailover;
     use pole_specification::v1::{
         discover_response::DiscoverResponseType, Code, ConfigDiscoverResponse, DiscoverResponse,
-        FaultDetectRule, FaultDetector, LaneGroup, LosslessRule, Service, TrafficMirror,
-        TrafficMock, TrafficSecurityRule,
+        FaultDetectRule, LaneGroup, LosslessRule, Service, TrafficMirror, TrafficMock,
+        TrafficSecurityRule,
     };
 
     struct NoopFailover;
@@ -1233,13 +1232,10 @@ mod tests {
                 code: Code::ExecuteSuccess as u32,
                 r#type: DiscoverResponseType::FaultDetector.into(),
                 service: Some(service()),
-                fault_detector: Some(FaultDetector {
-                    rules: vec![FaultDetectRule {
-                        name: "fault-detect-a".to_string(),
-                        ..FaultDetectRule::default()
-                    }],
-                    ..FaultDetector::default()
-                }),
+                fault_detect_rules: vec![FaultDetectRule {
+                    name: "fault-detect-a".to_string(),
+                    ..FaultDetectRule::default()
+                }],
                 ..DiscoverResponse::default()
             },
         )
@@ -1309,7 +1305,7 @@ mod tests {
         let faultdetect_item = faultdetect_rules.get("default#svc-a").unwrap();
         assert!(faultdetect_item.is_initialized());
         assert_eq!(faultdetect_item.revision(), "rev-2");
-        assert_eq!(faultdetect_item.value.rules[0].name, "fault-detect-a");
+        assert_eq!(faultdetect_item.value[0].name, "fault-detect-a");
 
         let security_rules = handler.traffic_security_rules.read().await;
         let security_item = security_rules.get("default#svc-a").unwrap();

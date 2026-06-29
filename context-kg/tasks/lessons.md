@@ -1,3 +1,11 @@
+---
+title: Lessons
+tags: [task, lessons]
+links: [todo]
+updated: 2026-06-16
+sources: 1
+---
+
 # Lessons
 
 - 不能把 warning 作为“剩余风险”留给用户。用户要求功能实现完成时，`cargo check` 和 `cargo test` 的 warning 也必须处理；若确实不能处理，需要明确技术原因，而不是把 warning 归为可接受状态。
@@ -7,3 +15,9 @@
 - 如果 e2e 测试工具只是当前仓库的测试体系，不需要再包一层聚合目录；用户明确要求时应直接作为根 workspace member `e2e_tests`，减少发布 crate 误解和路径噪音。
 - 主 SDK 的 Rust crate 命名应统一使用 `pole_rust`，不要继续暴露旧主 crate 名；外部 import、e2e 依赖名、README 示例和显式客户端类型字符串都要一起检查。
 - 项目重命名不能只改 crate/package 名；用户要求统一到 `pole` 时，类型名、依赖别名、日志前缀、默认配置、测试数据、README/Cargo metadata 和版权头中的旧品牌字眼都要纳入同一轮残留扫描与清理。
+- 维护 `context-kg` 相关 skill 或知识库时，必须内置并执行三域归档规则：长期架构/技术方案进入 `context-kg/technical/adr/`，业务知识进入 `business/`，质量知识进入 `quality/`，`tasks/` 只保留计划、进度、review 和 lessons。
+- 维护 `context-kg` 相关 skill 时，还要支持从代码、测试、配置和构建元数据反向生成部分知识库；这类内容必须证据驱动，不能把实现细节推断成未经验证的产品意图。
+
+## 相关页面
+
+- [[todo]]

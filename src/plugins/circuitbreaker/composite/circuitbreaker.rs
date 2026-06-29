@@ -164,7 +164,7 @@ impl CircuitBreakerRuleState {
         if self.status != Status::Open {
             return;
         }
-        let Some(recover_condition) = self.rule.recover_condition.as_ref() else {
+        let Some(recover_condition) = self.recover_condition() else {
             return;
         };
         let Some(opened_at) = self.opened_at else {
@@ -178,11 +178,16 @@ impl CircuitBreakerRuleState {
     }
 
     fn recover_success_threshold(&self) -> u32 {
-        self.rule
-            .recover_condition
-            .as_ref()
+        self.recover_condition()
             .map(|condition| condition.consecutive_success.max(1))
             .unwrap_or(1)
+    }
+
+    fn recover_condition(&self) -> Option<&pole_specification::v1::RecoverCondition> {
+        self.rule
+            .block_configs
+            .iter()
+            .find_map(|policy| policy.recover_condition.as_ref())
     }
 
     fn should_open(&self) -> bool {
@@ -194,6 +199,7 @@ impl CircuitBreakerRuleState {
             .rule
             .block_configs
             .iter()
+            .filter_map(|policy| policy.block_config.as_ref())
             .flat_map(|block| block.trigger_conditions.iter())
         {
             if trigger.trigger_type() != trigger_condition::TriggerType::ConsecutiveError {
@@ -331,7 +337,8 @@ mod tests {
     use super::*;
     use crate::core::model::circuitbreaker::RetStatus;
     use pole_specification::v1::{
-        trigger_condition, BlockConfig, CircuitBreakerRule, RecoverCondition, TriggerCondition,
+        trigger_condition, BlockConfig, CircuitBreakerPolicy, CircuitBreakerRule, RecoverCondition,
+        TriggerCondition,
     };
 
     fn consecutive_error_rule(error_count: u32) -> CircuitBreakerRule {
@@ -339,15 +346,18 @@ mod tests {
             id: "cb-1".to_string(),
             name: "consecutive-error".to_string(),
             enable: true,
-            block_configs: vec![BlockConfig {
-                trigger_conditions: vec![TriggerCondition {
-                    trigger_type: trigger_condition::TriggerType::ConsecutiveError.into(),
-                    error_count,
-                    minimum_request: error_count,
-                    interval: 60,
-                    ..TriggerCondition::default()
-                }],
-                ..BlockConfig::default()
+            block_configs: vec![CircuitBreakerPolicy {
+                block_config: Some(BlockConfig {
+                    trigger_conditions: vec![TriggerCondition {
+                        trigger_type: trigger_condition::TriggerType::ConsecutiveError.into(),
+                        error_count,
+                        minimum_request: error_count,
+                        interval: 60,
+                        ..TriggerCondition::default()
+                    }],
+                    ..BlockConfig::default()
+                }),
+                ..CircuitBreakerPolicy::default()
             }],
             ..CircuitBreakerRule::default()
         }
@@ -359,7 +369,7 @@ mod tests {
         consecutive_success: u32,
     ) -> CircuitBreakerRule {
         let mut rule = consecutive_error_rule(error_count);
-        rule.recover_condition = Some(RecoverCondition {
+        rule.block_configs[0].recover_condition = Some(RecoverCondition {
             sleep_window,
             consecutive_success,
         });

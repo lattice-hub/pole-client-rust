@@ -1348,7 +1348,7 @@ mod consumer_tests {
     use crate::traffic::router::req::ProcessRouteResponse;
     use pole_specification::v1::MockResponse;
     use pole_specification::v1::{
-        trigger_condition, BlockConfig, CircuitBreakerRule, TriggerCondition,
+        trigger_condition, BlockConfig, CircuitBreakerPolicy, CircuitBreakerRule, TriggerCondition,
     };
 
     fn test_configuration() -> Configuration {
@@ -1430,15 +1430,18 @@ config:
             id: "cb-1".to_string(),
             name: "consumer-report-consecutive-error".to_string(),
             enable: true,
-            block_configs: vec![BlockConfig {
-                trigger_conditions: vec![TriggerCondition {
-                    trigger_type: trigger_condition::TriggerType::ConsecutiveError.into(),
-                    error_count,
-                    minimum_request: error_count,
-                    interval: 60,
-                    ..TriggerCondition::default()
-                }],
-                ..BlockConfig::default()
+            block_configs: vec![CircuitBreakerPolicy {
+                block_config: Some(BlockConfig {
+                    trigger_conditions: vec![TriggerCondition {
+                        trigger_type: trigger_condition::TriggerType::ConsecutiveError.into(),
+                        error_count,
+                        minimum_request: error_count,
+                        interval: 60,
+                        ..TriggerCondition::default()
+                    }],
+                    ..BlockConfig::default()
+                }),
+                ..CircuitBreakerPolicy::default()
             }],
             ..CircuitBreakerRule::default()
         }
@@ -1526,7 +1529,7 @@ config:
     #[test]
     fn consumer_mock_route_response_returns_mock_without_instance() {
         let mock = MockResponse {
-            status_code: 201,
+            code: "MOCKED".to_string(),
             body: "mocked".to_string(),
             ..MockResponse::default()
         };

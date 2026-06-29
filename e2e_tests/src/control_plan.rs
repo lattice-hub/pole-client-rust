@@ -333,19 +333,21 @@ fn circuitbreaker_rule_body(resource: &FlowResource) -> Value {
         "priority": 1,
         "metadata": metadata(resource),
         "block_configs": [{
-            "name": resource.name(),
-            "trigger_conditions": [{
-                "trigger_type": "CONSECUTIVE_ERROR",
-                "error_count": 2,
-                "interval": 1,
-                "minimum_request": 2
-            }]
-        }],
-        "recover_condition": {
-            "sleep_window": 1,
-            "consecutive_success": 1
-        },
-        "max_ejection_percent": 100
+            "block_config": {
+                "name": resource.name(),
+                "trigger_conditions": [{
+                    "trigger_type": "CONSECUTIVE_ERROR",
+                    "error_count": 2,
+                    "interval": 1,
+                    "minimum_request": 2
+                }]
+            },
+            "recover_condition": {
+                "sleep_window": 1,
+                "consecutive_success": 1
+            },
+            "max_ejection_percent": 100
+        }]
     })
 }
 
@@ -381,17 +383,17 @@ fn lane_rule_body(resource: &FlowResource) -> Value {
 
 fn fault_detect_rule_body(resource: &FlowResource) -> Value {
     json!({
+        "id": resource.name(),
+        "name": resource.name(),
+        "description": "pole-client-rust e2e fault detect rule",
         "revision": resource.run_id,
+        "target_service": {
+            "namespace": resource.namespace(),
+            "service": resource.name()
+        },
+        "priority": 1,
         "metadata": metadata(resource),
         "rules": [{
-            "id": resource.name(),
-            "name": resource.name(),
-            "namespace": resource.namespace(),
-            "description": "pole-client-rust e2e fault detect rule",
-            "target_service": {
-                "namespace": resource.namespace(),
-                "service": resource.name()
-            },
             "interval": 1,
             "timeout": 1,
             "port": 18080,
@@ -403,9 +405,7 @@ fn fault_detect_rule_body(resource: &FlowResource) -> Value {
                     "key": "x-pole-e2e",
                     "value": resource.run_id
                 }]
-            },
-            "priority": 1,
-            "metadata": metadata(resource)
+            }
         }]
     })
 }
@@ -437,17 +437,19 @@ fn mirror_rule_body(resource: &FlowResource) -> Value {
         "id": resource.name(),
         "name": resource.name(),
         "description": "pole-client-rust e2e mirror rule",
-        "namespace": resource.namespace(),
-        "service": resource.name(),
         "enable": true,
         "priority": 1,
         "metadata": metadata(resource),
+        "caller": {
+            "namespace": "*",
+            "service": "*"
+        },
+        "callee": {
+            "namespace": resource.namespace(),
+            "service": resource.name()
+        },
         "rules": [{
-            "source": {
-                "namespace": resource.namespace(),
-                "service": resource.name(),
-                "traffic_match_rule": header_match(crate::flows::MIRROR_TRAFFIC_HEADER, crate::flows::MIRROR_TRAFFIC_HEADER_VALUE)
-            },
+            "traffic_match_rule": header_match(crate::flows::MIRROR_TRAFFIC_HEADER, crate::flows::MIRROR_TRAFFIC_HEADER_VALUE),
             "destination": {
                 "namespace": resource.namespace(),
                 "service": format!("{}-shadow", resource.name())
@@ -463,25 +465,25 @@ fn mock_rule_body(resource: &FlowResource) -> Value {
         "id": resource.name(),
         "name": resource.name(),
         "description": "pole-client-rust e2e mock rule",
-        "namespace": resource.namespace(),
-        "service": resource.name(),
         "enable": true,
         "priority": 1,
         "metadata": metadata(resource),
+        "caller": {
+            "namespace": "*",
+            "service": "*"
+        },
+        "callee": {
+            "namespace": resource.namespace(),
+            "service": resource.name()
+        },
         "rules": [{
-            "source": {
-                "namespace": resource.namespace(),
-                "service": resource.name(),
-                "traffic_match_rule": header_match(MOCK_TRAFFIC_HEADER, MOCK_TRAFFIC_HEADER_VALUE),
-            },
+            "traffic_match_rule": header_match(MOCK_TRAFFIC_HEADER, MOCK_TRAFFIC_HEADER_VALUE),
             "response": {
-                "status_code": 200,
                 "headers": {
                     "content-type": "application/json"
                 },
                 "body": format!("{{\"mocked\":true,\"service\":\"{}\"}}", resource.name()),
-                "code": "E2E_MOCK",
-                "message": "mocked by pole-client-rust e2e"
+                "code": "E2E_MOCK"
             },
             "mock_percent": 100,
             "disable": false
@@ -493,18 +495,18 @@ fn security_rule_body(resource: &FlowResource) -> Value {
     json!({
         "id": resource.name(),
         "name": resource.name(),
-        "namespace": resource.namespace(),
-        "service": resource.name(),
+        "target_service": {
+            "namespace": resource.namespace(),
+            "service": resource.name()
+        },
         "description": "pole-client-rust e2e traffic security rule",
         "priority": 1,
         "enable": true,
-        "default_action": "TRAFFIC_SECURITY_ALLOW",
         "metadata": metadata(resource),
         "policies": [{
             "traffic_match_rule": header_match(SECURITY_TRAFFIC_HEADER, SECURITY_TRAFFIC_HEADER_VALUE),
             "action": "TRAFFIC_SECURITY_DENY",
             "reject_effect": {
-                "status_code": 403,
                 "code": "E2E_DENIED",
                 "message": "blocked by pole-client-rust e2e"
             }

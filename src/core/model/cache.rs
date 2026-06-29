@@ -28,7 +28,7 @@ use pole_specification::v1::{
     config_discover_response::ConfigDiscoverResponseType, discover_request::DiscoverRequestType,
     discover_response::DiscoverResponseType, CircuitBreakerRule, ConfigDiscoverRequest,
     ConfigDiscoverResponse, ConfigFile as SpecConfigFile, ConfigFileRelease, DiscoverFilter,
-    DiscoverRequest, DiscoverResponse, FaultDetector, LaneGroup, LosslessRule, RateLimit,
+    DiscoverRequest, DiscoverResponse, FaultDetectRule, LaneGroup, LosslessRule, RateLimit,
     RouteRule, Service, TrafficMirror, TrafficMock, TrafficSecurityRule,
 };
 
@@ -1015,7 +1015,7 @@ impl RegistryCacheValue for CircuitBreakerRulesCacheItem {
 // FaultDetectRulesCacheItem 主动探测规则
 pub struct FaultDetectRulesCacheItem {
     initialized: Arc<AtomicBool>,
-    pub value: FaultDetector,
+    pub value: Vec<FaultDetectRule>,
     pub revision: String,
 }
 
@@ -1029,7 +1029,7 @@ impl FaultDetectRulesCacheItem {
     pub fn new() -> Self {
         Self {
             initialized: Arc::new(AtomicBool::new(false)),
-            value: FaultDetector::default(),
+            value: Vec::new(),
             revision: String::new(),
         }
     }

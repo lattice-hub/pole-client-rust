@@ -22,12 +22,6 @@ pub fn assert_mock_response(result: Result<InstanceResponse, PoleError>) -> Resu
         return Err("mock response missing from SDK result".to_string());
     };
 
-    if mock.status_code != 200 {
-        return Err(format!(
-            "mock response status mismatch: {}",
-            mock.status_code
-        ));
-    }
     if mock.code != "E2E_MOCK" {
         return Err(format!("mock response code mismatch: {}", mock.code));
     }

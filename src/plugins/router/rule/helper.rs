@@ -182,6 +182,7 @@ fn argument_type_from_source(source_type: source_match::Type) -> ArgumentType {
         source_match::Type::CallerIp => ArgumentType::CallerIP,
         source_match::Type::Path => ArgumentType::Path,
         source_match::Type::Cookie => ArgumentType::Cookie,
+        source_match::Type::CallerService => ArgumentType::CallerService,
         source_match::Type::CallerMetadata => ArgumentType::CallerService,
         source_match::Type::Custom => ArgumentType::Custom,
     }

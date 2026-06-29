@@ -86,9 +86,13 @@ async fn lossless_case_executes_behavior_assertion_before_cleanup() {
         .await;
 
     assert_eq!(report.outcome, CaseOutcome::Failed);
-    assert!(report
-        .message
-        .contains("lossless behavior assertion failed"));
+    assert!(
+        report
+            .message
+            .contains("lossless behavior assertion failed"),
+        "{}",
+        report.message
+    );
     assert!(!report
         .message
         .contains("behavioral assertions are not implemented"));
@@ -258,7 +262,11 @@ async fn routing_case_executes_behavior_assertion_before_cleanup() {
         .await;
 
     assert_eq!(report.outcome, CaseOutcome::Failed);
-    assert!(report.message.contains("routing behavior assertion failed"));
+    assert!(
+        report.message.contains("routing behavior assertion failed"),
+        "{}",
+        report.message
+    );
     assert!(!report
         .message
         .contains("behavioral assertions are not implemented"));
@@ -305,9 +313,13 @@ async fn circuitbreaker_case_executes_behavior_assertion_before_cleanup() {
         .await;
 
     assert_eq!(report.outcome, CaseOutcome::Failed);
-    assert!(report
-        .message
-        .contains("circuitbreaker behavior assertion failed"));
+    assert!(
+        report
+            .message
+            .contains("circuitbreaker behavior assertion failed"),
+        "{}",
+        report.message
+    );
     assert!(!report
         .message
         .contains("behavioral assertions are not implemented"));
@@ -423,7 +435,7 @@ async fn write_response(stream: &mut tokio::net::TcpStream, status: u16, body: &
     stream
         .write_all(
             format!(
-                "HTTP/1.1 {status} {status_text}\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n",
+                "HTTP/1.1 {status} {status_text}\r\nconnection: close\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n",
                 body.len()
             )
             .as_bytes(),

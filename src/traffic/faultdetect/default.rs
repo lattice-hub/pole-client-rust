@@ -13,7 +13,7 @@
 // CONDITIONS OF ANY KIND, either express or implied. See the License for the
 // specific language governing permissions and limitations under the License.
 
-use pole_specification::v1::{fault_detect_rule, FaultDetector};
+use pole_specification::v1::{fault_detect_rule, FaultDetectRule};
 use std::{
     collections::HashMap,
     sync::{Arc, Mutex},
@@ -325,46 +325,57 @@ pub fn fault_detect_result_to_resource_stat(
     }
 }
 
-pub fn build_fault_detect_plans(detector: &FaultDetector) -> Vec<FaultDetectPlan> {
-    let mut rules = detector.rules.iter().collect::<Vec<_>>();
+pub fn build_fault_detect_plans(rules: &[FaultDetectRule]) -> Vec<FaultDetectPlan> {
+    let mut rules = rules.iter().collect::<Vec<_>>();
     rules.sort_by(|a, b| a.priority.cmp(&b.priority));
 
     rules
         .into_iter()
-        .filter_map(|rule| {
+        .flat_map(|rule| {
             let target = rule.target_service.as_ref()?;
-            let protocol = protocol_from_spec(rule.protocol())?;
-            Some(FaultDetectPlan {
-                rule_id: rule.id.clone(),
-                namespace: target.namespace.clone(),
-                service: target.service.clone(),
-                interval_secs: rule.interval,
-                timeout_secs: rule.timeout,
-                port: rule.port,
-                protocol,
-                http_config: rule
-                    .http_config
-                    .as_ref()
-                    .map(|config| HttpFaultDetectConfig {
-                        method: config.method.clone(),
-                        url: config.url.clone(),
-                        headers: config
-                            .headers
-                            .iter()
-                            .map(|header| (header.key.clone(), header.value.clone()))
-                            .collect(),
-                        body: config.body.clone(),
+            Some(rule.rules.iter().filter_map(move |sub_rule| {
+                if sub_rule.disable {
+                    return None;
+                }
+                let protocol = protocol_from_spec(sub_rule.protocol())?;
+                Some(FaultDetectPlan {
+                    rule_id: rule.id.clone(),
+                    namespace: target.namespace.clone(),
+                    service: target.service.clone(),
+                    interval_secs: sub_rule.interval,
+                    timeout_secs: sub_rule.timeout,
+                    port: sub_rule.port,
+                    protocol,
+                    http_config: sub_rule.http_config.as_ref().map(|config| {
+                        HttpFaultDetectConfig {
+                            method: config.method.clone(),
+                            url: config.url.clone(),
+                            headers: config
+                                .headers
+                                .iter()
+                                .map(|header| (header.key.clone(), header.value.clone()))
+                                .collect(),
+                            body: config.body.clone(),
+                        }
                     }),
-                tcp_config: rule.tcp_config.as_ref().map(|config| TcpFaultDetectConfig {
-                    send: config.send.clone(),
-                    receive: config.receive.clone(),
-                }),
-                udp_config: rule.udp_config.as_ref().map(|config| UdpFaultDetectConfig {
-                    send: config.send.clone(),
-                    receive: config.receive.clone(),
-                }),
-            })
+                    tcp_config: sub_rule
+                        .tcp_config
+                        .as_ref()
+                        .map(|config| TcpFaultDetectConfig {
+                            send: config.send.clone(),
+                            receive: config.receive.clone(),
+                        }),
+                    udp_config: sub_rule
+                        .udp_config
+                        .as_ref()
+                        .map(|config| UdpFaultDetectConfig {
+                            send: config.send.clone(),
+                            receive: config.receive.clone(),
+                        }),
+                })
+            }))
         })
+        .flatten()
         .collect()
 }
 
@@ -719,7 +730,7 @@ mod tests {
     };
     use crate::core::plugin::plugins::Plugin;
     use pole_specification::v1::{
-        fault_detect_rule, http_protocol_config, FaultDetectRule, FaultDetector,
+        fault_detect_rule, http_protocol_config, FaultDetectRule, FaultDetectSubRule,
         HttpProtocolConfig, Service, TcpProtocolConfig, UdpProtocolConfig,
     };
     use std::{
@@ -733,15 +744,15 @@ mod tests {
 
     #[test]
     fn fault_detect_planner_builds_enabled_probe_plan_for_target_service() {
-        let detector = FaultDetector {
-            rules: vec![FaultDetectRule {
-                id: "fd-1".to_string(),
-                name: "orders-http".to_string(),
-                target_service: Some(fault_detect_rule::DestinationService {
-                    namespace: "default".to_string(),
-                    service: "orders".to_string(),
-                    ..fault_detect_rule::DestinationService::default()
-                }),
+        let rules = vec![FaultDetectRule {
+            id: "fd-1".to_string(),
+            name: "orders-http".to_string(),
+            target_service: Some(fault_detect_rule::DestinationService {
+                namespace: "default".to_string(),
+                service: "orders".to_string(),
+                ..fault_detect_rule::DestinationService::default()
+            }),
+            rules: vec![FaultDetectSubRule {
                 interval: 5,
                 timeout: 2,
                 port: 8080,
@@ -755,13 +766,13 @@ mod tests {
                     }],
                     body: "probe-body".to_string(),
                 }),
-                priority: 0,
-                ..FaultDetectRule::default()
+                ..FaultDetectSubRule::default()
             }],
-            revision: "rev-1".to_string(),
-        };
+            priority: 0,
+            ..FaultDetectRule::default()
+        }];
 
-        let plans = build_fault_detect_plans(&detector);
+        let plans = build_fault_detect_plans(&rules);
 
         assert_eq!(plans.len(), 1);
         assert_eq!(plans[0].rule_id, "fd-1");
@@ -930,22 +941,22 @@ mod tests {
         let owner = Arc::new(FaultDetectLifecycleOwner::new(scheduler));
         let listener = FaultDetectResourceListener::new(owner.clone());
         let mut rule_item = FaultDetectRulesCacheItem::new();
-        rule_item.value = FaultDetector {
-            rules: vec![FaultDetectRule {
-                id: "fd-orders".to_string(),
-                target_service: Some(fault_detect_rule::DestinationService {
-                    namespace: "default".to_string(),
-                    service: "orders".to_string(),
-                    ..fault_detect_rule::DestinationService::default()
-                }),
+        rule_item.value = vec![FaultDetectRule {
+            id: "fd-orders".to_string(),
+            target_service: Some(fault_detect_rule::DestinationService {
+                namespace: "default".to_string(),
+                service: "orders".to_string(),
+                ..fault_detect_rule::DestinationService::default()
+            }),
+            rules: vec![FaultDetectSubRule {
                 protocol: fault_detect_rule::Protocol::Tcp.into(),
                 interval: 1,
                 timeout: 1,
                 port: 8080,
-                ..FaultDetectRule::default()
+                ..FaultDetectSubRule::default()
             }],
-            ..FaultDetector::default()
-        };
+            ..FaultDetectRule::default()
+        }];
 
         listener
             .on_event(
@@ -1203,45 +1214,48 @@ mod tests {
 
     #[test]
     fn fault_detect_planner_copies_tcp_and_udp_payload_configs() {
-        let detector = FaultDetector {
-            rules: vec![
-                FaultDetectRule {
-                    id: "fd-tcp".to_string(),
-                    target_service: Some(fault_detect_rule::DestinationService {
-                        namespace: "default".to_string(),
-                        service: "orders".to_string(),
-                        ..fault_detect_rule::DestinationService::default()
-                    }),
+        let rules = vec![
+            FaultDetectRule {
+                id: "fd-tcp".to_string(),
+                target_service: Some(fault_detect_rule::DestinationService {
+                    namespace: "default".to_string(),
+                    service: "orders".to_string(),
+                    ..fault_detect_rule::DestinationService::default()
+                }),
+                rules: vec![FaultDetectSubRule {
                     port: 8081,
                     protocol: fault_detect_rule::Protocol::Tcp.into(),
                     tcp_config: Some(TcpProtocolConfig {
                         send: "ping".to_string(),
                         receive: vec!["pong".to_string()],
                     }),
-                    priority: 1,
-                    ..FaultDetectRule::default()
-                },
-                FaultDetectRule {
-                    id: "fd-udp".to_string(),
-                    target_service: Some(fault_detect_rule::DestinationService {
-                        namespace: "default".to_string(),
-                        service: "orders".to_string(),
-                        ..fault_detect_rule::DestinationService::default()
-                    }),
+                    ..FaultDetectSubRule::default()
+                }],
+                priority: 1,
+                ..FaultDetectRule::default()
+            },
+            FaultDetectRule {
+                id: "fd-udp".to_string(),
+                target_service: Some(fault_detect_rule::DestinationService {
+                    namespace: "default".to_string(),
+                    service: "orders".to_string(),
+                    ..fault_detect_rule::DestinationService::default()
+                }),
+                rules: vec![FaultDetectSubRule {
                     port: 8082,
                     protocol: fault_detect_rule::Protocol::Udp.into(),
                     udp_config: Some(UdpProtocolConfig {
                         send: "ping".to_string(),
                         receive: vec!["pong".to_string()],
                     }),
-                    priority: 2,
-                    ..FaultDetectRule::default()
-                },
-            ],
-            revision: "rev-1".to_string(),
-        };
+                    ..FaultDetectSubRule::default()
+                }],
+                priority: 2,
+                ..FaultDetectRule::default()
+            },
+        ];
 
-        let plans = build_fault_detect_plans(&detector);
+        let plans = build_fault_detect_plans(&rules);
 
         assert_eq!(plans.len(), 2);
         assert_eq!(
