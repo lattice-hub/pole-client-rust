@@ -2,7 +2,7 @@
 title: 知识库索引
 tags: [meta, index]
 links: [schema, log]
-updated: 2026-06-17
+updated: 2026-07-04
 sources: 1
 ---
 
@@ -25,6 +25,22 @@ sources: 1
 ## Quality
 
 - [[e2e-and-public-api-testing]] — e2e 与公开 API 测试体系 | quality, testing, e2e
+
+## Fronted Design
+
+- [[DESIGN]] — 治理规则设计系统 | fronted, design, governance
+- [[auth-policy-detail-design]] — 权限策略详情设计 | fronted, design, governance
+- [[auth-rule-design]] — 鉴权规则编辑设计 | fronted, design, governance
+- [[circuit-rule-design]] — 熔断规则编辑设计 | fronted, design, governance
+- [[fault-detect-rule-design]] — 探测规则编辑设计 | fronted, design, governance
+- [[lane-rule-design]] — 泳道规则编辑设计 | fronted, design, governance
+- [[lossless-rule-design]] — 无损上下线规则编辑设计 | fronted, design, governance
+- [[mirror-rule-design]] — 镜像规则编辑设计 | fronted, design, governance
+- [[mock-rule-design]] — Mock 规则编辑设计 | fronted, design, governance
+- [[ratelimit-rule-design copy]] — 限流规则编辑设计副本 | fronted, design, governance
+- [[ratelimit-rule-design]] — 限流规则编辑设计入口 | fronted, design, governance
+- [[router-rule-design copy]] — 路由规则编辑设计副本 | fronted, design, governance
+- [[router-rule-design]] — 路由规则编辑设计 | fronted, design, governance
 
 ## Tasks
 

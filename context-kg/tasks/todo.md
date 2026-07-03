@@ -2,11 +2,64 @@
 title: 切换 pole specification 依赖
 tags: [task, review]
 links: [lessons]
-updated: 2026-06-29
+updated: 2026-07-04
 sources: 1
 ---
 
 # 切换 pole specification 依赖
+
+## 本轮计划：治理匹配性能测试与 API path 索引设计
+
+- [x] 读取现有 `traffic` 架构知识和任务经验，确认治理能力的模块归属
+- [x] 检查 security、ratelimit、router、circuitbreaker、faultdetect、mirror、mock 的当前匹配入口
+- [x] 收敛 API path 前缀树索引的适用范围、语义边界和测试口径
+- [x] 补 RED 测试：限流 `Api.path` 不匹配不能消耗配额，API path 索引应把大量无关 exact path 规则收敛成少量候选
+- [x] 新增 `traffic::matcher` 内部共享模块，支持 method 桶、exact path 前缀树、复杂 path fallback 和统一 API 语义
+- [x] 将 traffic security、mirror、mock、ratelimit 的 API 判断改为共享 matcher，保留后续 traffic match rule / argument 的原有语义
+- [x] 补齐 policy/ratelimit 行为等价测试和确定性候选收敛测试
+- [x] 运行 fmt、warning-as-error check/test、diff check，并更新 review
+
+### 设计说明
+
+- 第一阶段只优化 `traffic` 域内已经具备 `Api` 入口的能力：traffic security、mirror、mock 和 ratelimit。
+- exact path 使用前缀树做候选定位，但仍按 exact 语义命中；regex、not-in、range 等复杂 `MatchString` 保留 fallback，再走完整匹配，避免改变 spec 语义。
+- router/lane 继续使用 `TrafficMatchRule` 和实例过滤链路；circuitbreaker/faultdetect 优先保持资源维度逻辑不变，后续如要优化 method resource key 单独处理。
+- 性能测试不依赖 wall-clock 阈值，改用候选集数量和 predicate 调用次数验证匹配面收敛；耗时 benchmark 后续可作为非 CI 强约束补充。
+
+## 本轮 review：治理匹配性能测试与 API path 索引设计
+
+- 已完成：新增 `src/traffic/matcher.rs`，提供 `ApiMatchIndex`、`ApiMatchInput` 和统一 API method/path 匹配；exact text path 通过前缀树定位候选，regex 等复杂 path 保留 fallback 完整匹配。
+- 已完成：traffic security、mirror、mock 已改为先按 API 索引收敛候选，再执行原有 `TrafficMatchRule`、采样和结果构造逻辑。
+- 已完成：ratelimit trigger 已改为先按 API 索引收敛候选，再执行参数匹配、failover、本地 QPS/Concurrency 计数逻辑。
+- 已完成：补充 RED 测试 `local_quota_counter_does_not_consume_quota_when_api_path_misses`，验证 `Api.path` 未命中不会错误消耗本地配额；该测试在修复前失败于第二次请求被限流。
+- 已完成：补充 matcher 候选收敛测试，1000 条无关 exact path 规则不会进入 `/orders/target` 的候选结果，同时覆盖 fallback regex、空 API 列表全匹配和多 API 去重。
+- 已完成：更新 `context-kg/technical/traffic-governance-architecture.md` 和 `_meta/log.md`，记录 matcher 的语义边界。
+- 已验证：`PROTOC=/Users/chuntao.liao/Github/pole-io/specification/source/protoc/protoc-darwin-arm64/bin/protoc RUSTFLAGS='-D warnings' cargo check --workspace` 通过，无 warning。
+- 已验证：`PROTOC=/Users/chuntao.liao/Github/pole-io/specification/source/protoc/protoc-darwin-arm64/bin/protoc RUSTFLAGS='-D warnings' cargo test --workspace` 通过，主库 107 个测试、public API 4 个测试、e2e_tests 64 个测试、doc tests 0 个全部通过。
+- 已验证：`cargo fmt --all -- --check` 通过。
+- 已验证：`git diff --check` 通过。
+- 已阻塞：`python3 /Users/chuntao.liao/.codex/skills/context-kg-maintainer/scripts/context_kg_lint.py ./context-kg` 已运行，但因本轮开始前已有的未跟踪 `context-kg/fronted/design/*.md` 缺少 frontmatter 失败；本轮未修改这些未跟踪文档。
+
+## 本轮计划：更新 spec tag 到 v0.1.0-ALPHA.32
+
+- [x] 将根包和 `e2e_tests` 的 `pole-specification` git tag 从 `v0.1.0-ALPHA.31` 更新到 `v0.1.0-ALPHA.32`
+- [x] 运行 `RUSTFLAGS=-D warnings cargo check --workspace`，按最新 spec 的 breaking change 适配源码和测试
+- [x] 运行 `cargo fmt`、旧品牌残留扫描、`RUSTFLAGS=-D warnings cargo check --workspace`、`RUSTFLAGS=-D warnings cargo test --workspace`
+- [x] 运行 `context_kg_lint.py ./context-kg` 和 `git diff --check`，记录既有未跟踪文档导致的 lint 阻塞
+- [x] 更新本轮 review
+
+## 本轮 review：更新 spec tag 到 v0.1.0-ALPHA.32
+
+- 已完成：通过 `git ls-remote --tags --refs https://github.com/lattice-hub/specification.git` 确认最新 tag 为 `v0.1.0-ALPHA.32`。
+- 已完成：根 `Cargo.toml` 和 `e2e_tests/Cargo.toml` 的 `pole-specification` git tag 已更新到 `v0.1.0-ALPHA.32`，Cargo 解析到提交 `70317c4d`。
+- 已完成：适配 spec breaking change：治理规则里的单个 `api` 字段改为 `apis` 列表，SDK 侧按“空列表全匹配、任一 API 命中即可”处理 traffic security、mirror、mock。
+- 已完成：适配限流 `LimitTrigger.method` 移除，改为从 `LimitTrigger.apis` 匹配请求 method；现有空 API 列表保持全匹配语义。
+- 已验证：旧品牌残留扫描无输出。
+- 已验证：`cargo fmt --all -- --check` 通过。
+- 已验证：`PROTOC=/Users/chuntao.liao/Github/pole-io/specification/source/protoc/protoc-darwin-arm64/bin/protoc RUSTFLAGS='-D warnings' cargo check --workspace` 通过，无 warning。
+- 已验证：`PROTOC=/Users/chuntao.liao/Github/pole-io/specification/source/protoc/protoc-darwin-arm64/bin/protoc RUSTFLAGS='-D warnings' cargo test --workspace` 通过，主库 102 个测试、`tests/public_api.rs` 4 个测试、e2e 测试 64 个测试、doc tests 0 个全部通过。
+- 已验证：`git diff --check` 通过。
+- 已阻塞：`python3 /Users/chuntao.liao/.codex/skills/context-kg-maintainer/scripts/context_kg_lint.py ./context-kg` 已运行，但因本轮开始前已有的未跟踪 `context-kg/fronted/design/*.md` 缺少 frontmatter 失败；本轮未修改这些未跟踪文档。
 
 ## 本轮计划：更新 spec tag 到 v0.1.0-ALPHA.31
 

@@ -2,11 +2,23 @@
 title: 知识库变更日志
 tags: [meta, log]
 links: [index]
-updated: 2026-06-17
+updated: 2026-07-04
 sources: 1
 ---
 
 # 知识库变更日志
+
+## [2026-07-04] ingest | 记录流量治理 API 匹配索引
+
+- 新增页面：无
+- 更新页面：`technical/traffic-governance-architecture.md`、`tasks/todo.md`
+- 变更摘要：记录 `traffic::matcher` 内部 API method/path 候选索引、exact path 前缀树语义边界，以及 security、mirror、mock、ratelimit 接入后的匹配职责划分。
+
+## [2026-07-04] ingest | 整理治理前端设计文档元数据
+
+- 新增页面：`fronted/design/*.md`
+- 更新页面：`_meta/index.md`、`_meta/log.md`
+- 变更摘要：为未跟踪治理前端设计交接稿补齐 context-kg frontmatter、相关页面区和索引入口，避免提交后留下已知 lint 失败状态。
 
 ## [2026-06-17] ingest | 从代码反向生成首批项目知识页
 

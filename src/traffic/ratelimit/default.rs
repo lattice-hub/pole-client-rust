@@ -25,6 +25,7 @@ use crate::core::{
 };
 use crate::discovery::req::{GetServiceRuleRequest, ServiceRuleType};
 use crate::plugins::router::rule::helper::match_label_value;
+use crate::traffic::matcher::{ApiMatchIndex, ApiMatchInput};
 use pole_specification::v1::{
     limit_trigger, match_argument, match_string, rate_limit, LimitTrigger, MatchArgument, RateLimit,
 };
@@ -123,6 +124,12 @@ struct QuotaWindow {
     used: u32,
 }
 
+#[derive(Clone, Copy)]
+struct QuotaTriggerEntry<'a> {
+    rule: &'a RateLimit,
+    trigger: &'a LimitTrigger,
+}
+
 impl LocalQuotaCounter {
     fn new() -> Self {
         Self {
@@ -132,82 +139,73 @@ impl LocalQuotaCounter {
     }
 
     fn check_quota(&self, req: &QuotaRequest, rules: &[RateLimit]) -> QuotaResponse {
-        let mut rules = rules.iter().collect::<Vec<_>>();
-        rules.sort_by(|a, b| a.priority.cmp(&b.priority));
-
-        for rule in rules {
-            if !quota_rule_matches(rule) {
+        for entry in matching_quota_triggers(req, rules) {
+            let rule = entry.rule;
+            let trigger = entry.trigger;
+            if rule.r#type() == rate_limit::Type::Global
+                && trigger.failover() == limit_trigger::FailoverType::FailoverPass
+            {
+                return QuotaResponse {
+                    allowed: true,
+                    message: String::new(),
+                };
+            }
+            if !uses_local_counter(rule, trigger) {
                 continue;
             }
-            for trigger in rule.rules.iter() {
-                if !trigger_matches(req, trigger) {
-                    continue;
-                }
-                if rule.r#type() == rate_limit::Type::Global
-                    && trigger.failover() == limit_trigger::FailoverType::FailoverPass
-                {
-                    return QuotaResponse {
-                        allowed: true,
-                        message: String::new(),
-                    };
-                }
-                if !uses_local_counter(rule, trigger) {
-                    continue;
-                }
-                match trigger.resource() {
-                    limit_trigger::Resource::Qps => {
-                        for amount in trigger.amounts.iter() {
-                            if amount.max_amount == 0 {
-                                continue;
-                            }
-                            let duration = amount_duration(amount);
-                            let key = quota_counter_key(req, rule, trigger, duration);
-                            let mut windows = self.windows.lock().unwrap();
-                            let window = windows.entry(key).or_insert_with(|| QuotaWindow {
-                                started_at: Instant::now(),
-                                used: 0,
-                            });
-                            if window.started_at.elapsed() >= duration {
-                                window.started_at = Instant::now();
-                                window.used = 0;
-                            }
-                            if window.used >= amount.max_amount {
-                                return QuotaResponse {
-                                    allowed: false,
-                                    message: "rate limit quota exhausted".to_string(),
-                                };
-                            }
-                            window.used += 1;
-                            return QuotaResponse {
-                                allowed: true,
-                                message: String::new(),
-                            };
-                        }
-                    }
-                    limit_trigger::Resource::Concurrency => {
-                        let Some(amount) = trigger.concurrency_amount.as_ref() else {
-                            continue;
-                        };
+            match trigger.resource() {
+                limit_trigger::Resource::Qps => {
+                    for amount in trigger.amounts.iter() {
                         if amount.max_amount == 0 {
                             continue;
                         }
-                        let key = concurrency_counter_key(req, rule, trigger);
-                        let mut concurrency = self.concurrency.lock().unwrap();
-                        let used = concurrency.entry(key).or_insert(0);
-                        if *used >= amount.max_amount {
+                        let duration = amount_duration(amount);
+                        let key = quota_counter_key(req, rule, trigger, duration);
+                        let mut windows = self.windows.lock().unwrap();
+                        let window = windows.entry(key).or_insert_with(|| QuotaWindow {
+                            started_at: Instant::now(),
+                            used: 0,
+                        });
+                        if window.started_at.elapsed() >= duration {
+                            window.started_at = Instant::now();
+                            window.used = 0;
+                        }
+                        if window.used >= amount.max_amount {
                             return QuotaResponse {
                                 allowed: false,
-                                message: "rate limit concurrency exhausted".to_string(),
+                                message: "rate limit quota exhausted".to_string(),
                             };
                         }
-                        *used += 1;
+                        window.used += 1;
                         return QuotaResponse {
                             allowed: true,
                             message: String::new(),
                         };
                     }
-                    _ => {}
                 }
+                limit_trigger::Resource::Concurrency => {
+                    let Some(amount) = trigger.concurrency_amount.as_ref() else {
+                        continue;
+                    };
+                    if amount.max_amount == 0 {
+                        continue;
+                    }
+                    let key = concurrency_counter_key(req, rule, trigger);
+                    let mut concurrency = self.concurrency.lock().unwrap();
+                    let used = concurrency.entry(key).or_insert(0);
+                    if *used >= amount.max_amount {
+                        return QuotaResponse {
+                            allowed: false,
+                            message: "rate limit concurrency exhausted".to_string(),
+                        };
+                    }
+                    *used += 1;
+                    return QuotaResponse {
+                        allowed: true,
+                        message: String::new(),
+                    };
+                }
+                _ => {}
             }
         }
 
@@ -218,40 +216,33 @@ impl LocalQuotaCounter {
     }
 
     fn return_quota(&self, req: &QuotaRequest, rules: &[RateLimit]) -> bool {
-        let mut rules = rules.iter().collect::<Vec<_>>();
-        rules.sort_by(|a, b| a.priority.cmp(&b.priority));
-
-        for rule in rules {
-            if !quota_rule_matches(rule) {
+        for entry in matching_quota_triggers(req, rules) {
+            let rule = entry.rule;
+            let trigger = entry.trigger;
+            if trigger.resource() != limit_trigger::Resource::Concurrency
+                || !uses_local_counter(rule, trigger)
+            {
                 continue;
             }
-            for trigger in rule.rules.iter() {
-                if !trigger_matches(req, trigger)
-                    || trigger.resource() != limit_trigger::Resource::Concurrency
-                    || !uses_local_counter(rule, trigger)
-                {
-                    continue;
-                }
-                let Some(amount) = trigger.concurrency_amount.as_ref() else {
-                    continue;
-                };
-                if amount.max_amount == 0 {
-                    continue;
-                }
-                let key = concurrency_counter_key(req, rule, trigger);
-                let mut concurrency = self.concurrency.lock().unwrap();
-                let Some(used) = concurrency.get_mut(&key) else {
-                    return false;
-                };
-                if *used == 0 {
-                    return false;
-                }
-                *used -= 1;
-                if *used == 0 {
-                    concurrency.remove(&key);
-                }
-                return true;
+            let Some(amount) = trigger.concurrency_amount.as_ref() else {
+                continue;
+            };
+            if amount.max_amount == 0 {
+                continue;
             }
+            let key = concurrency_counter_key(req, rule, trigger);
+            let mut concurrency = self.concurrency.lock().unwrap();
+            let Some(used) = concurrency.get_mut(&key) else {
+                return false;
+            };
+            if *used == 0 {
+                return false;
+            }
+            *used -= 1;
+            if *used == 0 {
+                concurrency.remove(&key);
+            }
+            return true;
         }
 
         false
@@ -263,25 +254,13 @@ fn check_quota(
     req: &QuotaRequest,
     rules: &[RateLimit],
 ) -> QuotaResponse {
-    let mut rules = rules.iter().collect::<Vec<_>>();
-    rules.sort_by(|a, b| a.priority.cmp(&b.priority));
-
-    for rule in rules {
-        if !quota_rule_matches(rule) {
-            continue;
+    for entry in matching_quota_triggers(req, rules) {
+        if entry.rule.r#type() == rate_limit::Type::Global {
+            return global_quota_failover(local_counter, req, entry.rule, entry.trigger);
         }
-        for trigger in rule.rules.iter() {
-            if !trigger_matches(req, trigger) {
-                continue;
-            }
 
-            if rule.r#type() == rate_limit::Type::Global {
-                return global_quota_failover(local_counter, req, rule, trigger);
-            }
-
-            if uses_local_counter(rule, trigger) {
-                return check_local_trigger(local_counter, req, rule, trigger);
-            }
+        if uses_local_counter(entry.rule, entry.trigger) {
+            return check_local_trigger(local_counter, req, entry.rule, entry.trigger);
         }
     }
 
@@ -292,34 +271,24 @@ fn check_quota(
 }
 
 fn return_quota(local_counter: &LocalQuotaCounter, req: &QuotaRequest, rules: &[RateLimit]) {
-    let mut rules = rules.iter().collect::<Vec<_>>();
-    rules.sort_by(|a, b| a.priority.cmp(&b.priority));
-
-    for rule in rules {
-        if !quota_rule_matches(rule) {
+    for entry in matching_quota_triggers(req, rules) {
+        if entry.trigger.resource() != limit_trigger::Resource::Concurrency {
             continue;
         }
-        for trigger in rule.rules.iter() {
-            if !trigger_matches(req, trigger)
-                || trigger.resource() != limit_trigger::Resource::Concurrency
-            {
-                continue;
-            }
 
-            if rule.r#type() == rate_limit::Type::Global {
-                if trigger.failover() == limit_trigger::FailoverType::FailoverPass {
-                    return;
-                }
-                let local_rule = rule_with_single_trigger(rule, trigger);
-                local_counter.return_quota(req, &[local_rule]);
+        if entry.rule.r#type() == rate_limit::Type::Global {
+            if entry.trigger.failover() == limit_trigger::FailoverType::FailoverPass {
                 return;
             }
+            let local_rule = rule_with_single_trigger(entry.rule, entry.trigger);
+            local_counter.return_quota(req, &[local_rule]);
+            return;
+        }
 
-            if uses_local_counter(rule, trigger) {
-                let local_rule = rule_with_single_trigger(rule, trigger);
-                local_counter.return_quota(req, &[local_rule]);
-                return;
-            }
+        if uses_local_counter(entry.rule, entry.trigger) {
+            let local_rule = rule_with_single_trigger(entry.rule, entry.trigger);
+            local_counter.return_quota(req, &[local_rule]);
+            return;
         }
     }
 }
@@ -390,28 +359,53 @@ fn uses_local_counter(rule: &RateLimit, trigger: &LimitTrigger) -> bool {
             && trigger.failover() == limit_trigger::FailoverType::FailoverLocal)
 }
 
-fn trigger_matches(req: &QuotaRequest, trigger: &LimitTrigger) -> bool {
-    if trigger.disable
-        || !matches!(
+fn matching_quota_triggers<'a>(
+    req: &QuotaRequest,
+    rules: &'a [RateLimit],
+) -> Vec<QuotaTriggerEntry<'a>> {
+    let mut rules = rules.iter().collect::<Vec<_>>();
+    rules.sort_by(|a, b| a.priority.cmp(&b.priority));
+
+    let entries = rules.into_iter().flat_map(|rule| {
+        if !quota_rule_matches(rule) {
+            return Vec::new();
+        }
+        rule.rules
+            .iter()
+            .filter(|trigger| trigger_base_matches(trigger))
+            .map(|trigger| (QuotaTriggerEntry { rule, trigger }, trigger.apis.as_slice()))
+            .collect::<Vec<_>>()
+    });
+    let input = quota_api_match_input(req);
+    let index = ApiMatchIndex::new(entries);
+
+    index
+        .candidates(&input)
+        .into_iter()
+        .filter(|entry| trigger_arguments_match(req, entry.trigger))
+        .collect()
+}
+
+fn trigger_base_matches(trigger: &LimitTrigger) -> bool {
+    !trigger.disable
+        && matches!(
             trigger.resource(),
             limit_trigger::Resource::Qps | limit_trigger::Resource::Concurrency
         )
-    {
-        return false;
-    }
-    if !trigger
-        .method
-        .as_ref()
-        .map(|method| method.value == req.method)
-        .unwrap_or(true)
-    {
-        return false;
-    }
+}
 
+fn trigger_arguments_match(req: &QuotaRequest, trigger: &LimitTrigger) -> bool {
     trigger
         .arguments
         .iter()
         .all(|argument| match_argument_matches(req, argument))
+}
+
+fn quota_api_match_input(req: &QuotaRequest) -> ApiMatchInput {
+    ApiMatchInput::new(
+        Some(req.method.clone()),
+        (req.traffic_label_provider)(ArgumentType::Path, ""),
+    )
 }
 
 fn match_argument_matches(req: &QuotaRequest, argument: &MatchArgument) -> bool {
@@ -499,6 +493,13 @@ mod tests {
         None
     }
 
+    fn order_99_traffic_label(arg_type: ArgumentType, _: &str) -> Option<String> {
+        match arg_type {
+            ArgumentType::Path => Some("/orders/99".to_string()),
+            _ => None,
+        }
+    }
+
     fn quota_request() -> QuotaRequest {
         QuotaRequest {
             flow_id: "flow-1".to_string(),
@@ -511,6 +512,14 @@ mod tests {
         }
     }
 
+    fn get_order_99_request() -> QuotaRequest {
+        QuotaRequest {
+            method: "GET".to_string(),
+            traffic_label_provider: order_99_traffic_label,
+            ..quota_request()
+        }
+    }
+
     fn local_qps_rule(max_amount: u32) -> RateLimit {
         RateLimit {
             id: "rule-1".to_string(),
@@ -518,10 +527,41 @@ mod tests {
             r#type: rate_limit::Type::Local.into(),
             rules: vec![LimitTrigger {
                 name: "trigger-1".to_string(),
-                method: Some(MatchString {
-                    value: "GET /orders".to_string(),
-                    ..MatchString::default()
-                }),
+                apis: vec![pole_specification::v1::Api {
+                    method: "GET /orders".to_string(),
+                    ..pole_specification::v1::Api::default()
+                }],
+                resource: limit_trigger::Resource::Qps.into(),
+                amounts: vec![Amount {
+                    max_amount,
+                    valid_duration: Some(ProstDuration {
+                        seconds: 60,
+                        nanos: 0,
+                    }),
+                    ..Amount::default()
+                }],
+                ..LimitTrigger::default()
+            }],
+            ..RateLimit::default()
+        }
+    }
+
+    fn local_qps_rule_for_path(path: &str, max_amount: u32) -> RateLimit {
+        RateLimit {
+            id: "rule-path".to_string(),
+            priority: 0,
+            r#type: rate_limit::Type::Local.into(),
+            rules: vec![LimitTrigger {
+                name: "trigger-path".to_string(),
+                apis: vec![pole_specification::v1::Api {
+                    method: "GET".to_string(),
+                    path: Some(MatchString {
+                        r#type: match_string::MatchStringType::Exact.into(),
+                        value: path.to_string(),
+                        value_type: match_string::ValueType::Text.into(),
+                    }),
+                    ..pole_specification::v1::Api::default()
+                }],
                 resource: limit_trigger::Resource::Qps.into(),
                 amounts: vec![Amount {
                     max_amount,
@@ -605,6 +645,19 @@ mod tests {
         assert!(not_matched.allowed);
         assert!(first_matched.allowed);
         assert!(!second_matched.allowed);
+    }
+
+    #[test]
+    fn local_quota_counter_does_not_consume_quota_when_api_path_misses() {
+        let counter = LocalQuotaCounter::new();
+        let req = get_order_99_request();
+        let rules = vec![local_qps_rule_for_path("/orders/42", 1)];
+
+        let first = counter.check_quota(&req, &rules);
+        let second = counter.check_quota(&req, &rules);
+
+        assert!(first.allowed);
+        assert!(second.allowed);
     }
 
     #[test]

@@ -11,6 +11,7 @@ use crate::core::{
     },
 };
 use crate::plugins::router::rule::helper::{match_label_value, traffic_match_rule_match};
+use crate::traffic::matcher::{ApiMatchIndex, ApiMatchInput};
 pub use crate::traffic::{
     policy::api::MirrorSender,
     policy::req::{
@@ -20,7 +21,7 @@ pub use crate::traffic::{
 use bytes::Bytes;
 use http::{header::HeaderName, HeaderValue, Request as HttpRequest};
 use pole_specification::v1::{
-    Api, MirrorDestination, MockResponse, SourceService, TrafficMirror, TrafficMock,
+    MirrorDestination, MockResponse, SourceService, TrafficMirror, TrafficMock,
     TrafficSecurityAction, TrafficSecurityRejectEffect, TrafficSecurityRule,
 };
 use std::{
@@ -649,16 +650,19 @@ fn evaluate_security(
         .collect::<Vec<_>>();
     rules.sort_by(|a, b| a.priority.cmp(&b.priority));
 
-    for rule in rules {
-        for policy in rule.policies.iter() {
-            if !api_matches(ctx, policy.api.as_ref()) {
-                continue;
-            }
-            if !traffic_rule_matches(ctx, policy.traffic_match_rule.as_ref()) {
-                continue;
-            }
-            return security_decision(policy.action(), policy.reject_effect.clone());
+    let entries = rules.iter().flat_map(|rule| {
+        rule.policies
+            .iter()
+            .map(|policy| (policy, policy.apis.as_slice()))
+    });
+    let input = api_match_input(ctx);
+    let index = ApiMatchIndex::new(entries);
+
+    for policy in index.candidates(&input) {
+        if !traffic_rule_matches(ctx, policy.traffic_match_rule.as_ref()) {
+            continue;
         }
+        return security_decision(policy.action(), policy.reject_effect.clone());
     }
 
     TrafficSecurityDecision::default()
@@ -671,34 +675,36 @@ fn evaluate_mirrors(ctx: &RouteContext, mirror_rules: &[TrafficMirror]) -> Vec<M
         .collect::<Vec<_>>();
     rules.sort_by(|a, b| a.priority.cmp(&b.priority));
 
-    let mut destinations = Vec::new();
-    for rule in rules {
+    let entries = rules.iter().flat_map(|rule| {
         if !source_service_matches(rule.caller.as_ref(), ctx) {
+            return Vec::new();
+        }
+        rule.rules
+            .iter()
+            .filter(|mirror_rule| !mirror_rule.disable && mirror_rule.mirror_percent != 0)
+            .map(|mirror_rule| (mirror_rule, mirror_rule.apis.as_slice()))
+            .collect::<Vec<_>>()
+    });
+    let input = api_match_input(ctx);
+    let index = ApiMatchIndex::new(entries);
+    let mut destinations = Vec::new();
+
+    for mirror_rule in index.candidates(&input) {
+        if !traffic_rule_matches(ctx, mirror_rule.traffic_match_rule.as_ref()) {
             continue;
         }
-        for mirror_rule in rule.rules.iter() {
-            if mirror_rule.disable || mirror_rule.mirror_percent == 0 {
+        if let Some(destination) = &mirror_rule.destination {
+            let sample_salt = format!(
+                "mirror#{}#{}#{}#{}",
+                ctx.route_info.caller.namespace,
+                ctx.route_info.caller.name,
+                destination.namespace,
+                destination.service
+            );
+            if !traffic_sample_hit(ctx, mirror_rule.mirror_percent, &sample_salt) {
                 continue;
             }
-            if !api_matches(ctx, mirror_rule.api.as_ref()) {
-                continue;
-            }
-            if !traffic_rule_matches(ctx, mirror_rule.traffic_match_rule.as_ref()) {
-                continue;
-            }
-            if let Some(destination) = &mirror_rule.destination {
-                let sample_salt = format!(
-                    "mirror#{}#{}#{}#{}",
-                    ctx.route_info.caller.namespace,
-                    ctx.route_info.caller.name,
-                    destination.namespace,
-                    destination.service
-                );
-                if !traffic_sample_hit(ctx, mirror_rule.mirror_percent, &sample_salt) {
-                    continue;
-                }
-                destinations.push(destination.clone());
-            }
+            destinations.push(destination.clone());
         }
     }
 
@@ -712,33 +718,35 @@ fn evaluate_mock(ctx: &RouteContext, mock_rules: &[TrafficMock]) -> Option<MockR
         .collect::<Vec<_>>();
     rules.sort_by(|a, b| a.priority.cmp(&b.priority));
 
-    for rule in rules {
+    let entries = rules.iter().flat_map(|rule| {
         if !source_service_matches(rule.caller.as_ref(), ctx) {
+            return Vec::new();
+        }
+        rule.rules
+            .iter()
+            .filter(|mock_rule| !mock_rule.disable && mock_rule.mock_percent != 0)
+            .map(|mock_rule| (mock_rule, mock_rule.apis.as_slice()))
+            .collect::<Vec<_>>()
+    });
+    let input = api_match_input(ctx);
+    let index = ApiMatchIndex::new(entries);
+
+    for mock_rule in index.candidates(&input) {
+        if !traffic_rule_matches(ctx, mock_rule.traffic_match_rule.as_ref()) {
             continue;
         }
-        for mock_rule in rule.rules.iter() {
-            if mock_rule.disable || mock_rule.mock_percent == 0 {
+        if let Some(response) = &mock_rule.response {
+            let sample_salt = format!(
+                "mock#{}#{}#{}#{}",
+                ctx.route_info.caller.namespace,
+                ctx.route_info.caller.name,
+                response.code,
+                response.body
+            );
+            if !traffic_sample_hit(ctx, mock_rule.mock_percent, &sample_salt) {
                 continue;
             }
-            if !api_matches(ctx, mock_rule.api.as_ref()) {
-                continue;
-            }
-            if !traffic_rule_matches(ctx, mock_rule.traffic_match_rule.as_ref()) {
-                continue;
-            }
-            if let Some(response) = &mock_rule.response {
-                let sample_salt = format!(
-                    "mock#{}#{}#{}#{}",
-                    ctx.route_info.caller.namespace,
-                    ctx.route_info.caller.name,
-                    response.code,
-                    response.body
-                );
-                if !traffic_sample_hit(ctx, mock_rule.mock_percent, &sample_salt) {
-                    continue;
-                }
-                return Some(response.clone());
-            }
+            return Some(response.clone());
         }
     }
 
@@ -790,27 +798,11 @@ fn traffic_rule_matches(
         .unwrap_or(true)
 }
 
-fn api_matches(ctx: &RouteContext, api: Option<&Api>) -> bool {
-    let Some(api) = api else {
-        return true;
-    };
-    if !api.method.is_empty() && api.method != "*" {
-        let actual_method = (ctx.route_info.traffic_label_provider)(ArgumentType::Method, "");
-        if actual_method.as_deref() != Some(api.method.as_str()) {
-            return false;
-        }
-    }
-    if let Some(path_rule) = &api.path {
-        let actual_path = (ctx.route_info.traffic_label_provider)(ArgumentType::Path, "");
-        let Some(actual_path) = actual_path else {
-            return false;
-        };
-        if !match_label_value(path_rule, actual_path) {
-            return false;
-        }
-    }
-
-    true
+fn api_match_input(ctx: &RouteContext) -> ApiMatchInput {
+    ApiMatchInput::new(
+        (ctx.route_info.traffic_label_provider)(ArgumentType::Method, ""),
+        (ctx.route_info.traffic_label_provider)(ArgumentType::Path, ""),
+    )
 }
 
 fn source_service_matches(source: Option<&SourceService>, ctx: &RouteContext) -> bool {
@@ -889,7 +881,7 @@ mod tests {
                     id: "security-1".to_string(),
                     enable: true,
                     policies: vec![TrafficSecurityPolicy {
-                        api: Some(api()),
+                        apis: vec![api()],
                         traffic_match_rule: Some(header_match("x-user", "alice")),
                         action: TrafficSecurityAction::TrafficSecurityDeny.into(),
                         reject_effect: Some(TrafficSecurityRejectEffect {
@@ -908,7 +900,7 @@ mod tests {
                     }),
                     rules: vec![MirrorRule {
                         traffic_match_rule: Some(header_match("x-debug", "true")),
-                        api: Some(api()),
+                        apis: vec![api()],
                         destination: Some(MirrorDestination {
                             namespace: "shadow".to_string(),
                             service: "orders-shadow".to_string(),
@@ -927,7 +919,7 @@ mod tests {
                         service: "frontend".to_string(),
                     }),
                     rules: vec![MockRule {
-                        api: Some(api()),
+                        apis: vec![api()],
                         traffic_match_rule: Some(header_match("x-user", "alice")),
                         response: Some(MockResponse {
                             code: "OK".to_string(),
@@ -1063,7 +1055,7 @@ mod tests {
                     id: "security-1".to_string(),
                     enable: true,
                     policies: vec![TrafficSecurityPolicy {
-                        api: Some(api()),
+                        apis: vec![api()],
                         traffic_match_rule: Some(header_match("x-user", "alice")),
                         action: TrafficSecurityAction::TrafficSecurityDeny.into(),
                         reject_effect: Some(TrafficSecurityRejectEffect {
@@ -1095,7 +1087,7 @@ mod tests {
                     }),
                     rules: vec![MirrorRule {
                         traffic_match_rule: Some(header_match("x-debug", "true")),
-                        api: Some(api()),
+                        apis: vec![api()],
                         destination: Some(MirrorDestination {
                             namespace: "shadow".to_string(),
                             service: "orders-shadow".to_string(),
@@ -1127,7 +1119,7 @@ mod tests {
                         service: "frontend".to_string(),
                     }),
                     rules: vec![MockRule {
-                        api: Some(api()),
+                        apis: vec![api()],
                         traffic_match_rule: Some(header_match("x-user", "alice")),
                         response: Some(MockResponse {
                             code: "OK".to_string(),
