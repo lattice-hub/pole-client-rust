@@ -888,6 +888,7 @@ mod tests {
                             code: "DENIED".to_string(),
                             message: "blocked".to_string(),
                         }),
+                        ..TrafficSecurityPolicy::default()
                     }],
                     ..TrafficSecurityRule::default()
                 })],
@@ -1062,6 +1063,7 @@ mod tests {
                             code: "DENIED".to_string(),
                             message: "blocked".to_string(),
                         }),
+                        ..TrafficSecurityPolicy::default()
                     }],
                     ..TrafficSecurityRule::default()
                 }],

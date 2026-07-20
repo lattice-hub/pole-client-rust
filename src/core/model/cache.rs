@@ -235,56 +235,67 @@ impl ResourceEventKey {
                 r#type: DiscoverRequestType::Instance.into(),
                 service: Some(self.to_spec_service(revision)),
                 filter: Some(DiscoverFilter::default()),
+                ..DiscoverRequest::default()
             }),
             crate::core::model::cache::EventType::RouterRule => Some(DiscoverRequest {
                 r#type: DiscoverRequestType::CustomRouteRule.into(),
                 service: Some(self.to_spec_service(revision)),
                 filter: Some(DiscoverFilter::default()),
+                ..DiscoverRequest::default()
             }),
             crate::core::model::cache::EventType::CircuitBreakerRule => Some(DiscoverRequest {
                 r#type: DiscoverRequestType::CircuitBreaker.into(),
                 service: Some(self.to_spec_service(revision)),
                 filter: Some(DiscoverFilter::default()),
+                ..DiscoverRequest::default()
             }),
             crate::core::model::cache::EventType::RateLimitRule => Some(DiscoverRequest {
                 r#type: DiscoverRequestType::RateLimit.into(),
                 service: Some(self.to_spec_service(revision)),
                 filter: Some(DiscoverFilter::default()),
+                ..DiscoverRequest::default()
             }),
             crate::core::model::cache::EventType::Service => Some(DiscoverRequest {
                 r#type: DiscoverRequestType::Services.into(),
                 service: Some(self.to_spec_service(revision)),
                 filter: Some(DiscoverFilter::default()),
+                ..DiscoverRequest::default()
             }),
             crate::core::model::cache::EventType::FaultDetectRule => Some(DiscoverRequest {
                 r#type: DiscoverRequestType::FaultDetector.into(),
                 service: Some(self.to_spec_service(revision)),
                 filter: Some(DiscoverFilter::default()),
+                ..DiscoverRequest::default()
             }),
             crate::core::model::cache::EventType::LaneRule => Some(DiscoverRequest {
                 r#type: DiscoverRequestType::Lane.into(),
                 service: Some(self.to_spec_service(revision)),
                 filter: Some(DiscoverFilter::default()),
+                ..DiscoverRequest::default()
             }),
             crate::core::model::cache::EventType::LosslessRule => Some(DiscoverRequest {
                 r#type: DiscoverRequestType::Lossless.into(),
                 service: Some(self.to_spec_service(revision)),
                 filter: Some(DiscoverFilter::default()),
+                ..DiscoverRequest::default()
             }),
             crate::core::model::cache::EventType::TrafficSecurityRule => Some(DiscoverRequest {
                 r#type: DiscoverRequestType::TrafficSecurityRule.into(),
                 service: Some(self.to_spec_service(revision)),
                 filter: Some(DiscoverFilter::default()),
+                ..DiscoverRequest::default()
             }),
             crate::core::model::cache::EventType::TrafficMirrorRule => Some(DiscoverRequest {
                 r#type: DiscoverRequestType::TrafficMirrorRule.into(),
                 service: Some(self.to_spec_service(revision)),
                 filter: Some(DiscoverFilter::default()),
+                ..DiscoverRequest::default()
             }),
             crate::core::model::cache::EventType::TrafficMockRule => Some(DiscoverRequest {
                 r#type: DiscoverRequestType::TrafficMockRule.into(),
                 service: Some(self.to_spec_service(revision)),
                 filter: Some(DiscoverFilter::default()),
+                ..DiscoverRequest::default()
             }),
             _ => None,
         }

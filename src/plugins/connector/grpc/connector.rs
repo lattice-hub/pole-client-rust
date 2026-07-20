@@ -111,6 +111,7 @@ fn service_contract_discover_request(req: &ServiceContractRequest) -> DiscoverRe
             ..Service::default()
         }),
         filter: None,
+        ..DiscoverRequest::default()
     }
 }
 

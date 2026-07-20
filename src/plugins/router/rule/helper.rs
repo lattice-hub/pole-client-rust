@@ -13,8 +13,6 @@
 // CONDITIONS OF ANY KIND, either express or implied. See the License for the
 // specific language governing permissions and limitations under the License.
 
-use std::env::VarError;
-
 use pole_specification::v1::{
     match_string::ValueType, source_match, traffic_match_rule, CustomRouteRule, MatchString,
     SourceMatch, TrafficMatchRule,
@@ -75,10 +73,10 @@ fn resolve_actual_value(
     rule_value: &MatchString,
 ) -> Option<String> {
     let traffic_provider = ctx.route_info.traffic_label_provider;
-    let ext_provider = ctx.route_info.external_parameter_supplier;
+    let value_type = ValueType::try_from(rule_value.value_type).ok()?;
 
     let mut match_key = source_match.key.as_str();
-    match rule_value.value_type() {
+    match value_type {
         ValueType::Text => {
             let mut traffic_type = argument_type_from_source(source_match.r#type());
             if source_match.key.contains('.') {
@@ -96,15 +94,6 @@ fn resolve_actual_value(
             argument_type_from_source(source_match.r#type()),
             rule_value.value.as_str(),
         ),
-        ValueType::Variable => match std::env::var(rule_value.value.as_str()) {
-            Ok(v) => Some(v),
-            Err(err) => {
-                if err != VarError::NotPresent {
-                    return None;
-                }
-                ext_provider(rule_value.value.as_str())
-            }
-        },
     }
 }
 
@@ -313,5 +302,24 @@ mod tests {
         };
 
         assert!(!match_label_value(&value, "42".to_string()));
+    }
+
+    #[test]
+    fn unknown_value_type_fails_closed() {
+        let rule = TrafficMatchRule {
+            arguments: vec![SourceMatch {
+                r#type: source_match::Type::Header.into(),
+                key: "x-env".to_string(),
+                value: Some(MatchString {
+                    r#type: MatchStringType::Exact.into(),
+                    value: "prod".to_string(),
+                    value_type: 2,
+                }),
+            }],
+            random_percent: 100,
+            match_mode: traffic_match_rule::TrafficMatchMode::And.into(),
+        };
+
+        assert!(!traffic_match_rule_match(&route_ctx(), &rule));
     }
 }

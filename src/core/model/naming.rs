@@ -237,6 +237,7 @@ impl InstanceRequest {
             health_check = Some(pole_specification::v1::HealthCheck {
                 r#type: i32::from(pole_specification::v1::health_check::HealthCheckType::Heartbeat),
                 heartbeat: Some(HeartbeatHealthCheck { ttl }),
+                ..pole_specification::v1::HealthCheck::default()
             });
         }
 
@@ -265,6 +266,7 @@ impl InstanceRequest {
             spec_ins.health_check = Some(pole_specification::v1::HealthCheck {
                 r#type: i32::from(pole_specification::v1::health_check::HealthCheckType::Heartbeat),
                 heartbeat: Some(HeartbeatHealthCheck { ttl: self.ttl }),
+                ..pole_specification::v1::HealthCheck::default()
             });
         }
         spec_ins

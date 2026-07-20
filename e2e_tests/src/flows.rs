@@ -213,7 +213,6 @@ pub fn ratelimit_flow_inputs(resource: &FlowResource) -> RateLimitFlowInputs {
             namespace,
             method: "GET /e2e".to_string(),
             traffic_label_provider: ratelimit_traffic_label_provider,
-            external_parameter_supplier: empty_external_parameter_supplier,
         },
     }
 }
@@ -569,10 +568,6 @@ fn mirror_traffic_label_provider(arg_type: ArgumentType, key: &str) -> Option<St
     if arg_type == ArgumentType::Header && key.eq_ignore_ascii_case(MIRROR_TRAFFIC_HEADER) {
         return Some(MIRROR_TRAFFIC_HEADER_VALUE.to_string());
     }
-    None
-}
-
-fn empty_external_parameter_supplier(_: &str) -> Option<String> {
     None
 }
 

@@ -412,16 +412,16 @@ fn match_argument_matches(req: &QuotaRequest, argument: &MatchArgument) -> bool 
     let Some(rule_value) = &argument.value else {
         return false;
     };
+    let Ok(value_type) = match_string::ValueType::try_from(rule_value.value_type) else {
+        return false;
+    };
     let arg_type = ratelimit_argument_type(argument.r#type());
-    let actual = match rule_value.value_type() {
+    let actual = match value_type {
         match_string::ValueType::Text => {
             (req.traffic_label_provider)(arg_type, argument.key.as_str())
         }
         match_string::ValueType::Parameter => {
             (req.traffic_label_provider)(arg_type, rule_value.value.as_str())
-        }
-        match_string::ValueType::Variable => {
-            (req.external_parameter_supplier)(rule_value.value.as_str())
         }
     };
     let Some(actual) = actual else {
@@ -489,10 +489,6 @@ mod tests {
         None
     }
 
-    fn no_external_parameter(_: &str) -> Option<String> {
-        None
-    }
-
     fn order_99_traffic_label(arg_type: ArgumentType, _: &str) -> Option<String> {
         match arg_type {
             ArgumentType::Path => Some("/orders/99".to_string()),
@@ -508,7 +504,6 @@ mod tests {
             namespace: "default".to_string(),
             method: "GET /orders".to_string(),
             traffic_label_provider: no_traffic_label,
-            external_parameter_supplier: no_external_parameter,
         }
     }
 
@@ -645,6 +640,23 @@ mod tests {
         assert!(not_matched.allowed);
         assert!(first_matched.allowed);
         assert!(!second_matched.allowed);
+    }
+
+    #[test]
+    fn unknown_argument_value_type_fails_closed() {
+        let mut req = quota_request();
+        req.traffic_label_provider = header_traffic_label;
+        let argument = MatchArgument {
+            r#type: match_argument::Type::Header.into(),
+            key: "x-user".to_string(),
+            value: Some(MatchString {
+                r#type: match_string::MatchStringType::Exact.into(),
+                value: "alice".to_string(),
+                value_type: 2,
+            }),
+        };
+
+        assert!(!match_argument_matches(&req, &argument));
     }
 
     #[test]
