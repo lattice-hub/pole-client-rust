@@ -19,11 +19,13 @@ use std::{
     time::{Duration, Instant},
 };
 
+use sha2::{Digest, Sha256};
+
 use crate::core::{
     context::SDKContext,
     model::{error::PoleError, ArgumentType},
 };
-use crate::discovery::req::{GetServiceRuleRequest, ServiceRuleType};
+use crate::discovery::req::{GetAllInstanceRequest, GetServiceRuleRequest, ServiceRuleType};
 use crate::plugins::router::rule::helper::match_label_value;
 use crate::traffic::matcher::{ApiMatchIndex, ApiMatchInput};
 use pole_specification::v1::{
@@ -32,6 +34,7 @@ use pole_specification::v1::{
 
 use super::{
     api::RateLimitAPI,
+    distributed::DistributedQuotaManager,
     req::{QuotaRequest, QuotaResponse},
 };
 
@@ -39,6 +42,9 @@ pub struct DefaultRateLimitAPI {
     manage_sdk: bool,
     context: Arc<SDKContext>,
     local_counter: LocalQuotaCounter,
+    distributed_quota: DistributedQuotaManager,
+    #[cfg(test)]
+    test_inputs: Option<(Vec<RateLimit>, Vec<crate::core::model::naming::Instance>)>,
 }
 
 impl DefaultRateLimitAPI {
@@ -48,18 +54,43 @@ impl DefaultRateLimitAPI {
             manage_sdk: true,
             context: ctx,
             local_counter: LocalQuotaCounter::new(),
+            distributed_quota: DistributedQuotaManager::default(),
+            #[cfg(test)]
+            test_inputs: None,
         }
     }
 
     pub fn new(context: Arc<SDKContext>) -> Self {
         Self {
             manage_sdk: false,
-            context: context,
+            context,
             local_counter: LocalQuotaCounter::new(),
+            distributed_quota: DistributedQuotaManager::default(),
+            #[cfg(test)]
+            test_inputs: None,
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn new_with_test_inputs(
+        context: Arc<SDKContext>,
+        rules: Vec<RateLimit>,
+        instances: Vec<crate::core::model::naming::Instance>,
+    ) -> Self {
+        Self {
+            manage_sdk: false,
+            context,
+            local_counter: LocalQuotaCounter::new(),
+            distributed_quota: DistributedQuotaManager::default(),
+            test_inputs: Some((rules, instances)),
         }
     }
 
     async fn load_rate_limit_rules(&self, req: &QuotaRequest) -> Result<Vec<RateLimit>, PoleError> {
+        #[cfg(test)]
+        if let Some((rules, _)) = &self.test_inputs {
+            return Ok(rules.clone());
+        }
         let service_rule = self
             .context
             .get_engine()
@@ -71,6 +102,87 @@ impl DefaultRateLimitAPI {
             })
             .await?;
         rate_limits_from_service_rules(service_rule.rules)
+    }
+
+    async fn check_quota(&self, req: &QuotaRequest, rules: &[RateLimit]) -> QuotaResponse {
+        for entry in matching_quota_triggers(req, rules) {
+            if uses_distributed_quota(entry.rule, entry.trigger) {
+                match self
+                    .check_distributed_quota(req, entry.rule, entry.trigger)
+                    .await
+                {
+                    Ok(response) => return response,
+                    Err(_) => {
+                        return global_quota_failover(
+                            &self.local_counter,
+                            req,
+                            entry.rule,
+                            entry.trigger,
+                        );
+                    }
+                }
+            }
+
+            if uses_local_counter(entry.rule, entry.trigger) {
+                return check_local_trigger(&self.local_counter, req, entry.rule, entry.trigger);
+            }
+        }
+
+        QuotaResponse {
+            allowed: true,
+            message: String::new(),
+        }
+    }
+
+    async fn check_distributed_quota(
+        &self,
+        req: &QuotaRequest,
+        rule: &RateLimit,
+        trigger: &LimitTrigger,
+    ) -> Result<QuotaResponse, PoleError> {
+        let cluster = rule.cluster.as_ref().ok_or_else(|| {
+            PoleError::new(
+                crate::core::model::error::ErrorCode::InvalidRule,
+                format!(
+                    "global rate limit rule {} does not declare cluster",
+                    rule.id
+                ),
+            )
+        })?;
+        #[cfg(test)]
+        let test_instances = self
+            .test_inputs
+            .as_ref()
+            .map(|(_, instances)| instances.clone());
+        #[cfg(not(test))]
+        let test_instances: Option<Vec<crate::core::model::naming::Instance>> = None;
+        let instances = if let Some(instances) = test_instances {
+            instances
+        } else {
+            self.context
+                .get_engine()
+                .get_service_instances(
+                    GetAllInstanceRequest {
+                        flow_id: req.flow_id.clone(),
+                        timeout: req.timeout,
+                        namespace: cluster.namespace.clone(),
+                        service: cluster.service.clone(),
+                    },
+                    true,
+                )
+                .await?
+                .instances
+                .instances
+        };
+        let client_context = self
+            .context
+            .get_engine()
+            .get_extensions()
+            .client_ctx
+            .clone();
+        self.distributed_quota
+            .check(req, rule, trigger, &instances, &client_context.client_id)
+            .await
     }
 }
 
@@ -98,16 +210,14 @@ impl RateLimitAPI for DefaultRateLimitAPI {
     async fn get_quota(&self, req: QuotaRequest) -> Result<QuotaResponse, PoleError> {
         let check_ret = req.check_valid();
         check_ret?;
-
         let rules = self.load_rate_limit_rules(&req).await?;
 
-        Ok(check_quota(&self.local_counter, &req, &rules))
+        Ok(self.check_quota(&req, &rules).await)
     }
 
     async fn return_quota(&self, req: QuotaRequest) -> Result<(), PoleError> {
         let check_ret = req.check_valid();
         check_ret?;
-
         let rules = self.load_rate_limit_rules(&req).await?;
         return_quota(&self.local_counter, &req, &rules);
         Ok(())
@@ -142,7 +252,7 @@ impl LocalQuotaCounter {
         for entry in matching_quota_triggers(req, rules) {
             let rule = entry.rule;
             let trigger = entry.trigger;
-            if rule.r#type() == rate_limit::Type::Global
+            if uses_distributed_quota(rule, trigger)
                 && trigger.failover() == limit_trigger::FailoverType::FailoverPass
             {
                 return QuotaResponse {
@@ -155,13 +265,21 @@ impl LocalQuotaCounter {
             }
             match trigger.resource() {
                 limit_trigger::Resource::Qps => {
-                    for amount in trigger.amounts.iter() {
-                        if amount.max_amount == 0 {
-                            continue;
-                        }
+                    let amounts = trigger
+                        .amounts
+                        .iter()
+                        .filter(|amount| amount.max_amount > 0)
+                        .collect::<Vec<_>>();
+                    if amounts.is_empty() {
+                        continue;
+                    }
+
+                    // 同一个 trigger 的多个窗口是叠加约束。先完成全部窗口的可用性
+                    // 判断，再统一扣减，避免后续窗口拒绝时前面的窗口已被部分消费。
+                    let mut windows = self.windows.lock().unwrap();
+                    for amount in &amounts {
                         let duration = amount_duration(amount);
                         let key = quota_counter_key(req, rule, trigger, duration);
-                        let mut windows = self.windows.lock().unwrap();
                         let window = windows.entry(key).or_insert_with(|| QuotaWindow {
                             started_at: Instant::now(),
                             used: 0,
@@ -176,12 +294,20 @@ impl LocalQuotaCounter {
                                 message: "rate limit quota exhausted".to_string(),
                             };
                         }
-                        window.used += 1;
-                        return QuotaResponse {
-                            allowed: true,
-                            message: String::new(),
-                        };
                     }
+
+                    for amount in amounts {
+                        let duration = amount_duration(amount);
+                        let key = quota_counter_key(req, rule, trigger, duration);
+                        let window = windows
+                            .get_mut(&key)
+                            .expect("quota window must exist after availability check");
+                        window.used += 1;
+                    }
+                    return QuotaResponse {
+                        allowed: true,
+                        message: String::new(),
+                    };
                 }
                 limit_trigger::Resource::Concurrency => {
                     let Some(amount) = trigger.concurrency_amount.as_ref() else {
@@ -249,13 +375,14 @@ impl LocalQuotaCounter {
     }
 }
 
+#[cfg(test)]
 fn check_quota(
     local_counter: &LocalQuotaCounter,
     req: &QuotaRequest,
     rules: &[RateLimit],
 ) -> QuotaResponse {
     for entry in matching_quota_triggers(req, rules) {
-        if entry.rule.r#type() == rate_limit::Type::Global {
+        if uses_distributed_quota(entry.rule, entry.trigger) {
             return global_quota_failover(local_counter, req, entry.rule, entry.trigger);
         }
 
@@ -277,9 +404,6 @@ fn return_quota(local_counter: &LocalQuotaCounter, req: &QuotaRequest, rules: &[
         }
 
         if entry.rule.r#type() == rate_limit::Type::Global {
-            if entry.trigger.failover() == limit_trigger::FailoverType::FailoverPass {
-                return;
-            }
             let local_rule = rule_with_single_trigger(entry.rule, entry.trigger);
             local_counter.return_quota(req, &[local_rule]);
             return;
@@ -354,9 +478,16 @@ fn quota_rule_matches(rule: &RateLimit) -> bool {
 }
 
 fn uses_local_counter(rule: &RateLimit, trigger: &LimitTrigger) -> bool {
-    rule.r#type() == rate_limit::Type::Local
+    // 并发数需要在请求完成时由 return_quota 归还，远端限流协议只有按时间窗口
+    // 汇总的 quota report，因此 GLOBAL 并发规则也必须保持本地计数语义。
+    trigger.resource() == limit_trigger::Resource::Concurrency
+        || rule.r#type() == rate_limit::Type::Local
         || (rule.r#type() == rate_limit::Type::Global
             && trigger.failover() == limit_trigger::FailoverType::FailoverLocal)
+}
+
+fn uses_distributed_quota(rule: &RateLimit, trigger: &LimitTrigger) -> bool {
+    rule.r#type() == rate_limit::Type::Global && trigger.resource() == limit_trigger::Resource::Qps
 }
 
 fn matching_quota_triggers<'a>(
@@ -366,6 +497,9 @@ fn matching_quota_triggers<'a>(
     let mut rules = rules.iter().collect::<Vec<_>>();
     rules.sort_by(|a, b| a.priority.cmp(&b.priority));
 
+    // 限流匹配拆成三段：先过滤禁用/资源类型这类廉价条件，再用 API
+    // 索引收敛 method/path 候选，最后执行 header/query/custom 等参数匹配。
+    // 这样既补齐 Api.path 语义，也避免大量无关 trigger 反复跑参数匹配。
     let entries = rules.into_iter().flat_map(|rule| {
         if !quota_rule_matches(rule) {
             return Vec::new();
@@ -402,6 +536,8 @@ fn trigger_arguments_match(req: &QuotaRequest, trigger: &LimitTrigger) -> bool {
 }
 
 fn quota_api_match_input(req: &QuotaRequest) -> ApiMatchInput {
+    // QuotaRequest.method 是限流 API 的稳定入口；path 仍从流量标签提供器取，
+    // 兼容没有 path 维度的调用方。
     ApiMatchInput::new(
         Some(req.method.clone()),
         (req.traffic_label_provider)(ArgumentType::Path, ""),
@@ -416,6 +552,9 @@ fn match_argument_matches(req: &QuotaRequest, argument: &MatchArgument) -> bool 
         return false;
     };
     let arg_type = ratelimit_argument_type(argument.r#type());
+    if value_type == match_string::ValueType::Parameter && rule_value.value.is_empty() {
+        return (req.traffic_label_provider)(arg_type, argument.key.as_str()).is_some();
+    }
     let actual = match value_type {
         match_string::ValueType::Text => {
             (req.traffic_label_provider)(arg_type, argument.key.as_str())
@@ -443,6 +582,50 @@ fn ratelimit_argument_type(arg_type: match_argument::Type) -> ArgumentType {
     }
 }
 
+/// 按 Polaris SDK/limiter 约定生成远端 counter 的 canonical labels：
+/// `method|TYPE:key:value`，参数项按字典序排列。limiter 将 labels 作为跨 SDK
+/// 共享配额桶的 opaque key，因此这里不能混入 Rust 私有的 rule revision 或摘要格式。
+pub(super) fn remote_quota_labels(req: &QuotaRequest, trigger: &LimitTrigger) -> String {
+    let mut arguments = trigger
+        .arguments
+        .iter()
+        .filter_map(|argument| {
+            let value = argument.value.as_ref()?;
+            let argument_type = argument.r#type();
+            let provider_key = if value.value_type() == match_string::ValueType::Parameter
+                && !value.value.is_empty()
+            {
+                value.value.as_str()
+            } else {
+                argument.key.as_str()
+            };
+            let actual = if argument_type == match_argument::Type::Method {
+                req.method.clone()
+            } else {
+                (req.traffic_label_provider)(ratelimit_argument_type(argument_type), provider_key)
+                    .unwrap_or_default()
+            };
+            let type_name = match argument_type {
+                match_argument::Type::Custom => "CUSTOM",
+                match_argument::Type::Method => "METHOD",
+                match_argument::Type::Header => "HEADER",
+                match_argument::Type::Query => "QUERY",
+                match_argument::Type::CallerService => "CALLER_SERVICE",
+                match_argument::Type::CallerIp => "CALLER_IP",
+                match_argument::Type::CallerMetadata => "CALLER_METADATA",
+            };
+            Some(match argument_type {
+                match_argument::Type::Method | match_argument::Type::CallerIp => {
+                    format!("{type_name}:{actual}")
+                }
+                _ => format!("{type_name}:{}:{actual}", argument.key),
+            })
+        })
+        .collect::<Vec<_>>();
+    arguments.sort_unstable();
+    format!("{}|{}", req.method, arguments.join("|"))
+}
+
 fn amount_duration(amount: &pole_specification::v1::Amount) -> Duration {
     amount
         .valid_duration
@@ -457,21 +640,56 @@ fn quota_counter_key(
     duration: Duration,
 ) -> String {
     format!(
-        "{}#{}#{}#{}#{}#{}",
+        "{}#{}#{}#{}#{}#{}{}",
         req.namespace,
         req.service,
         req.method,
         rule.id,
         trigger.name,
-        duration.as_secs()
+        duration.as_secs(),
+        request_parameter_dimension_suffix(req, trigger),
     )
 }
 
 fn concurrency_counter_key(req: &QuotaRequest, rule: &RateLimit, trigger: &LimitTrigger) -> String {
     format!(
-        "{}#{}#{}#{}#{}#concurrency",
-        req.namespace, req.service, req.method, rule.id, trigger.name
+        "{}#{}#{}#{}#{}#concurrency{}",
+        req.namespace,
+        req.service,
+        req.method,
+        rule.id,
+        trigger.name,
+        request_parameter_dimension_suffix(req, trigger),
     )
+}
+
+// PARAMETER + 空 value 采集当前请求参数并加入限流器 key。值只以 SHA-256
+// 摘要进入内存 key，既避免泄露 Header/Query 明文，又让不同请求值拥有独立桶。
+fn request_parameter_dimension_suffix(req: &QuotaRequest, trigger: &LimitTrigger) -> String {
+    let mut dimensions = trigger
+        .arguments
+        .iter()
+        .filter_map(|argument| {
+            let value = argument.value.as_ref()?;
+            if value.value_type() != match_string::ValueType::Parameter || !value.value.is_empty() {
+                return None;
+            }
+            let actual = (req.traffic_label_provider)(
+                ratelimit_argument_type(argument.r#type()),
+                argument.key.as_str(),
+            )?;
+            let digest = Sha256::digest(actual.as_bytes());
+            Some((
+                format!("{:?}.{}", argument.r#type(), argument.key),
+                format!("{digest:x}"),
+            ))
+        })
+        .collect::<Vec<_>>();
+    dimensions.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+    dimensions
+        .into_iter()
+        .map(|(key, value)| format!("#{key}={value}"))
+        .collect()
 }
 
 #[cfg(test)]
@@ -593,6 +811,39 @@ mod tests {
         rule
     }
 
+    fn local_qps_rule_with_dynamic_header(max_amount: u32) -> RateLimit {
+        let mut rule = local_qps_rule(max_amount);
+        rule.rules[0].arguments = vec![MatchArgument {
+            r#type: match_argument::Type::Header.into(),
+            key: "x-user".to_string(),
+            value: Some(MatchString {
+                r#type: match_string::MatchStringType::Exact.into(),
+                value: String::new(),
+                value_type: match_string::ValueType::Parameter.into(),
+            }),
+        }];
+        rule
+    }
+
+    #[test]
+    fn unknown_argument_value_type_fails_closed() {
+        let req = QuotaRequest {
+            traffic_label_provider: header_traffic_label,
+            ..quota_request()
+        };
+        let argument = MatchArgument {
+            r#type: match_argument::Type::Header.into(),
+            key: "x-user".to_string(),
+            value: Some(MatchString {
+                r#type: match_string::MatchStringType::Exact.into(),
+                value: "alice".to_string(),
+                value_type: 2,
+            }),
+        };
+
+        assert!(!match_argument_matches(&req, &argument));
+    }
+
     fn local_concurrency_rule(max_amount: u32) -> RateLimit {
         let mut rule = local_qps_rule(1);
         rule.id = "concurrency-rule".to_string();
@@ -600,6 +851,19 @@ mod tests {
         rule.rules[0].amounts.clear();
         rule.rules[0].concurrency_amount =
             Some(pole_specification::v1::ConcurrencyAmount { max_amount });
+        rule
+    }
+
+    fn local_qps_rule_with_multiple_windows() -> RateLimit {
+        let mut rule = local_qps_rule(2);
+        rule.rules[0].amounts.push(Amount {
+            max_amount: 1,
+            valid_duration: Some(ProstDuration {
+                seconds: 60,
+                nanos: 0,
+            }),
+            ..Amount::default()
+        });
         rule
     }
 
@@ -643,20 +907,27 @@ mod tests {
     }
 
     #[test]
-    fn unknown_argument_value_type_fails_closed() {
-        let mut req = quota_request();
-        req.traffic_label_provider = header_traffic_label;
-        let argument = MatchArgument {
-            r#type: match_argument::Type::Header.into(),
-            key: "x-user".to_string(),
-            value: Some(MatchString {
-                r#type: match_string::MatchStringType::Exact.into(),
-                value: "alice".to_string(),
-                value_type: 2,
-            }),
-        };
+    fn local_quota_counter_partitions_by_captured_request_parameter() {
+        fn alice(arg_type: ArgumentType, key: &str) -> Option<String> {
+            header_traffic_label(arg_type, key)
+        }
+        fn bob(arg_type: ArgumentType, key: &str) -> Option<String> {
+            match (arg_type, key) {
+                (ArgumentType::Header, "x-user") => Some("bob".to_string()),
+                _ => None,
+            }
+        }
 
-        assert!(!match_argument_matches(&req, &argument));
+        let counter = LocalQuotaCounter::new();
+        let rule = local_qps_rule_with_dynamic_header(1);
+        let mut alice_req = quota_request();
+        alice_req.traffic_label_provider = alice;
+        let mut bob_req = quota_request();
+        bob_req.traffic_label_provider = bob;
+
+        assert!(counter.check_quota(&alice_req, &[rule.clone()]).allowed);
+        assert!(!counter.check_quota(&alice_req, &[rule.clone()]).allowed);
+        assert!(counter.check_quota(&bob_req, &[rule]).allowed);
     }
 
     #[test]
@@ -677,6 +948,19 @@ mod tests {
         let counter = LocalQuotaCounter::new();
         let req = quota_request();
         let rules = vec![local_concurrency_rule(1)];
+
+        let first = counter.check_quota(&req, &rules);
+        let second = counter.check_quota(&req, &rules);
+
+        assert!(first.allowed);
+        assert!(!second.allowed);
+    }
+
+    #[test]
+    fn local_quota_counter_checks_all_qps_windows_before_consuming() {
+        let counter = LocalQuotaCounter::new();
+        let req = quota_request();
+        let rules = vec![local_qps_rule_with_multiple_windows()];
 
         let first = counter.check_quota(&req, &rules);
         let second = counter.check_quota(&req, &rules);
@@ -716,6 +1000,28 @@ mod tests {
 
         assert!(first.allowed);
         assert!(!second.allowed);
+    }
+
+    #[test]
+    fn global_concurrency_rule_keeps_local_counter_semantics() {
+        let mut rule = local_concurrency_rule(1);
+        rule.r#type = rate_limit::Type::Global.into();
+        rule.rules[0].failover = limit_trigger::FailoverType::FailoverPass.into();
+        let trigger = &rule.rules[0];
+
+        assert!(uses_local_counter(&rule, trigger));
+        assert!(!uses_distributed_quota(&rule, trigger));
+
+        let counter = LocalQuotaCounter::new();
+        let req = quota_request();
+        let first = check_quota(&counter, &req, &[rule.clone()]);
+        let second = check_quota(&counter, &req, &[rule.clone()]);
+        return_quota(&counter, &req, &[rule.clone()]);
+        let after_return = check_quota(&counter, &req, &[rule]);
+
+        assert!(first.allowed);
+        assert!(!second.allowed);
+        assert!(after_return.allowed);
     }
 
     #[test]

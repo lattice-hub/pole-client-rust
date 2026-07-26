@@ -46,7 +46,7 @@ async-trait = {version = "0.1"}
 http = {version = "1.4.0"}
 hyper = {version = "1.5.0", features = ["full"]}
 tokio = {version = "1.37.0", features = ["full"]}
-tokio-stream = {version = "0.1.16"}
+tokio-stream = {version = "0.1.16", features = ["net"]}
 tower = {version = "0.4.13"}
 
 # gRPC dep
@@ -71,6 +71,7 @@ block-modes = {version = "0.8.1"}
 hex = {version = "0.4.3"}
 rand = {version = "0.8.4"}
 rsa = {version = "0.9.6"}
+sha2 = {version = "0.10.9"}
 
 [dev-dependencies]
 
