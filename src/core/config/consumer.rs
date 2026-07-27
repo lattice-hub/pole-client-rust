@@ -22,7 +22,6 @@ use super::global::LocalCacheConfig;
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ConsumerConfig {
     pub service_router: ServiceRouterConfig,
-    pub circuit_breaker: CircuitBreakerConfig,
     pub load_balancer: LoadBalancerConfig,
     pub local_cache: LocalCacheConfig,
 }
@@ -47,11 +46,4 @@ pub struct ServiceRouterPluginConfig {
 pub struct LoadBalancerConfig {
     pub default_policy: String,
     pub plugins: Option<Vec<String>>,
-}
-
-#[derive(Deserialize, Debug)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct CircuitBreakerConfig {
-    pub enable: bool,
-    pub enable_remote_pull: bool,
 }

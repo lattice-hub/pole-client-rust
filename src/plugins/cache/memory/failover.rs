@@ -46,8 +46,9 @@ impl DiskCacheFailover {
 mod tests {
     use super::*;
     use pole_specification::v1::{
-        discover_response::DiscoverResponseType, DiscoverResponse, LosslessRule, Service,
-        TrafficMirror, TrafficMock, TrafficSecurityRule,
+        config_discover_response::ConfigDiscoverResponseType,
+        discover_response::DiscoverResponseType, ConfigDiscoverResponse, ConfigFileRelease,
+        DiscoverResponse, LosslessRule, Service, TrafficMirror, TrafficMock, TrafficSecurityRule,
     };
     use std::collections::HashMap;
     use std::fs;
@@ -166,12 +167,76 @@ mod tests {
 
         let _ = fs::remove_dir_all(conf.persist_dir);
     }
+
+    #[tokio::test]
+    async fn disabled_persistence_does_not_read_or_write_failover_files() {
+        let mut conf = temp_cache_config();
+        let persist_dir = conf.persist_dir.clone();
+        fs::remove_dir_all(&persist_dir).unwrap();
+        conf.persist_enable = false;
+        let failover = DiskCacheFailover::new(conf);
+
+        failover
+            .save_naming_failover(DiscoverResponse {
+                r#type: DiscoverResponseType::Lossless.into(),
+                service: Some(service()),
+                lossless_rules: vec![LosslessRule::default()],
+                ..DiscoverResponse::default()
+            })
+            .await
+            .unwrap();
+        failover
+            .save_config_failover(ConfigDiscoverResponse {
+                r#type: ConfigDiscoverResponseType::ConfigFile.into(),
+                file: Some(ConfigFileRelease {
+                    namespace: "default".to_string(),
+                    group: "group-a".to_string(),
+                    file_name: "file-a".to_string(),
+                    ..ConfigFileRelease::default()
+                }),
+                ..ConfigDiscoverResponse::default()
+            })
+            .await
+            .unwrap();
+
+        assert!(!std::path::Path::new(&persist_dir).exists());
+        let naming_error = failover
+            .failover_naming_load(filter(EventType::LosslessRule))
+            .await
+            .unwrap_err();
+        assert!(naming_error
+            .to_string()
+            .contains("local cache persistence is disabled"));
+        let config_error = failover
+            .failover_config_load(Filter {
+                resource_key: crate::core::model::cache::ResourceEventKey {
+                    namespace: "default".to_string(),
+                    event_type: EventType::ConfigFile,
+                    filter: HashMap::from([
+                        ("group".to_string(), "group-a".to_string()),
+                        ("file".to_string(), "file-a".to_string()),
+                    ]),
+                },
+                ..Filter::default()
+            })
+            .await
+            .unwrap_err();
+        assert!(config_error
+            .to_string()
+            .contains("local cache persistence is disabled"));
+    }
 }
 
 #[async_trait::async_trait]
 impl ResourceCacheFailover for DiskCacheFailover {
     // failover_naming_load 兜底加载
     async fn failover_naming_load(&self, filter: Filter) -> Result<DiscoverResponse, PoleError> {
+        if !self.conf.persist_enable {
+            return Err(PoleError::new(
+                ErrorCode::InternalError,
+                "local cache persistence is disabled".to_string(),
+            ));
+        }
         let mut persist_file = self.conf.persist_dir.clone();
         let event_type = filter.get_event_type();
         let resource_key = filter.resource_key;
@@ -238,6 +303,9 @@ impl ResourceCacheFailover for DiskCacheFailover {
 
     // save_failover 保存容灾数据
     async fn save_naming_failover(&self, value: DiscoverResponse) -> Result<(), PoleError> {
+        if !self.conf.persist_enable {
+            return Ok(());
+        }
         let mut buf = Vec::new();
         let mut persist_file = self.conf.persist_dir.clone();
         let svc = value.service.clone().unwrap();
@@ -307,6 +375,12 @@ impl ResourceCacheFailover for DiskCacheFailover {
         &self,
         filter: Filter,
     ) -> Result<ConfigDiscoverResponse, PoleError> {
+        if !self.conf.persist_enable {
+            return Err(PoleError::new(
+                ErrorCode::InternalError,
+                "local cache persistence is disabled".to_string(),
+            ));
+        }
         let mut persist_file = self.conf.persist_dir.clone();
         let event_type = filter.get_event_type();
         let resource_key = filter.resource_key;
@@ -365,6 +439,9 @@ impl ResourceCacheFailover for DiskCacheFailover {
 
     // save_config_failover 保存容灾数据
     async fn save_config_failover(&self, value: ConfigDiscoverResponse) -> Result<(), PoleError> {
+        if !self.conf.persist_enable {
+            return Ok(());
+        }
         let mut buf = Vec::new();
         let mut persist_file = self.conf.persist_dir.clone();
         let conf = value

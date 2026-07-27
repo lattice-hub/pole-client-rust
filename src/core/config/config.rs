@@ -31,7 +31,7 @@ pub struct Configuration {
     pub config: ConfigFileConfig,
 }
 
-pub fn load_default<'a>() -> Result<Configuration, io::Error> {
+pub fn load_default() -> Result<Configuration, io::Error> {
     // 这里兼容不同 yaml 文件格式的后缀
     let mut path = Path::new("./pole.yaml");
     if !path.exists() {
@@ -58,7 +58,40 @@ pub fn load<P: AsRef<Path>>(path: P) -> Result<Configuration, io::Error> {
 
 #[cfg(test)]
 mod tests {
+    use super::Configuration;
 
     #[test]
     fn test_load() {}
+
+    #[test]
+    fn default_config_example_matches_current_schema() {
+        let config: Configuration =
+            serde_yaml::from_str(include_str!("../../../tests/data/default-config.yml")).unwrap();
+
+        assert_eq!(config.consumer.local_cache.name, "memory");
+        assert_eq!(
+            config.consumer.load_balancer.default_policy,
+            "weightedRandom"
+        );
+        assert_eq!(
+            config
+                .global
+                .server_connectors
+                .observability
+                .as_ref()
+                .unwrap()
+                .addresses,
+            vec!["127.0.0.1:4317"]
+        );
+    }
+
+    #[test]
+    fn removed_provider_rate_limit_configuration_is_rejected() {
+        let legacy = include_str!("../../../tests/data/default-config.yml")
+            .replace("provider:\n", "provider:\n  rateLimit:\n    enable: true\n");
+
+        let error = serde_yaml::from_str::<Configuration>(&legacy).unwrap_err();
+
+        assert!(error.to_string().contains("rateLimit"));
+    }
 }

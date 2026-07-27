@@ -29,7 +29,7 @@ use pole_specification::v1::{
     discover_response::DiscoverResponseType, CircuitBreakerRule, ConfigDiscoverRequest,
     ConfigDiscoverResponse, ConfigFile as SpecConfigFile, ConfigFileRelease, DiscoverFilter,
     DiscoverRequest, DiscoverResponse, FaultDetectRule, LaneGroup, LosslessRule, RateLimit,
-    RouteRule, Service, TrafficMirror, TrafficMock, TrafficSecurityRule,
+    RouteRule, Service, TrafficMirror, TrafficMock, TrafficSecurityRule, TrustBundleQuery,
 };
 
 use super::{
@@ -52,6 +52,8 @@ pub enum EventType {
     TrafficSecurityRule,
     TrafficMirrorRule,
     TrafficMockRule,
+    ServiceIdentity,
+    ServiceIdentityBundle,
     Namespaces,
     ConfigFile,
     ConfigGroup,
@@ -60,6 +62,7 @@ pub enum EventType {
 
 impl EventType {
     pub fn to_persist_file(&self) -> String {
+        // failover 落盘文件名必须和 EventType 一一对应，避免不同治理规则互相覆盖。
         match self {
             EventType::Instance => "instance.data".to_string(),
             EventType::RouterRule => "router_rule.data".to_string(),
@@ -73,6 +76,9 @@ impl EventType {
             EventType::TrafficSecurityRule => "traffic_security_rule.data".to_string(),
             EventType::TrafficMirrorRule => "traffic_mirror_rule.data".to_string(),
             EventType::TrafficMockRule => "traffic_mock_rule.data".to_string(),
+            // 身份 descriptor 只在 SDK 内存中保存，不落盘。
+            EventType::ServiceIdentity => "unknown".to_string(),
+            EventType::ServiceIdentityBundle => "unknown".to_string(),
             EventType::Namespaces => "namespaces.data".to_string(),
             EventType::ConfigFile => "config_file.data".to_string(),
             EventType::ConfigGroup => "config_group.data".to_string(),
@@ -81,6 +87,7 @@ impl EventType {
     }
 
     pub fn naming_spec_to_persist_file(t: DiscoverResponseType) -> String {
+        // 服务发现响应类型来自 spec，这里映射到本地 failover 文件名。
         match t {
             DiscoverResponseType::Instance => "instance.data".to_string(),
             DiscoverResponseType::CustomRouteRule => "router_rule.data".to_string(),
@@ -130,6 +137,8 @@ impl ToString for EventType {
             EventType::TrafficSecurityRule => "TrafficSecurityRule".to_string(),
             EventType::TrafficMirrorRule => "TrafficMirrorRule".to_string(),
             EventType::TrafficMockRule => "TrafficMockRule".to_string(),
+            EventType::ServiceIdentity => "ServiceIdentity".to_string(),
+            EventType::ServiceIdentityBundle => "ServiceIdentityBundle".to_string(),
             EventType::Namespaces => "Namespaces".to_string(),
             EventType::ConfigFile => "ConfigFile".to_string(),
             EventType::ConfigGroup => "ConfigGroup".to_string(),
@@ -230,6 +239,8 @@ pub struct ResourceEventKey {
 
 impl ResourceEventKey {
     pub fn to_discover_request(&self, revision: String) -> Option<DiscoverRequest> {
+        // ResourceEventKey 是本地订阅键；转换为 DiscoverRequest 时要保持
+        // namespace/service/revision 不变，只替换成 spec 要求的请求类型。
         match self.event_type {
             crate::core::model::cache::EventType::Instance => Some(DiscoverRequest {
                 r#type: DiscoverRequestType::Instance.into(),
@@ -295,6 +306,24 @@ impl ResourceEventKey {
                 r#type: DiscoverRequestType::TrafficMockRule.into(),
                 service: Some(self.to_spec_service(revision)),
                 filter: Some(DiscoverFilter::default()),
+                ..DiscoverRequest::default()
+            }),
+            crate::core::model::cache::EventType::ServiceIdentity => Some(DiscoverRequest {
+                r#type: DiscoverRequestType::ServiceIdentity.into(),
+                service: Some(self.to_spec_service(revision)),
+                filter: Some(DiscoverFilter::default()),
+                ..DiscoverRequest::default()
+            }),
+            crate::core::model::cache::EventType::ServiceIdentityBundle => Some(DiscoverRequest {
+                r#type: DiscoverRequestType::ServiceIdentityBundle.into(),
+                trust_bundle_query: Some(TrustBundleQuery {
+                    known_version: revision,
+                    known_sequence: self
+                        .filter
+                        .get("sequence")
+                        .and_then(|value| value.parse().ok())
+                        .unwrap_or_default(),
+                }),
                 ..DiscoverRequest::default()
             }),
             _ => None,
@@ -420,6 +449,10 @@ mod tests {
                 EventType::TrafficMockRule,
                 DiscoverRequestType::TrafficMockRule,
             ),
+            (
+                EventType::ServiceIdentity,
+                DiscoverRequestType::ServiceIdentity,
+            ),
         ];
 
         for (event_type, expected) in cases {
@@ -485,6 +518,7 @@ mod tests {
                 "TrafficMirrorRule#default#svc-a",
             ),
             (EventType::TrafficMockRule, "TrafficMockRule#default#svc-a"),
+            (EventType::ServiceIdentity, "ServiceIdentity#default#svc-a"),
         ];
 
         for (event_type, expected) in cases {
@@ -1204,6 +1238,10 @@ impl ConfigFileCacheItem {
             version: self.value.version,
             content: self.value.content.clone(),
             labels: self.value.labels.clone(),
+            release_name: self.value.name.clone(),
+            release_type: self.value.release_type.clone(),
+            active: self.value.active,
+            beta_labels: self.value.beta_labels.clone(),
             encrypt_algo: self.value.encrypt_algo.clone(),
             encrypt_key: String::new(),
         }

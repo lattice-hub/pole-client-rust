@@ -2,11 +2,243 @@
 title: 切换 pole specification 依赖
 tags: [task, review]
 links: [lessons]
-updated: 2026-07-04
+updated: 2026-07-20
 sources: 1
 ---
 
 # 切换 pole specification 依赖
+
+## 本轮计划：升级版本并完整实现配置与治理多灰度
+
+- [x] 冻结跨仓库契约与公开测试 seam：Config Discover、Naming Discover、Router/CircuitBreaker API、多客户端标签隔离
+- [x] 升级 Rust SDK、e2e_tests 与 control-plane 的 specification 至 `v0.1.0-ALPHA.38`
+- [x] 实现 control-plane 配置/治理多 active gray、客户端标签选择、复合 revision 与 Lane Discover
+- [x] 实现 Rust SDK naming Discover 标签透传、配置发布身份保留与统一刷新 token
+- [x] 修复 RouteRule enable/priority/启用判断和熔断相同 revision 保态
+- [x] 接通治理 failover，明确 security/mirror/mock 的独立失败与安全失败语义
+- [x] 增加多客户端构造、配置回退、治理选择/停止灰度、跨 namespace 和禁用规则回归测试
+- [x] 运行 fmt、warning-as-error、Rust/Go 全量测试、context-kg lint 和 diff check
+- [x] 执行独立 code review，修复发现项并更新本轮 review
+
+## 本轮 review：升级版本并完整实现配置与治理多灰度
+
+- 已完成：Rust SDK、e2e_tests 和 control-plane 均升级到 specification `v0.1.0-ALPHA.38`。
+- 已完成：配置 Discover 使用顶层快照 revision 和 caller labels；命中多个 active gray 时按 version/mtime 选择，停止 gray 后即使 normal 版本更低也会通过不同 revision 回退。
+- 已完成：Router、RateLimit、CircuitBreaker、FaultDetect、Lane、Lossless、Security、Mirror、Mock 九类治理规则支持多 active gray、caller labels 选择和稳定快照 revision；发布模型和 MySQL 转换保留 ClientLabels，Lane 已接入 gRPC Discover。
+- 已完成：治理 release 缓存键包含 namespace、rule ID、rule name、release type 和 gray release name，避免跨 namespace 覆盖；熔断/故障探测在 service 层无实际命中时继续回退 namespace/global。
+- 已完成：Rust naming Discover 透传精确客户端标签；配置结果保留 release name/type/active/beta labels；RouteRule 正确处理任一侧规则、外层 enable 和稳定 priority；熔断相同规则刷新保留状态并应用 matcher。
+- 已完成：九类治理规则均可在在线初始化失败后从统一 failover provider 恢复；禁用持久化时不读写磁盘；security 加载失败 fail closed，mirror/mock 各自失败不会关闭其它治理。
+- 已完成：普通实例发现按明确服务自动建立 FaultDetectRule/Instance 订阅，规则异常不阻断实例发现；多服务规则和实例按 `namespace#service` 精确配对，不再交叉串用。
+- 独立双轴审查发现并修复三项 P1：跨 namespace release key 冲突、熔断/故障探测层级回退缺失、多服务主动探测笛卡尔积。另记录两个非阻断项：公开配置结构新增字段属于 alpha 版本迁移的源码兼容变更；MemoryCache 九类规则加载流程仍有可抽取的重复代码。
+- 已验证：`cargo fmt --all -- --check`、warning-as-error `cargo check --all-targets --workspace`、`cargo test --workspace` 全部通过，主库 190/190、公开 API 6/6；control-plane 升级后 `GOPROXY=direct go test ./... -count=1` 全量通过；两个仓库的 context-kg lint、gofmt 检查和 `git diff --check` 通过。
+- 验证边界：当前新增的是 in-process/组件集成回归，未在本轮启动一套外部 control-plane 并执行真实进程级“发布 normal/多个 gray → 两个 Rust 客户端 Discover → Stopbeta 回退”live E2E；因此不把部署环境联调表述为已完成。
+
+## 本轮计划：核查多灰度配置与治理规则生效机制
+
+- [x] 核对当前 specification 版本及配置、治理规则模型的最新字段
+- [x] 跟踪配置多灰度版本从订阅、缓存、选择到返回内容的完整链路
+- [x] 跟踪治理规则从订阅、缓存、匹配到插件执行的完整链路
+- [x] 运行针对性测试，验证版本选择、规则刷新、启停和匹配行为
+- [x] 记录 review：已适配项、缺陷、风险与建议
+
+## 本轮 review：核查多灰度配置与治理规则生效机制
+
+- 结论：配置中心多 active gray 的内容选择基本兼容，但治理规则多灰度未适配，不能认为治理规则都能正确应用。
+- 配置正向链路成立：`global.client.labels` 进入 `ClientContext`，配置请求发送前写入 `ConfigFile.labels`；control-plane 按多条 active gray 的标签匹配和 version/mtime 顺序选择单个版本，客户端收到后整体替换配置缓存，因此 gray-a、gray-b、normal 之间具备内容切换条件。
+- 配置风险：本地模型丢弃 release name/type/active/beta labels，无法观测实际命中的发布；connector 使用 response revision，而 memory cache 使用 file version，两套刷新 token 未统一；当前没有 Rust 端多灰度切换和 watch 去重 E2E。
+- 治理阻断：Router、RateLimit、CircuitBreaker、FaultDetect、Lane、Lossless、Security、Mirror、Mock 的 naming Discover 都使用空 `DiscoverFilter`，没有把 `ClientContext.labels` 写入 `caller.labels`；客户端也不消费 `RuleRelease.client_labels`，因此无法按 SDK 标签选择治理灰度版本。
+- 控制面限制：当前治理发布 pipeline 仍限制同类 active gray 唯一，尚未具备配置中心那种多 active gray 选择机制；因此该能力需要 specification、control-plane 与 SDK 三方一起收敛，不能只在客户端补一个字段。
+- 治理执行缺陷：规则路由的启用判断使用 `caller_empty || callee_empty`，主调和被调同时有规则时反而禁用，且没有过滤外层 `RouteRule.enable`；熔断每次 check/report 前刷新相同规则并清空状态，连续错误无法稳定累计。
+- 其它风险：control-plane gRPC Discover switch 缺少 Lane 分支；治理 failover 未接入 `load_service_rule`，traffic security/mirror/mock 任一加载失败会整体回退默认放行。
+- 版本结论：远端最新 specification tag 为 `v0.1.0-ALPHA.38`，当前 `Cargo.toml`/`Cargo.lock` 仍为 `v0.1.0-ALPHA.37`。ALPHA.38 主要是协议兼容性 reserved 字段和注释调整，不是本次治理灰度缺失的根因。
+- 已验证：control-plane `go test ./pkg/config ./pkg/cache/config ./pkg/cache/rules` 通过；Rust 配置响应映射、治理缓存更新、治理规则 downcast、熔断规则更新和 Discover 类型映射等针对性测试通过。
+- 全量 Rust lib 测试结果为 167 通过、1 失败；失败项是既有分布式限流 `endpoint_affinity_is_isolated_by_limiter_cluster`，隔离重跑仍失败，与本轮只读灰度审查无直接关系。
+
+## 本轮计划：修复分布式限流运行时契约
+
+- [x] 以 `RateLimitAPI::get_quota` 和真实 `RateLimitGRPCV2` 协议边界补 RED 测试
+- [x] 服务发现只选择健康可用的 gRPC limiter 实例，并保持窗口 endpoint 粘性
+- [x] 复用 SDK 实例级 `ClientContext.client_id`，接入 `TimeAdjust` 时钟偏移
+- [x] 处理 ACQUIRE 业务错误、404 重新 INIT 和断流 session 重建
+- [x] 覆盖 method/动态参数维度的远端 counter labels，保持 LOCAL/GLOBAL 隔离语义一致
+- [x] 运行文件格式化、warning-as-error workspace lib/tests、diff check 和独立代码审查
+- [x] 更新 review；工作区存在并行且交叠的未提交改动，本轮不创建混合提交
+
+## 本轮 review：修复分布式限流运行时契约
+
+- 已完成：公开 `RateLimitAPI::get_quota` 测试入口经过真实生成的 `RateLimitGRPCV2` 服务，验证 Engine 实例级 `client_id`、HTTP/gRPC 混合实例过滤、INIT 和 ACQUIRE 上报。
+- 已完成：窗口 endpoint affinity 包含 limiter cluster 与规范化 target labels；实例新增时保持粘性，原 endpoint 不可用才重选。规则 revision 通过 current-generation 和 target INIT 串行化避免旧请求覆盖新窗口。
+- 已完成：连接建立时执行 `TimeAdjust`，健康 session 每 30 秒重校；404001 在原流重新 INIT，400214、断流和发送失败会淘汰 session 并重连。
+- 已完成：远端 labels 与 Polaris SDK 的 `method|TYPE:key:value` counter 身份一致；revision 只参与本地窗口失效。GLOBAL concurrency 保持本地计数并可通过 `return_quota` 正确归还，包括 `FAILOVER_PASS`。
+- 已完成：异步 ACQUIRE 回包按 server-time epoch 和压缩 pending reports 对账；耗尽主动 push 不误确认本地 report。窗口缓存有 10000 硬上限、active 引用保护、周期清理；无窗口 endpoint 会关闭接收任务和 session。
+- 已验证：`RUSTFLAGS='-D warnings' cargo test --lib traffic::ratelimit` 31 项通过；`RUSTFLAGS='-D warnings' cargo test --workspace --lib --tests` 通过（主库 187 项、公开 API 6 项及 e2e 测试组件）。`git diff --check` 对本轮限流文件通过。
+- 已知外部阻塞：并行升级 specification ALPHA.38 后，完整 `cargo test --workspace` 会编译 examples，其中 `examples/config.rs` 尚未补 `ConfigFileRelease.beta_labels/release_type`，与本轮限流无关。
+- 提交边界：当前工作区同时存在 identity、observability、路由、配置灰度等大量交叠修改，且 `Cargo.toml`/spec tag 正在并行变更；为避免把用户改动混入提交，本轮未执行 git commit。
+
+## 本轮计划：审计 Rust SDK 与 pole-limiter-server 协议契约
+
+- [x] 核对两个仓库的依赖版本、RPC 服务定义和生成代码来源
+- [x] 比对 INIT、ACQUIRE/REPORT 的字段、枚举、响应码和状态机语义
+- [x] 核对限流集群服务发现、endpoint、实例可用性和连接生命周期
+- [x] 运行两端针对性测试或最小联调，验证实际互操作性
+- [x] 记录 review：一致项、阻断问题、风险和后续建议
+
+## 本轮 review：审计 Rust SDK 与 pole-limiter-server 协议契约
+
+- 已确认：客户端使用 lattice-hub specification `v0.1.0-ALPHA.37`，服务端使用 pole-io specification `v0.1.0-ALPHA.32`；两版 `ratelimiter.proto` 与 `grpcapi_ratelimiter.proto` 逐文件 diff 无差异，`polaris.metric.v2.RateLimitGRPCV2/Service`、字段编号、枚举值和成功码 `200000` wire-compatible。
+- 已确认：Rust 的 `INIT`、`ACQUIRE + RateLimitReportRequest`、`BATCH_OCCUPY`、`GLOBAL_TOTAL -> WHOLE`、`SHARE_EQUALLY -> DIVIDE`、秒级 duration 和毫秒 timestamp 与服务端基本契约一致。
+- 阻断问题：limiter 默认把 HTTP 8100 与 gRPC 8101 注册到同一个 `Polaris/polaris.limiter` 服务；Rust 只按健康/隔离/权重筛选实例，未按 `protocol=grpc` 过滤，可能把 gRPC 流连到 HTTP 端口。
+- 阻断问题：Rust 未调用 `TimeAdjust` 或维护服务端时钟偏移；服务端仅在客户端 timestamp 与服务端处于同一滑窗时计入用量，跨窗口时钟偏差会使上报用量被丢弃并造成超发。
+- 阻断问题：服务端要求 `clientId` 标识 SDK 实例并在重启后变化，同名 client 会替换 stream；Rust 分布式限流绕过已生成的 `ClientContext.client_id`，配置为空时回退固定 `pole-rust-client`，多进程会互相覆盖并破坏 DIVIDE 客户端计数。
+- 风险：Rust 忽略 ACQUIRE 非成功业务码，没有按服务端约定对 404 重新 INIT；`InvalidCounterKey` 后服务端关闭流，客户端 session 恢复条件目前只检查发送端关闭，需补真实恢复测试。
+- 风险：远端 counter 的 labels 未包含本地计数 key 已使用的 method 和动态参数维度，GLOBAL 与 LOCAL 对多 API、参数化规则可能产生不同的配额隔离语义。
+- 已验证：Rust 分布式限流目标测试 3 个通过；服务端 `ratelimitv2`、`apiserver/grpc`、`bootstrap` 在 `-vet=off` 下构建/测试通过。服务端默认 `go test` 被两处既有格式化 vet 错误阻断；`test/quotav2` 因测试硬编码连接 8081、实际测试配置监听 8101 而超时，当前仓库自身 live 测试不可作为互操作性证明。
+
+## 本轮计划：交接分布式限流 live 联调
+
+- [x] 核对当前分布式限流实现、spec tag、测试边界和工作区状态
+- [x] 记录下一步对接 `pole-limiter` 的启动、注册和 live E2E 验证目标
+- [x] 将交接文档写入本地 `.handoff/` 并验证不进入 Git
+
+## 本轮 review：交接分布式限流 live 联调
+
+- 已完成：交接文档位于 `.handoff/2026-07-25-distributed-rate-limit.md`，包含已实现协议链路、未完成的 `pole-limiter` 实机联调、验证命令和工作区边界。
+- 已完成：`.handoff/` 已写入 `.git/info/exclude`；交接文件不能被暂存或提交。
+
+## 本轮计划：补齐规则驱动的分布式限流
+
+- [x] 对照最新 spec 的 `RateLimit.cluster`、配额 RPC 与现有限流执行链，明确单机/分布式的请求、缓存和降级边界
+- [x] 在 specification 公开 `polaris.metric.v2` 的官方 Rust API 并发布新 spec tag，避免 SDK 复制 proto/生成代码
+- [x] 清理失效的全局 `provider.rateLimit` 配置，收敛 `serverConnectors` 到 discover/config/observability 的直连配置模型
+- [x] 实现按 `RateLimit.cluster(namespace, service)` 懒加载和复用的分布式限流客户端，覆盖 Init、Acquire、Report、规则 revision 失效与 failover
+- [x] 补齐单元测试和可运行的 gRPC 限流服务 E2E 用例，覆盖 LOCAL、GLOBAL、集群切换、远端失败降级
+- [x] 执行 fmt、warning-as-error workspace test、context-kg lint、diff check，并更新本轮 review
+
+## 本轮 review：补齐规则驱动的分布式限流
+
+- 已完成：在 specification 发布 `v0.1.0-ALPHA.33`，正式导出 `polaris.metric.v2` 的限流 gRPC Rust API；SDK 和 `e2e_tests` 都已切换到该 tag。
+- 已完成：GLOBAL QPS 规则仅在命中后按 `RateLimit.cluster(namespace, service)` 通过已有服务发现获取实例，按 endpoint 复用双向 gRPC 流，并完成 `INIT`、`ACQUIRE` 和服务端剩余配额回写；规则 revision 是窗口 key 的组成部分，更新后会重新初始化。
+- 已完成：LOCAL QPS/并发始终使用本地计数。GLOBAL QPS 远端不可用时遵循 trigger 的 `FAILOVER_LOCAL`/`FAILOVER_PASS`；并发资源需要请求完成时归还额度，按 protocol 与 Go SDK 语义强制保持本地计数，不发起不正确的远端配额请求。
+- 已完成：删除 `provider.rateLimit` 和旧连接器字段；`serverConnectors` 只保留 discover、config、observability 三个直连目标。观测 endpoint 由环境变量优先，其次使用 `serverConnectors.observability`，不再维护发现、缓存和热切换状态机。
+- 已完成：修正本地多窗口 QPS 规则为“先检查全部窗口、再统一消费”，避免后续窗口拒绝时留下部分额度消耗。
+- 已验证：真实本地双向 gRPC 协议集成测试覆盖窗口复用、revision 重建及多限流实例的 session 隔离；另覆盖 LOCAL/多窗口 QPS、GLOBAL 并发本地语义、远端失败降级和观测直连配置。
+- 已验证：`cargo fmt --all -- --check`、`PROTOC=/Users/chuntao.liao/Github/pole-io/specification/source/protoc/protoc-darwin-arm64/bin/protoc RUSTFLAGS='-D warnings' cargo test --workspace`、本轮改动文件的 `cargo clippy -D warnings` 筛查、`context_kg_lint.py ./context-kg`、`git diff --check` 均通过。主库 121 个测试、public API 5 个测试和 `e2e_tests` 63 个测试通过。
+
+## 本轮计划：收敛 pole.yml 与 Rust schema
+
+- [x] 对照样例 `pole.yml`、配置 schema 和插件装配入口，列出字段位置、必填项与失效开关差异
+- [x] 清理样例中的过时字段，补齐当前 schema 的必填项，并将缓存配置放到实际读取的层级
+- [x] 删除熔断、限流、优雅上下线和旧 stat reporter 的重复或失效本地开关，保持治理能力按控制面规则生效
+- [x] 增加样例配置反序列化与核心装配测试，执行 fmt、warning-as-error check/test、context-kg lint、diff check
+
+## 本轮 review：收敛 pole.yml 与 Rust schema
+
+- 已完成：样例配置将 `localCache` 移至 `consumer`，补齐 `global.client` 和 `loadBalancer.defaultPolicy`，删除 schema 不支持的缓存重试字段。
+- 已完成：删除未接入运行时的 `statReporter` schema 与所有测试 bootstrap 字段；删除 `consumer.circuitBreaker`、`provider.rateLimit.enable`、`provider.lossless.enable`，熔断插件在 SDK 初始化时无条件装配。
+- 已完成：新增样例配置反序列化测试和默认熔断插件装配测试，e2e bootstrap 同步使用现行 schema。
+- 已验证：`cargo fmt --all -- --check`、`PROTOC=/Users/chuntao.liao/Github/pole-io/specification/source/protoc/protoc-darwin-arm64/bin/protoc RUSTFLAGS='-D warnings' cargo test --workspace` 通过；主库 118 个测试、公开 API 5 个测试和 e2e_tests 测试组件全部通过。
+
+## 本轮计划：撤销不必要的 SDK 动态治理开关
+
+- [x] 核对运行时配置引入点，明确仅撤销 SDK 模块级启停，不影响现有配置中心和观测配置
+- [x] 删除 `RuntimeSdkConfig`、远端订阅和各治理模块的额外开关分支，恢复静态 `SDKContext`
+- [x] 删除对应 E2E 用例与过时文档，统一为“治理能力默认可用，按控制面规则及其开关生效”
+- [x] 执行 fmt、warning-as-error check/test、context-kg lint、diff check，并完成代码审查
+
+## 本轮 review：撤销不必要的 SDK 动态治理开关
+
+- 已完成：删除 `RuntimeSdkConfig`、`SdkRemoteConfig`、远端订阅监听、`RuntimeFeature` 及治理调用链中的绕过分支；`SDKContext` 恢复为静态配置和稳定 Engine。
+- 已完成：路由、泳道、限流、熔断、探测、mock、镜像、鉴权默认参与执行，实际效果只由控制面规则是否存在和规则自身 `enable/disable` 决定。
+- 已完成：移除 `sdk-remote-config` E2E case、注册表断言和 README 示例；保留配置中心通用 API、治理规则 E2E 与独立的 `global.observability.remoteConfig` schema。
+- 代码审查：为旧方案扩散的配置 `Clone` 派生已移除；仅保留插件初始化确实需要复制的 `ServerConnectorConfig`、`SSL`、`LocationConfig`、`LocationProviderConfig`、`LocalCacheConfig`。
+- 已验证：`cargo fmt --all -- --check`、`PROTOC=/Users/chuntao.liao/Github/pole-io/specification/source/protoc/protoc-darwin-arm64/bin/protoc RUSTFLAGS='-D warnings' cargo test --workspace`、`context_kg_lint.py ./context-kg`、`git diff --check` 全部通过。主库 117 个测试、公开 API 5 个测试、e2e_tests 测试组件全部通过。
+
+## 本轮计划：核查核心能力实现完整性
+
+- [x] 核查注册发现：Provider 注册/反注册/心跳、Consumer 获取实例、路由链和 e2e 覆盖
+- [x] 核查流量治理：路由、泳道、限流、熔断、探测、镜像、鉴权、mock 的缓存读取、执行链路和测试覆盖
+- [x] 核查配置获取：配置文件/配置分组 API、watch/listen 和 e2e 覆盖
+- [x] 核查 SDK 自身配置走配置中心获取：启动配置来源、远端配置拉取/热更新是否进入 `SDKContext`/`Engine`
+- [x] 对发现的缺口给出结论或补齐最小实现/测试
+- [x] 运行必要的 check/test/context-kg lint/diff check，并更新 review
+
+## 本轮 review：核查核心能力实现完整性
+
+- 已确认：注册发现入口覆盖 Provider register/deregister/heartbeat/report contract、Consumer get_all/get_one/watch/get_service_rule/report_call；e2e `service-discovery` 会创建真实 SDK context，并执行注册、心跳、发现、单实例获取和反注册。
+- 已确认：流量治理入口已按 `traffic` 顶层组织，e2e registry 覆盖 routing、ratelimit、circuitbreaker、lane-routing、fault-detect、lossless、mirror、auth-security、mock；控制面执行路径会 create、publish、运行 SDK 行为断言并 cleanup。
+- 已修复：`RouterFlow` after 阶段原来误从 `before_routers` 容器取插件，已改为读取 `after_routers`，并新增三段路由链调用顺序单测。
+- 已确认：配置中心公开 API 支持配置文件 get/create/update/publish/upsert_publish/watch 和配置组 get/watch；e2e `config-center` 覆盖 upsert publish 后再 get 内容一致。
+- 缺口结论：SDK 自身配置目前没有完整从配置中心拉取并进入 `SDKContext`/`Engine` 的启动链路。当前 `SDKContext::default()` 和 `create_by_addresses()` 仍先读取本地 `pole.yaml`/`pole.yml` 或 `POLE_RUST_CONFIG`，`global.observability.remoteConfig` 只是配置 schema/语义，不等于已实现远端启动配置拉取和热更新。
+- 已记录：更新 `context-kg/tasks/lessons.md`，要求后续核查能力完整性时区分普通配置 API 和 SDK 启动配置链路，并覆盖非默认路由链段。
+- 已验证：新增目标测试 `core::flow::router_flow_tests::choose_instances_runs_before_core_and_after_router_containers_in_order` 通过。
+- 已验证：`cargo fmt --all -- --check` 通过。
+- 已验证：`PROTOC=/Users/chuntao.liao/Github/pole-io/specification/source/protoc/protoc-darwin-arm64/bin/protoc RUSTFLAGS='-D warnings' cargo check --workspace` 通过，无 warning。
+- 已验证：`PROTOC=/Users/chuntao.liao/Github/pole-io/specification/source/protoc/protoc-darwin-arm64/bin/protoc RUSTFLAGS='-D warnings' cargo test --workspace` 通过，主库 118 个测试、public API 5 个测试、e2e_tests 64 个测试、doc tests 0 个全部通过。
+- 已验证：`python3 /Users/chuntao.liao/.codex/skills/context-kg-maintainer/scripts/context_kg_lint.py ./context-kg` 通过。
+
+## 本轮计划：同步远端最新 specification tag
+
+- [x] 查询 `https://github.com/pole-io/specification.git` 远端 tags，确认最新 spec tag
+- [x] 将根包和 `e2e_tests` 的 `pole-specification` 依赖 tag 更新到最新版本
+- [x] 更新 `Cargo.lock` 并运行 warning-as-error check，识别是否存在 spec breaking change
+- [x] 必要时适配源码和测试，保持上一轮未提交改动不被回退
+- [x] 运行 fmt、context-kg lint、warning-as-error check/test、diff check
+- [x] 更新本轮 review
+
+## 本轮 review：同步远端最新 specification tag
+
+- 已完成：通过 `git ls-remote --tags --refs https://github.com/pole-io/specification.git 'v*'` 确认远端最新 tag 仍为 `v0.1.0-ALPHA.32`。
+- 已完成：当前根 `Cargo.toml` 和 `e2e_tests/Cargo.toml` 已经指向 `pole-specification` tag `v0.1.0-ALPHA.32`，无需修改依赖文件。
+- 已完成：确认 `v0.1.0-ALPHA.32` tag 解引用 commit 为 `70317c4d7c08e11a8cd773dd745f592b1c8143f0`，与当前 `Cargo.lock` 中锁定的 spec 提交一致。
+- 已完成：尝试执行 `cargo update -p pole-specification`，但网络索引刷新长时间无输出后中断；由于远端 tag 和 lock commit 已一致，本轮没有需要落盘的 lock 更新。
+- 已验证：`cargo fmt --all -- --check` 通过。
+- 已验证：`PROTOC=/Users/chuntao.liao/Github/pole-io/specification/source/protoc/protoc-darwin-arm64/bin/protoc RUSTFLAGS='-D warnings' cargo check --workspace` 通过，无 warning。
+- 已验证：`PROTOC=/Users/chuntao.liao/Github/pole-io/specification/source/protoc/protoc-darwin-arm64/bin/protoc RUSTFLAGS='-D warnings' cargo test --workspace` 通过，主库 117 个测试、public API 5 个测试、e2e_tests 64 个测试、doc tests 0 个全部通过。
+- 已验证：`python3 /Users/chuntao.liao/.codex/skills/context-kg-maintainer/scripts/context_kg_lint.py ./context-kg` 通过。
+- 已验证：`git diff --check` 通过。
+
+## 本轮计划：按控制面 ADR 补齐客户端观测基础能力
+
+- [x] 从 `../pole-control-plane/context-kg/technical/adr/observability/adr-pole-rust-client-observability.md` 提取 Rust SDK 侧职责和第一阶段边界
+- [x] 新增 `observability` 顶层模块，提供配置、Resource attributes、OTLP endpoint、事件/指标记录和治理决策上下文的公共语义模型
+- [x] 实现 OTel 环境变量解析、Pole 观测服务实例到 endpoint 的转换、治理 metrics 低基数字段保护和事件/trace 关联字段生成
+- [x] 补齐单元测试和 public API 测试，覆盖 env 优先级、endpoint discovery、低基数过滤、治理决策 id 关联和 noop recorder 行为
+- [x] 更新 context-kg 技术文档和本轮 review
+- [x] 运行 fmt、context-kg lint、warning-as-error check/test、diff check
+
+## 本轮 review：按控制面 ADR 补齐客户端观测基础能力
+
+- 已完成：新增 `observability` 顶层模块，包含 `api`、`req`、`default` 三层，提供 no-op recorder、Resource attributes、OTLP endpoint、signal、metric/event/span 和治理决策上下文模型。
+- 已完成：实现 OTel env 解析，支持 `OTEL_SERVICE_NAME`、`OTEL_RESOURCE_ATTRIBUTES`、`OTEL_EXPORTER_OTLP_ENDPOINT`、`OTEL_TRACES_EXPORTER`、`OTEL_METRICS_EXPORTER`、`OTEL_LOGS_EXPORTER`，并让 `*_EXPORTER=none` 关闭对应 signal。
+- 已完成：实现 Pole 服务发现实例到 OTLP endpoint 的转换，按 `pole-observability/pole-otel-collector`、健康状态、metadata endpoint kind/path/signal/secure 生成 endpoint，并在变化时产生结构化事件。
+- 已完成：新增 `global.observability` 配置 schema，兼容旧配置默认值，并支持 exporter、endpoint discovery、remote config 和 events 开关。
+- 已完成：治理决策模型将 `decision_id` 留在 event/span，metrics 只保留低基数字段；`MetricRecord` 会过滤 rule id、decision id、trace id、request id、原始 path/client IP 等高基数字段。
+- 已完成：新增 `context-kg/technical/observability-architecture.md`，记录 ADR 到客户端实现的能力边界和后续 exporter 接入点。
+- 已验证：`PROTOC=/Users/chuntao.liao/Github/pole-io/specification/source/protoc/protoc-darwin-arm64/bin/protoc RUSTFLAGS='-D warnings' cargo test observability --workspace` 通过，观测相关 10 个单元测试和 1 个 public API 测试通过。
+- 已验证：`cargo fmt --all -- --check` 通过。
+- 已验证：`python3 /Users/chuntao.liao/.codex/skills/context-kg-maintainer/scripts/context_kg_lint.py ./context-kg` 通过，23 个 Markdown 页面检查通过。
+- 已验证：`PROTOC=/Users/chuntao.liao/Github/pole-io/specification/source/protoc/protoc-darwin-arm64/bin/protoc RUSTFLAGS='-D warnings' cargo check --workspace` 通过，无 warning。
+- 已验证：`PROTOC=/Users/chuntao.liao/Github/pole-io/specification/source/protoc/protoc-darwin-arm64/bin/protoc RUSTFLAGS='-D warnings' cargo test --workspace` 通过，主库 117 个测试、public API 5 个测试、e2e_tests 64 个测试、doc tests 0 个全部通过。
+- 已验证：`git diff --check` 通过。
+
+## 本轮计划：补齐流量治理相关代码中文注释
+
+- [x] 识别本轮“相关代码”范围：`traffic` 顶层能力、router rule/lane helper、circuitbreaker composite、cache 中治理规则映射
+- [x] 为核心匹配、规则加载、候选收敛、生命周期、探测和副作用边界补中文注释
+- [x] 更新本次用户纠正到 lessons
+- [x] 运行 fmt、context-kg lint、warning-as-error check/test、diff check
+- [x] 更新本轮 review
+
+## 本轮 review：补齐流量治理相关代码中文注释
+
+- 已完成：补充 `traffic::matcher`、`traffic::policy`、`traffic::ratelimit`、`traffic::router`、`traffic::circuitbreaker`、`traffic::faultdetect` 的中文注释，说明 API 匹配索引、治理结果进入主路由链、镜像/mock/security 副作用边界、限流 trigger 三段匹配、熔断规则刷新和探测任务生命周期。
+- 已完成：补充 `plugins::router::rule`、`plugins::router::lane`、`plugins::circuitbreaker::composite`、`core::flow`、`discovery::req`、`core::model::cache`、`plugins::cache::memory` 的中文注释，覆盖规则加载、TrafficMatchRule 解析、规则路由/泳道匹配、熔断状态机、EventType 映射和 ResourceCache 规则返回边界。
+- 已完成：更新 `context-kg/tasks/lessons.md`，记录“相关代码注释”需要覆盖完整相关链路，而不是只补本轮新增文件。
+- 已验证：`cargo fmt --all -- --check` 通过。
+- 已验证：`python3 /Users/chuntao.liao/.codex/skills/context-kg-maintainer/scripts/context_kg_lint.py ./context-kg` 通过。
+- 已验证：`PROTOC=/Users/chuntao.liao/Github/pole-io/specification/source/protoc/protoc-darwin-arm64/bin/protoc RUSTFLAGS='-D warnings' cargo check --workspace` 通过，无 warning。
+- 已验证：`PROTOC=/Users/chuntao.liao/Github/pole-io/specification/source/protoc/protoc-darwin-arm64/bin/protoc RUSTFLAGS='-D warnings' cargo test --workspace` 通过，主库 107 个测试、public API 4 个测试、e2e_tests 64 个测试、doc tests 0 个全部通过。
+- 已验证：`git diff --check` 通过。
 
 ## 本轮计划：治理匹配性能测试与 API path 索引设计
 
@@ -826,6 +1058,37 @@ sources: 1
 - 已验证：`PROTOC=/Users/chuntao.liao/Github/pole-io/specification/source/protoc/protoc-darwin-arm64/bin/protoc RUSTFLAGS='-D warnings' cargo check --workspace` 通过，无 warning。
 - 已验证：`PROTOC=/Users/chuntao.liao/Github/pole-io/specification/source/protoc/protoc-darwin-arm64/bin/protoc RUSTFLAGS='-D warnings' cargo test --workspace` 通过，主库 102 个测试、`tests/public_api.rs` 1 个测试、e2e crate 64 个测试、doc tests 0 个全部通过。
 - 剩余风险：fault-detect 使用固定 `127.0.0.1:18080` 探测端口；真实 e2e 环境如果并行运行或端口被占用会失败。当前工作区仍包含大量此前主功能改动和 untracked 新目录，提交前需要按最终变更范围统一 review/stage。
+
+## 本轮计划：托管服务身份发现
+
+- [x] 在 `global.client.serviceIdentityDiscovery` 中增加可选的 namespace/service/controlPlaneToken 配置，不破坏未启用身份发现的现有 SDK 配置
+- [x] 使 Discover gRPC 长连接在建立时通过 `authorization` metadata 携带 service token
+- [x] 增加 `SERVICE_IDENTITY` 请求键、响应路由和 SDK 内部 descriptor 缓存 handler
+- [x] 补充单测并执行定向测试、格式化、workspace 检查
+
+## 本轮托管服务身份 review
+
+- 已完成：新增可选 `global.client.serviceIdentityDiscovery` 配置；未配置时保持原有 SDK 行为，配置存在时校验 namespace/service/controlPlaneToken，并从 Debug 输出中脱敏 control-plane token，避免与数据面 descriptor 混淆。
+- 已完成：Discover 长连接及其他 Discover gRPC 请求通过 `authorization` metadata 携带 control-plane service token；本阶段保持原有单次 stream 生命周期，不引入无法完整 replay 全部 watch 的半成品重连。
+- 已完成：SDK 启动时自动订阅 `SERVICE_IDENTITY`，按 namespace/service 路由响应，只在 Engine 内部内存保存 descriptor，不落盘、不暴露用户编辑入口；拒绝 namespace/service 错配或 subject/revision 缺失的 descriptor。首次成功缓存 revision 后不再参与每 2 秒普通 watch 轮询，避免稳定身份反复查库。
+- 已验证：在本地最新 specification 下，中间集成版 `RUSTFLAGS='-D warnings' cargo test --workspace` 通过，当时主库 131 个测试、public API 5 个测试及 e2e workspace 全部通过；最终语义收敛后 identity/config/connector 6 个定向测试、identity handler 3 个定向测试和 `RUSTFLAGS='-D warnings' cargo check --workspace` 通过。联编通过 Cargo path patch 使用未发布的本地 spec；正式依赖需在 spec 发布新 tag 后更新。
+- 剩余联编前置：本地 spec 尚包含与本任务无关的 `HealthCheck.tcp/http` 未发布改动；workspace 验证时临时补齐 Rust 构造字段后已恢复，最终身份改动不夹带该无关适配。
+
+## 本轮计划：调用鉴权模式安全执行
+
+- [x] 核对 traffic policy 实际请求上下文可用的 Header 与身份信息
+- [x] `CUSTOM_HEADER` 仅按 `header_name/value_sha256` 执行 SHA-256 精确验证
+- [x] `MANAGED_IDENTITY` 在 AuthenticatedCaller 尚未落地前 fail-closed
+- [x] 保持无 authentication 的历史规则兼容，补测并完成定向验证
+
+## 本轮调用鉴权模式 review
+
+- 已完成：鉴权模式从 policy 的普通 `traffic_match_rule` 中独立为规则级门禁；只有 API 候选命中后才执行鉴权，鉴权失败直接拒绝，不会因为缺少 `traffic_match_rule` 而把新鉴权模式变成无条件放行。
+- 已完成：`CUSTOM_HEADER` 只读取 spec 下发的 `header_name/value_sha256`，对请求 Header 原始值计算 SHA-256 后按摘要字节比较；不使用 write-only 明文 `value` 作为数据面后备，缺失、非法或不匹配摘要均 fail-closed。
+- 已完成：当前 `RouteContext` 只有普通 Header/Method/Path 等 label provider，没有可信 `AuthenticatedCaller`。因此 `MANAGED_IDENTITY` 明确 fail-closed，不从 caller、Header 或 metadata 猜测服务身份；待 WorkloadCredential 入站验证完成后再接入受信调用方上下文。
+- 已完成：没有 `authentication` 的历史规则，以及显式且字段一致的 `LEGACY_REQUEST_MATCH`，继续保持原有 request matcher 和“缺少 traffic match 表示匹配”的兼容语义；未知模式或模式字段混用直接拒绝。
+- 已验证：新增 `sha2 0.10.9` 直接依赖；鉴权/镜像/mock policy 定向测试 14 个全部通过。
+- 已验证：使用本地最新 specification path patch 执行 `RUSTFLAGS='-D warnings' cargo check --workspace` 和 `cargo test --workspace` 全部通过；主库 136 个测试、public API 5 个测试及 e2e workspace 测试全部通过。联编期间临时适配本地 spec 的无关 `HealthCheck.tcp/http` 字段，验证后已恢复，未夹带该变更。
 
 ## 相关页面
 

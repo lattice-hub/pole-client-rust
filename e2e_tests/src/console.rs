@@ -88,7 +88,10 @@ impl ConsoleClient {
         let url = format!("{}{}", self.base_url, normalize_path(path));
         let mut request = self.client.request(method, url);
         if let Some(token) = &self.token {
-            request = request.bearer_auth(token);
+            request = request
+                .header("Authorization", token)
+                .header("X-Polaris-Token", token)
+                .header("Polaris-Token", token);
         }
         if let Some(body) = body {
             request = request.json(body);

@@ -15,9 +15,7 @@
 
 use crate::core::config::config::Configuration;
 use crate::core::config::config_file::ConfigFilter;
-use crate::core::config::consumer::{
-    CircuitBreakerConfig, ServiceRouterConfig, ServiceRouterPluginConfig,
-};
+use crate::core::config::consumer::{ServiceRouterConfig, ServiceRouterPluginConfig};
 use crate::core::config::global::{LocalCacheConfig, LocationConfig, ServerConnectorConfig};
 use crate::core::model::error::{ErrorCode, PoleError};
 use crate::core::model::ClientContext;
@@ -126,16 +124,16 @@ global:
     retryInterval: 1ms
     reportInterval: 1s
   serverConnectors:
-    addresses:
-      - discover://127.0.0.1:8091
-    protocol: grpc
-    connectTimeout: 1ms
-    serverSwitchInterval: 1s
-    messageTimeout: 1ms
-    connectionIdleTimeout: 1s
-    reconnectInterval: 1ms
-  statReporter:
-    enable: false
+    discover:
+      addresses: [127.0.0.1:8091]
+      protocol: grpc
+      connectTimeout: 1ms
+      messageTimeout: 1ms
+    config:
+      addresses: [127.0.0.1:8093]
+      protocol: grpc
+      connectTimeout: 1ms
+      messageTimeout: 1ms
   location: {}
   client:
     id: test-client
@@ -145,9 +143,6 @@ consumer:
     beforeChain: []
     coreChain: []
     afterChain: []
-  circuitBreaker:
-    enable: false
-    enableRemotePull: false
   loadBalancer:
     defaultPolicy: weightedRandom
     plugins: []
@@ -160,17 +155,7 @@ consumer:
     persistEnable: false
     persistDir: ./target/test-cache
 provider:
-  rateLimit:
-    enable: false
-    service: pole.limiter
-    namespace: Pole
-    maxWindowCount: 1
-    fallbackOnExceedWindowCount: pass
-    remoteSyncTimeout: 1ms
-    maxQueuingTime: 1ms
-    reportMetrics: false
   lossless:
-    enable: false
     host: 127.0.0.1
     port: 0
     delayRegisterInterval: 1ms
@@ -202,6 +187,15 @@ config:
         service_routers: None,
         load_balancers: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
     })
+}
+
+#[cfg(test)]
+pub(crate) fn test_extensions_with_router_container(
+    router_container: RouterContainer,
+) -> Arc<Extensions> {
+    let mut extensions = test_extensions_without_plugins().as_ref().clone();
+    extensions.service_routers = Some(Arc::new(router_container));
+    Arc::new(extensions)
 }
 
 impl Extensions {
@@ -268,7 +262,7 @@ impl Extensions {
         }
 
         // 初始化 circuit_breaker
-        let ret = self.load_circuit_breaker(&conf.consumer.circuit_breaker);
+        let ret = self.load_circuit_breaker();
         if ret.is_err() {
             return Err(ret.err().unwrap());
         }
@@ -302,10 +296,17 @@ impl Extensions {
         &mut self,
         connector_opt: &ServerConnectorConfig,
     ) -> Result<(), PoleError> {
-        if connector_opt.addresses.is_empty() {
+        if connector_opt.discover.addresses.is_empty() || connector_opt.config.addresses.is_empty()
+        {
             return Err(PoleError::new(
                 ErrorCode::InvalidConfig,
-                "server_connector addresses is empty".to_string(),
+                "discover and config connector addresses must not be empty".to_string(),
+            ));
+        }
+        if connector_opt.discover.protocol != connector_opt.config.protocol {
+            return Err(PoleError::new(
+                ErrorCode::InvalidConfig,
+                "discover and config connectors must use the same protocol".to_string(),
             ));
         }
 
@@ -435,25 +436,19 @@ impl Extensions {
         Ok(())
     }
 
-    fn load_circuit_breaker(&mut self, opt: &CircuitBreakerConfig) -> Result<(), PoleError> {
-        self.circuit_breaker = Self::build_circuit_breaker(opt)?;
+    fn load_circuit_breaker(&mut self) -> Result<(), PoleError> {
+        self.circuit_breaker = Some(Self::build_circuit_breaker()?);
         Ok(())
     }
 
-    fn build_circuit_breaker(
-        opt: &CircuitBreakerConfig,
-    ) -> Result<Option<Arc<Box<dyn CircuitBreaker>>>, PoleError> {
-        if !opt.enable {
-            return Ok(None);
-        }
-
+    fn build_circuit_breaker() -> Result<Arc<Box<dyn CircuitBreaker>>, PoleError> {
         let supplier = CLIENT_PLUGIN_CONTAINER
             .read()
             .unwrap()
             .get_circuit_breaker_supplier("composite");
         let mut breaker = supplier();
         breaker.init();
-        Ok(Some(Arc::new(breaker)))
+        Ok(Arc::new(breaker))
     }
 
     fn load_location_providers(&mut self, opt: &LocationConfig) -> Result<(), PoleError> {
@@ -673,13 +668,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn load_circuit_breaker_installs_composite_when_enabled() {
-        let breaker = Extensions::build_circuit_breaker(&CircuitBreakerConfig {
-            enable: true,
-            enable_remote_pull: true,
-        })
-        .unwrap()
-        .unwrap();
+    fn load_circuit_breaker_always_installs_composite() {
+        let breaker = Extensions::build_circuit_breaker().unwrap();
 
         assert_eq!(breaker.name(), "composite");
     }
@@ -687,11 +677,12 @@ mod tests {
 
 pub fn acquire_client_self_ip(conf: Arc<Configuration>) -> String {
     // 和北极星服务端做一个 TCP connect 连接获取 本地 IP 地址
-    let host = conf.global.server_connectors.addresses.first();
-
-    let mut origin_endpoint = host.unwrap().as_str().trim_start_matches("discover://");
-    origin_endpoint = origin_endpoint.trim_start_matches("config://");
-    let addrs = (origin_endpoint).to_socket_addrs();
+    let host = conf.global.server_connectors.discover.addresses.first();
+    let Some(host) = host else {
+        crate::error!("acquire_client_self_ip discover connector address is empty");
+        return "127.0.0.1".to_string();
+    };
+    let addrs = host.to_socket_addrs();
     match addrs {
         Ok(mut addr_iter) => {
             if let Some(addr) = addr_iter.next() {

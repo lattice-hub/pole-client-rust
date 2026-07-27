@@ -6,7 +6,6 @@ use std::{
     time::Duration,
 };
 
-use pole_rust::core::context::SDKContext;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::time::timeout;
@@ -145,7 +144,7 @@ async fn run_connectivity(ctx: &CaseContext<'_>, name: &str, _elapsed: Duration)
         return CaseReport::failed(name, start.elapsed(), err.to_string());
     }
 
-    match SDKContext::create_by_addresses(ctx.config.sdk_addresses()) {
+    match ctx.config.create_sdk_context() {
         Ok(_sdk) => CaseReport::passed(
             name,
             start.elapsed(),
@@ -165,7 +164,7 @@ async fn run_service_discovery(ctx: &CaseContext<'_>, name: &str) -> CaseReport 
     };
 
     let start = std::time::Instant::now();
-    let sdk = match SDKContext::create_by_addresses(ctx.config.sdk_addresses()) {
+    let sdk = match ctx.config.create_sdk_context() {
         Ok(sdk) => Arc::new(sdk),
         Err(err) => {
             return CaseReport::failed(name, start.elapsed(), format!("sdk init failed: {err}"))
@@ -233,7 +232,7 @@ async fn run_config_center(ctx: &CaseContext<'_>, name: &str) -> CaseReport {
     use pole_rust::config::api::{new_config_file_api_by_context, ConfigFileAPI};
 
     let start = std::time::Instant::now();
-    let sdk = match SDKContext::create_by_addresses(ctx.config.sdk_addresses()) {
+    let sdk = match ctx.config.create_sdk_context() {
         Ok(sdk) => Arc::new(sdk),
         Err(err) => {
             return CaseReport::failed(name, start.elapsed(), format!("sdk init failed: {err}"))
@@ -423,7 +422,7 @@ async fn run_mock_behavior(
 ) -> Result<pole_rust::discovery::req::InstanceResponse, pole_rust::core::model::error::PoleError> {
     use pole_rust::discovery::api::{new_consumer_api_by_context, ConsumerAPI};
 
-    let sdk = Arc::new(SDKContext::create_by_addresses(ctx.config.sdk_addresses())?);
+    let sdk = Arc::new(ctx.config.create_sdk_context()?);
     let consumer = new_consumer_api_by_context(sdk)?;
     consumer
         .get_one_instance(mock_flow_inputs(resource).get_one)
@@ -436,7 +435,7 @@ async fn run_security_behavior(
 ) -> Result<pole_rust::discovery::req::InstanceResponse, pole_rust::core::model::error::PoleError> {
     use pole_rust::discovery::api::{new_consumer_api_by_context, ConsumerAPI};
 
-    let sdk = Arc::new(SDKContext::create_by_addresses(ctx.config.sdk_addresses())?);
+    let sdk = Arc::new(ctx.config.create_sdk_context()?);
     let consumer = new_consumer_api_by_context(sdk)?;
     consumer
         .get_one_instance(security_flow_inputs(resource).get_one)
@@ -458,7 +457,7 @@ async fn run_ratelimit_behavior(
 ) {
     use pole_rust::traffic::ratelimit::api::{new_ratelimit_api_by_context, RateLimitAPI};
 
-    let sdk = match SDKContext::create_by_addresses(ctx.config.sdk_addresses()) {
+    let sdk = match ctx.config.create_sdk_context() {
         Ok(sdk) => Arc::new(sdk),
         Err(err) => return (Err(err.clone()), Err(err)),
     };
@@ -480,7 +479,7 @@ async fn run_instance_route_behavior(
         new_consumer_api_by_context, new_provider_api_by_context, ConsumerAPI, ProviderAPI,
     };
 
-    let sdk = Arc::new(SDKContext::create_by_addresses(ctx.config.sdk_addresses())?);
+    let sdk = Arc::new(ctx.config.create_sdk_context()?);
     let provider = new_provider_api_by_context(sdk.clone())?;
     let consumer = new_consumer_api_by_context(sdk)?;
 
@@ -518,7 +517,7 @@ async fn run_circuitbreaker_behavior(
         core::model::circuitbreaker::{ResourceStat, RetStatus},
     };
 
-    let sdk = Arc::new(SDKContext::create_by_addresses(ctx.config.sdk_addresses())?);
+    let sdk = Arc::new(ctx.config.create_sdk_context()?);
     let api = DefaultCircuitBreakerAPI::new(sdk);
     for _ in 0..2 {
         api.report_stat(ResourceStat {
@@ -561,7 +560,8 @@ async fn run_fault_detect_behavior(
     });
 
     let sdk = Arc::new(
-        SDKContext::create_by_addresses(ctx.config.sdk_addresses())
+        ctx.config
+            .create_sdk_context()
             .map_err(|err| format!("sdk init failed: {err}"))?,
     );
     let provider = new_provider_api_by_context(sdk.clone())
@@ -634,7 +634,8 @@ async fn run_lossless_behavior(
     use tokio::net::TcpListener;
 
     let sdk = Arc::new(
-        SDKContext::create_by_addresses(ctx.config.sdk_addresses())
+        ctx.config
+            .create_sdk_context()
             .map_err(|err| format!("sdk init failed: {err}"))?,
     );
     let consumer = new_consumer_api_by_context(sdk)
@@ -649,7 +650,9 @@ async fn run_lossless_behavior(
         .find_map(|rule| rule.downcast_ref::<LosslessRule>().cloned())
         .ok_or_else(|| "lossless rule did not downcast to LosslessRule".to_string())?;
 
-    let lossless_context = SDKContext::create_by_addresses(ctx.config.sdk_addresses())
+    let lossless_context = ctx
+        .config
+        .create_sdk_context()
         .map_err(|err| format!("lossless sdk init failed: {err}"))?;
     let lossless = new_lossless_api_by_context(lossless_context)
         .map_err(|err| format!("lossless api init failed: {err}"))?;
@@ -820,7 +823,8 @@ async fn run_mirror_behavior(
     });
 
     let sdk = Arc::new(
-        SDKContext::create_by_addresses(ctx.config.sdk_addresses())
+        ctx.config
+            .create_sdk_context()
             .map_err(|err| format!("sdk init failed: {err}"))?,
     );
     let provider = new_provider_api_by_context(sdk.clone())

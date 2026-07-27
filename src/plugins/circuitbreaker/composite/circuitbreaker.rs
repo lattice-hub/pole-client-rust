@@ -34,6 +34,7 @@ fn new_circuir_breaker() -> Box<dyn CircuitBreaker> {
 }
 
 pub struct CompositeCircuitBreaker {
+    // rules 是当前服务规则快照；具体资源的运行时状态在 states 中按 resource_key 隔离。
     rules: Mutex<Vec<CircuitBreakerRule>>,
     states: Mutex<HashMap<String, Vec<CircuitBreakerRuleState>>>,
 }
@@ -59,7 +60,13 @@ impl CompositeCircuitBreaker {
     }
 
     fn update_rules_inner(&self, rules: Vec<CircuitBreakerRule>) {
-        *self.rules.lock().unwrap() = rules;
+        let mut current_rules = self.rules.lock().unwrap();
+        if *current_rules == rules {
+            return;
+        }
+        // 只有规则内容真实变化时才清空运行态，周期性刷新相同快照不能丢失统计。
+        *current_rules = rules;
+        drop(current_rules);
         self.states.lock().unwrap().clear();
     }
 
@@ -72,6 +79,7 @@ impl CompositeCircuitBreaker {
         resource_key: String,
         rules: Vec<CircuitBreakerRule>,
     ) -> &'a mut Vec<CircuitBreakerRuleState> {
+        // 每个资源第一次上报统计时，基于当前规则快照创建独立状态机集合。
         states.entry(resource_key).or_insert_with(|| {
             rules
                 .into_iter()
@@ -105,11 +113,13 @@ impl CircuitBreakerRuleState {
     fn report_status(&mut self, ret_status: &RetStatus) {
         self.refresh_status();
 
+        // Open 状态下拒绝请求，不再消费失败统计；等待 sleep window 转半开。
         if self.status == Status::Open {
             return;
         }
 
         if self.status == Status::HalfOpen {
+            // 半开状态用连续成功数判断恢复，任一错误立即重新打开。
             if is_error_status(ret_status) {
                 self.open();
             } else {
@@ -161,6 +171,7 @@ impl CircuitBreakerRuleState {
     }
 
     fn refresh_status(&mut self) {
+        // Open 到 HalfOpen 的转换由访问时懒触发，避免额外后台定时器。
         if self.status != Status::Open {
             return;
         }
@@ -195,6 +206,7 @@ impl CircuitBreakerRuleState {
             return false;
         }
 
+        // 当前实现只处理连续错误触发条件，其它触发类型保留给后续扩展。
         for trigger in self
             .rule
             .block_configs
@@ -224,7 +236,69 @@ fn is_error_status(status: &RetStatus) -> bool {
     )
 }
 
+fn applicable_rules(
+    resource: &Resource,
+    rules: Vec<CircuitBreakerRule>,
+) -> Vec<CircuitBreakerRule> {
+    let mut rules = rules
+        .into_iter()
+        .filter(|rule| rule.enable && rule_matches_resource(rule, resource))
+        .collect::<Vec<_>>();
+    // 稳定排序保证同优先级规则继续沿用控制面返回顺序。
+    rules.sort_by(|left, right| left.priority.cmp(&right.priority));
+    rules
+}
+
+fn rule_matches_resource(rule: &CircuitBreakerRule, resource: &Resource) -> bool {
+    let Some(matcher) = rule.rule_matcher.as_ref() else {
+        return true;
+    };
+    let (caller, callee) = match resource {
+        Resource::ServiceResource(resource) => (resource.caller.as_ref(), Some(&resource.callee)),
+        Resource::MethodResource(resource) => (resource.caller.as_ref(), Some(&resource.callee)),
+        Resource::InstanceResource(_) => (None, None),
+    };
+
+    matcher
+        .source
+        .as_ref()
+        .map(|source| {
+            service_selector_matches(source.namespace.as_str(), source.service.as_str(), caller)
+        })
+        .unwrap_or(true)
+        && matcher
+            .destination
+            .as_ref()
+            .map(|destination| {
+                service_selector_matches(
+                    destination.namespace.as_str(),
+                    destination.service.as_str(),
+                    callee,
+                )
+            })
+            .unwrap_or(true)
+}
+
+fn service_selector_matches(
+    namespace: &str,
+    service: &str,
+    actual: Option<&crate::core::model::naming::ServiceKey>,
+) -> bool {
+    let namespace_is_wildcard = namespace.is_empty() || namespace == "*";
+    let service_is_wildcard = service.is_empty() || service == "*";
+    if namespace_is_wildcard && service_is_wildcard {
+        return true;
+    }
+    actual
+        .map(|actual| {
+            (namespace_is_wildcard || namespace == actual.namespace)
+                && (service_is_wildcard || service == actual.name)
+        })
+        .unwrap_or(false)
+}
+
 fn resource_key(resource: &Resource) -> String {
+    // 服务级和方法级资源分别隔离统计，caller 缺失时用 "*" 表示全主调。
     match resource {
         Resource::ServiceResource(resource) => format!(
             "service#{}#{}",
@@ -276,6 +350,7 @@ impl CircuitBreaker for CompositeCircuitBreaker {
         let key = resource_key(&_resource);
         let mut states = self.states.lock().unwrap();
         let Some(resource_states) = states.get_mut(&key) else {
+            // 尚未有统计上报的资源默认 Close，避免规则加载后立即阻断。
             return Ok(CircuitBreakerStatus {
                 status: Status::Close,
                 start_ms: 0,
@@ -288,6 +363,7 @@ impl CircuitBreaker for CompositeCircuitBreaker {
         for state in resource_states.iter_mut() {
             let status = state.current_status();
             if status == Status::Open {
+                // 任一规则打开即阻断资源。
                 return Ok(CircuitBreakerStatus {
                     status: Status::Open,
                     start_ms: 0,
@@ -297,6 +373,7 @@ impl CircuitBreaker for CompositeCircuitBreaker {
                 });
             }
             if status == Status::HalfOpen && half_open_state.is_none() {
+                // 半开不直接阻断，由上层决定是否试探放行。
                 half_open_state = Some(state.rule_name());
             }
         }
@@ -321,7 +398,7 @@ impl CircuitBreaker for CompositeCircuitBreaker {
     }
     /// report_stat 上报统计信息
     async fn report_stat(&self, stat: ResourceStat) -> Result<(), PoleError> {
-        let rules = self.rules_snapshot();
+        let rules = applicable_rules(&stat.resource, self.rules_snapshot());
         let mut states = self.states.lock().unwrap();
         let resource_states =
             Self::states_for_resource(&mut states, resource_key(&stat.resource), rules);
@@ -337,8 +414,8 @@ mod tests {
     use super::*;
     use crate::core::model::circuitbreaker::RetStatus;
     use pole_specification::v1::{
-        trigger_condition, BlockConfig, CircuitBreakerPolicy, CircuitBreakerRule, RecoverCondition,
-        TriggerCondition,
+        rule_matcher, trigger_condition, BlockConfig, CircuitBreakerPolicy, CircuitBreakerRule,
+        RecoverCondition, RuleMatcher, TriggerCondition,
     };
 
     fn consecutive_error_rule(error_count: u32) -> CircuitBreakerRule {
@@ -383,6 +460,39 @@ mod tests {
                 name: service.to_string(),
             },
         ))
+    }
+
+    fn service_resource_with_caller(caller: &str, callee: &str) -> Resource {
+        Resource::ServiceResource(
+            crate::core::model::circuitbreaker::ServiceResource::new_waith_caller(
+                crate::core::model::naming::ServiceKey {
+                    namespace: "default".to_string(),
+                    name: caller.to_string(),
+                },
+                crate::core::model::naming::ServiceKey {
+                    namespace: "default".to_string(),
+                    name: callee.to_string(),
+                },
+            ),
+        )
+    }
+
+    fn matched_rule(name: &str, priority: u32, caller: &str, callee: &str) -> CircuitBreakerRule {
+        let mut rule = consecutive_error_rule(1);
+        rule.name = name.to_string();
+        rule.priority = priority;
+        rule.rule_matcher = Some(RuleMatcher {
+            source: Some(rule_matcher::SourceService {
+                namespace: "default".to_string(),
+                service: caller.to_string(),
+            }),
+            destination: Some(rule_matcher::DestinationService {
+                namespace: "default".to_string(),
+                service: callee.to_string(),
+                ..rule_matcher::DestinationService::default()
+            }),
+        });
+        rule
     }
 
     #[test]
@@ -450,6 +560,64 @@ mod tests {
 
         assert_eq!(status.status, Status::Open);
         assert_eq!(status.circuit_breaker, "consecutive-error");
+    }
+
+    #[tokio::test]
+    async fn refreshing_identical_rules_preserves_consecutive_error_state() {
+        let rule = consecutive_error_rule(2);
+        let breaker = CompositeCircuitBreaker::new_with_rules(vec![rule.clone()]);
+
+        breaker
+            .report_stat(ResourceStat {
+                resource: service_resource("svc-a"),
+                ret_code: "500".to_string(),
+                delay: std::time::Duration::from_millis(10),
+                status: RetStatus::RetFail,
+            })
+            .await
+            .unwrap();
+        breaker.update_rules(vec![rule]);
+        breaker
+            .report_stat(ResourceStat {
+                resource: service_resource("svc-a"),
+                ret_code: "500".to_string(),
+                delay: std::time::Duration::from_millis(10),
+                status: RetStatus::RetFail,
+            })
+            .await
+            .unwrap();
+
+        let status = breaker
+            .check_resource(service_resource("svc-a"))
+            .await
+            .unwrap();
+        assert_eq!(status.status, Status::Open);
+    }
+
+    #[tokio::test]
+    async fn circuit_breaker_filters_rule_matchers_and_applies_priority_stably() {
+        let breaker = CompositeCircuitBreaker::new_with_rules(vec![
+            matched_rule("unmatched", 0, "other-caller", "svc-a"),
+            matched_rule("lower-priority", 20, "frontend", "svc-a"),
+            matched_rule("higher-priority", 10, "frontend", "svc-a"),
+        ]);
+
+        breaker
+            .report_stat(ResourceStat {
+                resource: service_resource_with_caller("frontend", "svc-a"),
+                ret_code: "500".to_string(),
+                delay: std::time::Duration::from_millis(10),
+                status: RetStatus::RetFail,
+            })
+            .await
+            .unwrap();
+
+        let status = breaker
+            .check_resource(service_resource_with_caller("frontend", "svc-a"))
+            .await
+            .unwrap();
+        assert_eq!(status.status, Status::Open);
+        assert_eq!(status.circuit_breaker, "higher-priority");
     }
 
     #[tokio::test]

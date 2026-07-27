@@ -67,6 +67,8 @@ impl DefaultCircuitBreakerAPI {
         service: String,
         timeout: std::time::Duration,
     ) -> Result<Vec<CircuitBreakerRule>, PoleError> {
+        // 熔断规则按被调服务维度从服务规则缓存加载，具体资源粒度
+        // 由 CircuitBreakerFlow 在 check/report 时再区分服务或方法。
         let service_rule = self
             .context
             .get_engine()
@@ -81,6 +83,7 @@ impl DefaultCircuitBreakerAPI {
     }
 
     async fn refresh_rules_for_resource(&self, resource: &Resource) -> Result<(), PoleError> {
+        // InstanceResource 暂不具备独立规则服务键，保持静默跳过，避免误拉取空服务规则。
         let Some(service_key) = circuit_breaker_rule_service_key(resource) else {
             return Ok(());
         };
@@ -111,6 +114,8 @@ struct DefaultCircuitBreakerRuleRefresher {
 #[async_trait::async_trait]
 impl CircuitBreakerRuleRefresher for DefaultCircuitBreakerRuleRefresher {
     async fn refresh_rules_for_resource(&self, resource: &Resource) -> Result<(), PoleError> {
+        // InvokeHandler 在检查和上报前都会刷新一次，保证长生命周期 handler
+        // 能看到远端规则变化，不依赖调用方重建 API。
         let Some(service_key) = circuit_breaker_rule_service_key(resource) else {
             return Ok(());
         };
@@ -135,6 +140,7 @@ impl CircuitBreakerRuleRefresher for DefaultCircuitBreakerRuleRefresher {
 fn circuit_breaker_rules_from_service_rules(
     rules: Vec<Box<dyn std::any::Any + Send>>,
 ) -> Result<Vec<CircuitBreakerRule>, PoleError> {
+    // ResourceCache 以 Any 承载不同治理规则，这里是熔断 API 的类型边界。
     let mut circuit_breaker_rules = Vec::with_capacity(rules.len());
     for rule in rules {
         let type_id = rule.type_id();
@@ -155,6 +161,7 @@ fn circuit_breaker_rules_from_service_rules(
 }
 
 fn circuit_breaker_rule_service_key(resource: &Resource) -> Option<ServiceKey> {
+    // 熔断规则发布仍以服务为主键；方法级资源复用被调服务键加载同一组规则。
     match resource {
         Resource::ServiceResource(resource) => Some(resource.callee.clone()),
         Resource::MethodResource(resource) => Some(resource.callee.clone()),

@@ -2,7 +2,7 @@
 title: 知识库索引
 tags: [meta, index]
 links: [schema, log]
-updated: 2026-07-04
+updated: 2026-07-17
 sources: 1
 ---
 
@@ -20,6 +20,7 @@ sources: 1
 ## Technical
 
 - [[sdk-module-architecture]] — SDK 模块与运行时架构 | technical, architecture, sdk
+- [[observability-architecture]] — Rust SDK 观测能力架构 | technical, observability, sdk
 - [[traffic-governance-architecture]] — 流量治理域架构 | technical, traffic, governance
 
 ## Quality

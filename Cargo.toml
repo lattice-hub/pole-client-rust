@@ -19,7 +19,7 @@ exclude = ["examples/*", "benches/*", "tests/*", "e2e_tests/*", ".gitignore"]
 [dependencies]
 
 # pole spec dep
-pole-specification = { package = "pole-specification", git = "https://github.com/lattice-hub/specification.git", tag = "v0.1.0-ALPHA.35" }
+pole-specification = { package = "pole-specification", git = "https://github.com/lattice-hub/specification.git", tag = "v0.1.0-ALPHA.38" }
 
 # common dep
 bytes = {version = "1.4.0"}
@@ -56,7 +56,7 @@ once_cell = {version = "1.19.0"}
 prost = {version = "0.14.4"}
 prost-build = {version = "0.14.4"}
 prost-types = {version = "0.14.4"}
-tonic = {version = "0.14.6"}
+tonic = {version = "0.14.6", features = ["tls-webpki-roots"]}
 tonic-prost = {version = "0.14.2"}
 
 # logging
@@ -68,6 +68,7 @@ tracing-subscriber = {version = "0.3", features = ["default"]}
 aes = {version = "0.7.4"}
 base64 = {version = "0.22.1"}
 block-modes = {version = "0.8.1"}
+ed25519-dalek = {version = "2.1.1"}
 hex = {version = "0.4.3"}
 rand = {version = "0.8.4"}
 rsa = {version = "0.9.6"}

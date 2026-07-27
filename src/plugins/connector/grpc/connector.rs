@@ -14,6 +14,7 @@
 // specific language governing permissions and limitations under the License.
 
 use crate::core::config::global::ServerConnectorConfig;
+use crate::core::config::global::ServiceIdentityDiscoveryConfig;
 use crate::core::model::cache::{EventType, RemoteData};
 use crate::core::model::config::{ConfigFileRequest, ConfigPublishRequest, ConfigReleaseRequest};
 use crate::core::model::error::ErrorCode::{ServerError, ServiceNotFound};
@@ -27,10 +28,14 @@ use crate::core::plugin::plugins::Plugin;
 use crate::{debug, error, info};
 use pole_specification::v1::config_grpc_client::ConfigGrpcClient;
 use pole_specification::v1::discover_grpc_client::DiscoverGrpcClient;
+use pole_specification::v1::workload_credential_service_client::WorkloadCredentialServiceClient;
 use pole_specification::v1::Code::{ExecuteSuccess, ExistedResource, NotFoundResource};
 use pole_specification::v1::{
-    discover_request::DiscoverRequestType, Code, ConfigDiscoverRequest, ConfigDiscoverResponse,
-    DiscoverRequest, DiscoverResponse, HeartbeatsRequest, InstanceHeartbeat, Service,
+    discover_request::DiscoverRequestType,
+    match_string::{MatchStringType, ValueType},
+    Caller, ClientLabel, Code, ConfigDiscoverRequest, ConfigDiscoverResponse, DiscoverFilter,
+    DiscoverRequest, DiscoverResponse, HeartbeatsRequest, InstanceHeartbeat, MatchString, Service,
+    WorkloadCredentialIssueRequest, WorkloadCredentialRenewRequest, WorkloadCredentialResponse,
 };
 use std::cmp::PartialEq;
 use std::collections::HashMap;
@@ -53,6 +58,25 @@ fn response_code(code: u32) -> Code {
     Code::try_from(code as i32).unwrap_or(Code::Unknown)
 }
 
+fn attach_client_labels(req: &mut DiscoverRequest, labels: &HashMap<String, String>) {
+    let mut client_labels = labels
+        .iter()
+        .map(|(key, value)| ClientLabel {
+            key: key.clone(),
+            value: Some(MatchString {
+                r#type: MatchStringType::Exact.into(),
+                value: value.clone(),
+                value_type: ValueType::Text.into(),
+            }),
+        })
+        .collect::<Vec<_>>();
+    client_labels.sort_by(|left, right| left.key.cmp(&right.key));
+
+    let filter = req.filter.get_or_insert_with(DiscoverFilter::default);
+    let caller = filter.caller.get_or_insert_with(Caller::default);
+    caller.labels = client_labels;
+}
+
 fn service_rule_watch_key(resp: &DiscoverResponse, event_type: EventType) -> Option<String> {
     let svc = resp.service.as_ref()?;
     Some(format!(
@@ -63,7 +87,10 @@ fn service_rule_watch_key(resp: &DiscoverResponse, event_type: EventType) -> Opt
     ))
 }
 
-fn discover_response_watch_key(resp: &DiscoverResponse) -> Option<String> {
+fn discover_response_watch_key(
+    resp: &DiscoverResponse,
+    identity: Option<&ServiceIdentityDiscoveryConfig>,
+) -> Option<String> {
     match resp.r#type() {
         pole_specification::v1::discover_response::DiscoverResponseType::Services => {
             resp.service.as_ref().map(|svc| svc.namespace.clone())
@@ -98,8 +125,113 @@ fn discover_response_watch_key(resp: &DiscoverResponse) -> Option<String> {
         pole_specification::v1::discover_response::DiscoverResponseType::TrafficMockRule => {
             service_rule_watch_key(resp, EventType::TrafficMockRule)
         }
+        pole_specification::v1::discover_response::DiscoverResponseType::ServiceIdentity => {
+            resp.service_identity.as_ref().map(|identity| {
+                format!(
+                    "{:?}#{}#{}",
+                    EventType::ServiceIdentity,
+                    identity.namespace.clone(),
+                    identity.service.clone()
+                )
+            })
+        }
+        pole_specification::v1::discover_response::DiscoverResponseType::ServiceIdentityBundle => {
+            let identity = identity?;
+            resp.service_identity_bundle.as_ref().map(|_| {
+                format!(
+                    "{:?}#{}#{}",
+                    EventType::ServiceIdentityBundle,
+                    identity.namespace,
+                    identity.service
+                )
+            })
+        }
         _ => None,
     }
+}
+
+fn discover_response_revision(resp: &DiscoverResponse) -> Option<String> {
+    match resp.r#type() {
+        pole_specification::v1::discover_response::DiscoverResponseType::ServiceIdentity => resp
+            .service_identity
+            .as_ref()
+            .filter(|identity| {
+                !identity.subject.trim().is_empty()
+                    && !identity.namespace.trim().is_empty()
+                    && !identity.service.trim().is_empty()
+                    && !identity.revision.trim().is_empty()
+            })
+            .map(|identity| identity.revision.clone()),
+        pole_specification::v1::discover_response::DiscoverResponseType::ServiceIdentityBundle => {
+            resp.service_identity_bundle
+                .as_ref()
+                .filter(|bundle| {
+                    bundle.schema_version == 1
+                        && bundle.sequence > 0
+                        && !bundle.trust_domain.trim().is_empty()
+                        && !bundle.issuer.trim().is_empty()
+                        && !bundle.version.trim().is_empty()
+                })
+                .map(|bundle| bundle.version.clone())
+        }
+        _ => resp
+            .service
+            .as_ref()
+            .map(|service| service.revision.clone()),
+    }
+}
+
+fn discover_metadata(
+    flow: Option<&str>,
+    identity: Option<&ServiceIdentityDiscoveryConfig>,
+) -> HashMap<String, String> {
+    let mut metadata = HashMap::new();
+    if let Some(flow) = flow {
+        metadata.insert("request-id".to_string(), flow.to_string());
+    }
+    if let Some(identity) = identity {
+        metadata.insert(
+            "authorization".to_string(),
+            identity.control_plane_token.clone(),
+        );
+    }
+    metadata
+}
+
+fn should_refresh_resource(
+    _key: &crate::core::model::cache::ResourceEventKey,
+    _revision: &str,
+) -> bool {
+    true
+}
+
+fn config_response_watch_key(resp: &ConfigDiscoverResponse) -> Option<String> {
+    match resp.r#type() {
+		pole_specification::v1::config_discover_response::ConfigDiscoverResponseType::ConfigFile => {
+			let file = resp.file.as_ref()?;
+			Some(format!(
+				"{:?}#{}#{}#{}",
+				EventType::ConfigFile,
+				file.namespace.clone(),
+				file.group.clone(),
+				file.file_name.clone()
+			))
+		}
+		pole_specification::v1::config_discover_response::ConfigDiscoverResponseType::ConfigFileNames => {
+			let file = resp.file_names.first()?;
+			Some(format!(
+				"{:?}#{}#{}",
+				EventType::ConfigGroup,
+				file.namespace.clone(),
+				file.group.clone()
+			))
+		}
+		pole_specification::v1::config_discover_response::ConfigDiscoverResponseType::ConfigFileGroups => {
+			error!("[pole][config][connector] not support ConfigFileGroups");
+			None
+		}
+		_ => None,
+	}
 }
 
 fn service_contract_discover_request(req: &ServiceContractRequest) -> DiscoverRequest {
@@ -112,6 +244,15 @@ fn service_contract_discover_request(req: &ServiceContractRequest) -> DiscoverRe
         }),
         filter: None,
         ..DiscoverRequest::default()
+    }
+}
+
+fn normalize_config_response_revision(resp: &mut ConfigDiscoverResponse) {
+    if !resp.revision.is_empty() {
+        return;
+    }
+    if let Some(file) = resp.file.as_ref() {
+        resp.revision = file.version.to_string();
     }
 }
 
@@ -141,6 +282,7 @@ struct ResourceHandlerWrapper {
 }
 
 static PLUGIN_NAME: &str = "grpc";
+type ConnectorBuilder = fn(InitConnectorOption) -> Box<dyn Connector>;
 
 #[derive(Clone)]
 pub struct GrpcConnector {
@@ -158,8 +300,12 @@ fn new_connector(opt: InitConnectorOption) -> Box<dyn Connector> {
     let conf = &opt.conf.global.server_connectors.clone();
     let (discover_channel, config_channel) = create_channel(conf);
 
-    let (discover_sender, mut discover_reciver) =
-        run_discover_spec_stream(discover_channel.clone(), opt.runtime.clone()).unwrap();
+    let (discover_sender, mut discover_reciver) = run_discover_spec_stream(
+        discover_channel.clone(),
+        opt.runtime.clone(),
+        opt.conf.global.client.service_identity_discovery.clone(),
+    )
+    .unwrap();
 
     let (config_sender, mut config_reciver) =
         run_config_spec_stream(config_channel.clone(), opt.runtime.clone()).unwrap();
@@ -181,13 +327,17 @@ fn new_connector(opt: InitConnectorOption) -> Box<dyn Connector> {
         loop {
             tokio::select! {
                 discover_ret = discover_reciver.recv() => {
-                    if discover_ret.is_some() {
-                        receive_c.receive_discover_response(discover_ret.unwrap()).await;
+                    if let Some(response) = discover_ret {
+                        receive_c.receive_discover_response(response).await;
+                    } else {
+                        return;
                     }
                 }
                 config_ret = config_reciver.recv() => {
-                    if config_ret.is_some() {
-                        receive_c.receive_config_response(config_ret.unwrap()).await;
+                    if let Some(response) = config_ret {
+                        receive_c.receive_config_response(response).await;
+                    } else {
+                        return;
                     }
                 }
             }
@@ -203,6 +353,9 @@ fn new_connector(opt: InitConnectorOption) -> Box<dyn Connector> {
                 let watch_resources = send_c.watch_resources.read().await;
                 watch_resources.iter().for_each(|(_key, handler)| {
                     let key = handler.handler.interest_resource();
+                    if !should_refresh_resource(&key, &handler.revision) {
+                        return;
+                    }
                     let filter = key.clone().filter;
                     debug!(
                         "[pole][discovery][connector] send discover request: {:?} filter: {:?}",
@@ -213,10 +366,10 @@ fn new_connector(opt: InitConnectorOption) -> Box<dyn Connector> {
                     let discover_request = key.to_discover_request(handler.revision.clone());
                     let config_request = key.to_config_request(handler.revision.clone());
 
-                    if discover_request.is_some() {
-                        send_c.send_naming_discover_request(discover_request.unwrap());
-                    } else {
-                        send_c.send_config_discover_request(config_request.unwrap());
+                    if let Some(request) = discover_request {
+                        send_c.send_naming_discover_request(request);
+                    } else if let Some(request) = config_request {
+                        send_c.send_config_discover_request(request);
                     }
                 });
             }
@@ -228,40 +381,48 @@ fn new_connector(opt: InitConnectorOption) -> Box<dyn Connector> {
 }
 
 fn create_channel(conf: &ServerConnectorConfig) -> (Channel, Channel) {
-    let addresses = conf.addresses.clone();
-    let mut discover_address: Vec<String> = Vec::new();
-    let mut config_address: Vec<String> = Vec::new();
-
-    for ele in addresses {
-        if ele.starts_with("discover://") {
-            discover_address.push(format!("http://{}", ele.trim_start_matches("discover://")));
-        } else if ele.starts_with("config://") {
-            config_address.push(format!("http://{}", ele.trim_start_matches("config://")));
-        }
-    }
+    let discover_address = conf
+        .discover
+        .addresses
+        .iter()
+        .map(|address| endpoint_uri(&conf.discover.protocol, address))
+        .collect::<Vec<_>>();
+    let config_address = conf
+        .config
+        .addresses
+        .iter()
+        .map(|address| endpoint_uri(&conf.config.protocol, address))
+        .collect::<Vec<_>>();
 
     info!(
         "[pole][server_connector] discover_address: {:?} config_address: {:?}",
         discover_address, config_address
     );
 
-    let connect_timeout = conf.connect_timeout;
-
     let discover_endpoints = discover_address.iter().map(|item| {
         Endpoint::from_shared(item.to_string())
             .unwrap()
-            .connect_timeout(connect_timeout)
+            .connect_timeout(conf.discover.connect_timeout)
     });
     let config_endpoints = config_address.iter().map(|item| {
         Endpoint::from_shared(item.to_string())
             .unwrap()
-            .connect_timeout(connect_timeout)
+            .connect_timeout(conf.config.connect_timeout)
     });
 
     let discover_channel = Channel::balance_list(discover_endpoints);
     let config_channel = Channel::balance_list(config_endpoints);
 
     (discover_channel, config_channel)
+}
+
+fn endpoint_uri(protocol: &str, address: &str) -> String {
+    let scheme = if protocol.eq_ignore_ascii_case("grpcs") {
+        "https"
+    } else {
+        "http"
+    };
+    format!("{scheme}://{address}")
 }
 
 impl Plugin for GrpcConnector {
@@ -275,7 +436,7 @@ impl Plugin for GrpcConnector {
 }
 
 impl GrpcConnector {
-    pub fn builder() -> (fn(opt: InitConnectorOption) -> Box<dyn Connector>, String) {
+    pub fn builder() -> (ConnectorBuilder, String) {
         (new_connector, PLUGIN_NAME.to_string())
     }
 
@@ -284,11 +445,15 @@ impl GrpcConnector {
         flow: String,
     ) -> DiscoverGrpcClient<InterceptedService<Channel, GrpcConnectorInterceptor>> {
         let interceptor = GrpcConnectorInterceptor {
-            metadata: {
-                let mut metadata = HashMap::new();
-                metadata.insert("request-id".to_string(), flow.to_string());
-                metadata
-            },
+            metadata: discover_metadata(
+                Some(flow.as_str()),
+                self.opt
+                    .conf
+                    .global
+                    .client
+                    .service_identity_discovery
+                    .as_ref(),
+            ),
         };
         DiscoverGrpcClient::with_interceptor(self.discover_channel.clone(), interceptor)
     }
@@ -305,6 +470,28 @@ impl GrpcConnector {
             },
         };
         ConfigGrpcClient::with_interceptor(self.config_channel.clone(), interceptor)
+    }
+
+    fn create_workload_credential_stub(
+        &self,
+        flow: &str,
+    ) -> WorkloadCredentialServiceClient<InterceptedService<Channel, GrpcConnectorInterceptor>>
+    {
+        let interceptor = GrpcConnectorInterceptor {
+            metadata: discover_metadata(
+                Some(flow),
+                self.opt
+                    .conf
+                    .global
+                    .client
+                    .service_identity_discovery
+                    .as_ref(),
+            ),
+        };
+        WorkloadCredentialServiceClient::with_interceptor(
+            self.discover_channel.clone(),
+            interceptor,
+        )
     }
 
     async fn send_create_config_file(
@@ -436,12 +623,27 @@ impl GrpcConnector {
             return;
         }
 
-        let Some(watch_key) = discover_response_watch_key(&resp) else {
+        let Some(watch_key) = discover_response_watch_key(
+            &resp,
+            self.opt
+                .conf
+                .global
+                .client
+                .service_identity_discovery
+                .as_ref(),
+        ) else {
             return;
         };
         let mut handlers = self.watch_resources.write().await;
         if let Some(handle) = handlers.get_mut(watch_key.as_str()) {
-            handle.revision = remote_rsp.service.clone().unwrap().revision.clone();
+            let Some(revision) = discover_response_revision(&remote_rsp) else {
+                error!(
+                    "[pole][discovery][connector] response has no valid resource revision: type={:?}",
+                    remote_rsp.r#type()
+                );
+                return;
+            };
+            handle.revision = revision;
             handle.handler.handle_event(RemoteData {
                 event_key: handle.handler.interest_resource(),
                 discover_value: Some(remote_rsp),
@@ -457,7 +659,7 @@ impl GrpcConnector {
         );
 
         let filters = self.opt.config_filters.clone();
-        for (_i, filter) in filters.iter().enumerate() {
+        for filter in filters.iter() {
             let ret = filter.response_process(
                 crate::core::model::DiscoverResponseInfo::Configuration(resp.clone()),
             );
@@ -475,40 +677,46 @@ impl GrpcConnector {
             }
         }
 
+        normalize_config_response_revision(&mut resp);
         let remote_rsp = resp.clone();
 
-        let mut watch_key = "".to_string();
-        match resp.r#type() {
-            pole_specification::v1::config_discover_response::ConfigDiscoverResponseType::ConfigFile => {
-                let ret = resp.file.clone().unwrap_or_default();
-                watch_key = format!("{:?}#{}#{}#{}", EventType::ConfigFile, ret.namespace.clone(), 
-                ret.group.clone(),  ret.file_name.clone());
-            },
-            pole_specification::v1::config_discover_response::ConfigDiscoverResponseType::ConfigFileNames => {
-                if let Some(ret) = resp.file_names.first() {
-                    watch_key = format!("{:?}#{}#{}", EventType::ConfigGroup, ret.namespace.clone(), 
-                    ret.group.clone());
-                }
-            },
-            pole_specification::v1::config_discover_response::ConfigDiscoverResponseType::ConfigFileGroups => {
-                error!("[pole][config][connector] not support ConfigFileGroups");
-            },
-            _ => {}
+        if remote_rsp.code == Code::DataNoChange as u32 {
+            debug!(
+                "[pole][config][connector] receive config_discover no_change response: {:?}",
+                resp
+            );
+            return;
+        }
+        if remote_rsp.code != Code::ExecuteSuccess as u32 {
+            error!(
+                "[pole][config][connector] receive config_discover failure response: {:?}",
+                resp
+            );
+            return;
         }
 
+        let Some(watch_key) = config_response_watch_key(&resp) else {
+            return;
+        };
         let mut handlers = self.watch_resources.write().await;
         if let Some(handle) = handlers.get_mut(watch_key.as_str()) {
             handle.revision = remote_rsp.revision.clone();
+            handle.handler.handle_event(RemoteData {
+                event_key: handle.handler.interest_resource(),
+                discover_value: None,
+                config_value: Some(remote_rsp),
+            });
         }
     }
 
-    fn send_naming_discover_request(&self, req: DiscoverRequest) {
+    fn send_naming_discover_request(&self, mut req: DiscoverRequest) {
+        attach_client_labels(&mut req, &self.opt.client_ctx.labels);
         let _ = self.discover_spec_sender.send(req);
     }
 
     fn send_config_discover_request(&self, mut req: ConfigDiscoverRequest) {
         let filters = self.opt.config_filters.clone();
-        for (_i, filter) in filters.iter().enumerate() {
+        for filter in filters.iter() {
             let ret = filter.request_process(
                 crate::core::model::DiscoverRequestInfo::Configuration(req.clone()),
             );
@@ -567,10 +775,10 @@ impl Connector for GrpcConnector {
         let discover_request = watch_key.to_discover_request("".to_string());
         let config_request = watch_key.to_config_request("".to_string());
 
-        if discover_request.is_some() {
-            self.send_naming_discover_request(discover_request.unwrap());
-        } else {
-            self.send_config_discover_request(config_request.unwrap());
+        if let Some(request) = discover_request {
+            self.send_naming_discover_request(request);
+        } else if let Some(request) = config_request {
+            self.send_config_discover_request(request);
         }
 
         info!(
@@ -718,16 +926,7 @@ impl Connector for GrpcConnector {
     ) -> Result<bool, PoleError> {
         debug!("[pole][discovery][connector] send report service_contract request={req:?}");
 
-        let interceptor = GrpcConnectorInterceptor {
-            metadata: {
-                let mut metadata = HashMap::new();
-                metadata.insert("request-id".to_string(), req.flow_id.to_string());
-                metadata
-            },
-        };
-
-        let mut client =
-            DiscoverGrpcClient::with_interceptor(self.discover_channel.clone(), interceptor);
+        let mut client = self.create_discover_grpc_stub(req.flow_id.clone());
         let ret = client
             .report_service_contract(tonic::Request::new(req.contract.convert_spec()))
             .in_current_span()
@@ -781,7 +980,13 @@ impl Connector for GrpcConnector {
             }
         };
 
-        let timeout = self.opt.conf.global.server_connectors.message_timeout;
+        let timeout = self
+            .opt
+            .conf
+            .global
+            .server_connectors
+            .discover
+            .message_timeout;
         loop {
             let received = tokio::time::timeout(timeout, stream.next()).await;
             let Some(item) = (match received {
@@ -911,11 +1116,46 @@ impl Connector for GrpcConnector {
         );
         Err(PoleError::new(ServerError, info))
     }
+
+    async fn issue_workload_credential(
+        &self,
+        req: WorkloadCredentialIssueRequest,
+    ) -> Result<WorkloadCredentialResponse, PoleError> {
+        let mut client = self.create_workload_credential_stub(&req.request_id);
+        client
+            .issue(tonic::Request::new(req))
+            .in_current_span()
+            .await
+            .map(|response| response.into_inner())
+            .map_err(|err| {
+                // 请求和响应都可能包含敏感凭证，此处只记录 transport status。
+                error!("[pole][identity] issue workload credential failed: {}", err);
+                PoleError::new(ServerError, err.to_string())
+            })
+    }
+
+    async fn renew_workload_credential(
+        &self,
+        req: WorkloadCredentialRenewRequest,
+    ) -> Result<WorkloadCredentialResponse, PoleError> {
+        let mut client = self.create_workload_credential_stub(&req.request_id);
+        client
+            .renew(tonic::Request::new(req))
+            .in_current_span()
+            .await
+            .map(|response| response.into_inner())
+            .map_err(|err| {
+                // current_credential 是 secret，禁止 Debug 请求或响应。
+                error!("[pole][identity] renew workload credential failed: {}", err);
+                PoleError::new(ServerError, err.to_string())
+            })
+    }
 }
 
 fn run_discover_spec_stream(
     channel: Channel,
     executor: Arc<Runtime>,
+    identity: Option<ServiceIdentityDiscoveryConfig>,
 ) -> Result<
     (
         UnboundedSender<DiscoverRequest>,
@@ -927,41 +1167,39 @@ fn run_discover_spec_stream(
     let (rsp_sender, rsp_recv) = mpsc::unbounded_channel::<DiscoverResponse>();
     _ = executor.spawn(async move {
         info!("[pole][discovery][connector] start naming_discover grpc stream");
-        let reciver = UnboundedReceiverStream::new(rx);
+        let receiver = UnboundedReceiverStream::new(rx);
+        let interceptor = GrpcConnectorInterceptor {
+            metadata: discover_metadata(None, identity.as_ref()),
+        };
+        let mut client = DiscoverGrpcClient::with_interceptor(channel, interceptor);
 
-        let mut client = DiscoverGrpcClient::new(channel);
-
-        let discover_future = client.discover(tonic::Request::new(reciver));
-
-        let discover_rt = discover_future.await;
-        if discover_rt.is_err() {
-            let stream_err = discover_rt.err().unwrap();
+        let discover_rt = client.discover(tonic::Request::new(receiver)).await;
+        if let Err(stream_err) = discover_rt {
             error!(
                 "[pole][discovery][connector] naming_discover stream receive err: {}",
-                stream_err.clone().to_string()
+                stream_err
             );
             return Err(PoleError::new(
                 crate::core::model::error::ErrorCode::PluginError,
-                stream_err.clone().to_string(),
+                stream_err.to_string(),
             ));
         }
 
         let mut stream_recv = discover_rt.unwrap().into_inner();
         while let Some(received) = stream_recv.next().await {
             match received {
-                Ok(rsp) => match rsp_sender.send(rsp) {
-                    Ok(_) => {}
-                    Err(err) => {
+                Ok(response) => {
+                    if let Err(err) = rsp_sender.send(response) {
                         error!(
-                            "[pole][discovery][connector] send discover request receive fail: {}",
-                            err.to_string()
+                            "[pole][discovery][connector] send discover response failed: {}",
+                            err
                         );
                     }
-                },
+                }
                 Err(err) => {
                     error!(
                         "[pole][discovery][connector] naming_discover stream receive err: {}",
-                        err.to_string()
+                        err
                     );
                 }
             }
@@ -1034,7 +1272,9 @@ fn run_config_spec_stream(
 mod tests {
     use super::*;
     use pole_specification::v1::{
-        discover_response::DiscoverResponseType, ServiceContract as SpecServiceContract,
+        config_discover_response::ConfigDiscoverResponseType,
+        discover_response::DiscoverResponseType, ConfigFileRelease,
+        ServiceContract as SpecServiceContract, ServiceIdentityDescriptor, WorkloadTrustBundle,
     };
 
     fn response(response_type: DiscoverResponseType) -> DiscoverResponse {
@@ -1048,6 +1288,47 @@ mod tests {
             }),
             ..DiscoverResponse::default()
         }
+    }
+
+    #[test]
+    fn naming_discover_attaches_sorted_exact_client_labels_without_losing_caller() {
+        let mut req = DiscoverRequest {
+            filter: Some(DiscoverFilter {
+                only_healthy_instance: true,
+                caller: Some(Caller {
+                    namespace: "production".to_string(),
+                    service: "checkout".to_string(),
+                    labels: Vec::new(),
+                }),
+            }),
+            ..DiscoverRequest::default()
+        };
+
+        attach_client_labels(
+            &mut req,
+            &HashMap::from([
+                ("zone".to_string(), "shanghai-1".to_string()),
+                ("tenant".to_string(), "blue".to_string()),
+            ]),
+        );
+
+        let filter = req.filter.unwrap();
+        assert!(filter.only_healthy_instance);
+        let caller = filter.caller.unwrap();
+        assert_eq!(caller.namespace, "production");
+        assert_eq!(caller.service, "checkout");
+        assert_eq!(
+            caller
+                .labels
+                .iter()
+                .map(|label| label.key.as_str())
+                .collect::<Vec<_>>(),
+            vec!["tenant", "zone"]
+        );
+        assert!(caller.labels.iter().all(|label| {
+            let value = label.value.as_ref().unwrap();
+            value.r#type() == MatchStringType::Exact && value.value_type() == ValueType::Text
+        }));
     }
 
     #[test]
@@ -1070,10 +1351,185 @@ mod tests {
 
         for (response_type, expected) in cases {
             assert_eq!(
-                discover_response_watch_key(&response(response_type)).as_deref(),
+                discover_response_watch_key(&response(response_type), None).as_deref(),
                 Some(expected)
             );
         }
+    }
+
+    #[test]
+    fn service_identity_response_uses_descriptor_key_and_revision() {
+        let resp = DiscoverResponse {
+            r#type: DiscoverResponseType::ServiceIdentity.into(),
+            service_identity: Some(ServiceIdentityDescriptor {
+                subject: "pole://production/orders".to_string(),
+                namespace: "production".to_string(),
+                service: "orders".to_string(),
+                revision: "identity-rev-2".to_string(),
+                ..ServiceIdentityDescriptor::default()
+            }),
+            ..DiscoverResponse::default()
+        };
+
+        assert_eq!(
+            discover_response_watch_key(&resp, None).as_deref(),
+            Some("ServiceIdentity#production#orders")
+        );
+        assert_eq!(
+            discover_response_revision(&resp).as_deref(),
+            Some("identity-rev-2")
+        );
+
+        let mut incomplete = resp;
+        incomplete
+            .service_identity
+            .as_mut()
+            .unwrap()
+            .subject
+            .clear();
+        assert!(discover_response_revision(&incomplete).is_none());
+    }
+
+    #[test]
+    fn service_identity_token_is_attached_as_authorization_metadata() {
+        let identity = ServiceIdentityDiscoveryConfig {
+            namespace: "production".to_string(),
+            service: "orders".to_string(),
+            control_plane_token: "service-secret".to_string(),
+        };
+        let mut interceptor = GrpcConnectorInterceptor {
+            metadata: discover_metadata(Some("flow-1"), Some(&identity)),
+        };
+
+        let request = interceptor.call(tonic::Request::new(())).unwrap();
+
+        assert_eq!(
+            request.metadata().get("authorization").unwrap(),
+            "service-secret"
+        );
+        assert_eq!(request.metadata().get("request-id").unwrap(), "flow-1");
+    }
+
+    #[test]
+    fn trust_bundle_response_uses_authenticated_service_watch_key() {
+        let identity = ServiceIdentityDiscoveryConfig {
+            namespace: "production".to_string(),
+            service: "orders".to_string(),
+            control_plane_token: "service-secret".to_string(),
+        };
+        let response = DiscoverResponse {
+            r#type: DiscoverResponseType::ServiceIdentityBundle.into(),
+            service_identity_bundle: Some(WorkloadTrustBundle {
+                schema_version: 1,
+                trust_domain: "pole.local".to_string(),
+                issuer: "https://issuer.pole.local".to_string(),
+                version: "bundle-2".to_string(),
+                sequence: 2,
+                ..WorkloadTrustBundle::default()
+            }),
+            ..DiscoverResponse::default()
+        };
+
+        assert_eq!(
+            discover_response_watch_key(&response, Some(&identity)).as_deref(),
+            Some("ServiceIdentityBundle#production#orders")
+        );
+        assert_eq!(
+            discover_response_revision(&response).as_deref(),
+            Some("bundle-2")
+        );
+    }
+
+    #[test]
+    fn initialized_service_identity_watch_is_periodically_refreshed() {
+        let identity_key = crate::core::model::cache::ResourceEventKey {
+            namespace: "production".to_string(),
+            event_type: EventType::ServiceIdentity,
+            filter: HashMap::from([("service".to_string(), "orders".to_string())]),
+        };
+        let instance_key = crate::core::model::cache::ResourceEventKey {
+            namespace: "production".to_string(),
+            event_type: EventType::Instance,
+            filter: HashMap::from([("service".to_string(), "orders".to_string())]),
+        };
+        let bundle_key = crate::core::model::cache::ResourceEventKey {
+            namespace: "production".to_string(),
+            event_type: EventType::ServiceIdentityBundle,
+            filter: HashMap::from([("service".to_string(), "orders".to_string())]),
+        };
+
+        assert!(should_refresh_resource(&identity_key, ""));
+        assert!(should_refresh_resource(&identity_key, "identity-rev-1"));
+        assert!(should_refresh_resource(&bundle_key, "bundle-1"));
+        assert!(should_refresh_resource(&instance_key, "instance-rev-1"));
+    }
+
+    #[test]
+    fn connector_protocol_selects_secure_endpoint_scheme() {
+        assert_eq!(
+            endpoint_uri("grpc", "127.0.0.1:8091"),
+            "http://127.0.0.1:8091"
+        );
+        assert_eq!(
+            endpoint_uri("grpcs", "control.pole.example:443"),
+            "https://control.pole.example:443"
+        );
+    }
+
+    #[test]
+    fn config_response_watch_key_maps_config_file_response() {
+        let resp = ConfigDiscoverResponse {
+            r#type: ConfigDiscoverResponseType::ConfigFile.into(),
+            file: Some(ConfigFileRelease {
+                namespace: "default".to_string(),
+                group: "app".to_string(),
+                file_name: "app.yaml".to_string(),
+                ..ConfigFileRelease::default()
+            }),
+            ..ConfigDiscoverResponse::default()
+        };
+
+        assert_eq!(
+            config_response_watch_key(&resp).as_deref(),
+            Some("ConfigFile#default#app#app.yaml")
+        );
+    }
+
+    #[test]
+    fn config_response_uses_selected_file_version_when_server_revision_is_missing() {
+        let mut resp = ConfigDiscoverResponse {
+            r#type: ConfigDiscoverResponseType::ConfigFile.into(),
+            file: Some(ConfigFileRelease {
+                version: 9,
+                ..ConfigFileRelease::default()
+            }),
+            ..ConfigDiscoverResponse::default()
+        };
+
+        normalize_config_response_revision(&mut resp);
+        assert_eq!(resp.revision, "9");
+
+        resp.revision = "gray-blue@9".to_string();
+        normalize_config_response_revision(&mut resp);
+        assert_eq!(resp.revision, "gray-blue@9");
+    }
+
+    #[test]
+    fn config_response_watch_key_maps_config_group_response() {
+        let resp = ConfigDiscoverResponse {
+            r#type: ConfigDiscoverResponseType::ConfigFileNames.into(),
+            file_names: vec![ConfigFileRelease {
+                namespace: "default".to_string(),
+                group: "app".to_string(),
+                ..ConfigFileRelease::default()
+            }],
+            ..ConfigDiscoverResponse::default()
+        };
+
+        assert_eq!(
+            config_response_watch_key(&resp).as_deref(),
+            Some("ConfigGroup#default#app")
+        );
     }
 
     fn contract_request(

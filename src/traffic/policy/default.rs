@@ -21,9 +21,11 @@ pub use crate::traffic::{
 use bytes::Bytes;
 use http::{header::HeaderName, HeaderValue, Request as HttpRequest};
 use pole_specification::v1::{
-    MirrorDestination, MockResponse, SourceService, TrafficMirror, TrafficMock,
-    TrafficSecurityAction, TrafficSecurityRejectEffect, TrafficSecurityRule,
+    CustomHeaderAuthentication, ManagedCallerSelector, MirrorDestination, MockResponse,
+    SourceService, TrafficMirror, TrafficMock, TrafficSecurityAction, TrafficSecurityAuthMode,
+    TrafficSecurityAuthentication, TrafficSecurityRejectEffect, TrafficSecurityRule,
 };
+use sha2::{Digest, Sha256};
 use std::{
     any::Any,
     collections::{hash_map::DefaultHasher, HashMap},
@@ -557,30 +559,68 @@ pub async fn evaluate_traffic_governance_from_cache(
     resource_cache: Arc<Box<dyn ResourceCache>>,
     timeout: Duration,
 ) -> Result<TrafficGovernanceResult, PoleError> {
-    let security_rule = load_traffic_service_rule(
-        resource_cache.clone(),
-        ctx,
-        EventType::TrafficSecurityRule,
-        timeout,
-    )
-    .await?;
-    let mirror_rule = load_traffic_service_rule(
+    let security_rules = downcast_rule_list(
+        load_traffic_service_rule(
+            resource_cache.clone(),
+            ctx,
+            EventType::TrafficSecurityRule,
+            timeout,
+        )
+        .await?
+        .rules,
+        "TrafficSecurityRule",
+    )?;
+    let mirror_rules = match load_traffic_service_rule(
         resource_cache.clone(),
         ctx,
         EventType::TrafficMirrorRule,
         timeout,
     )
-    .await?;
-    let mock_rule =
-        load_traffic_service_rule(resource_cache, ctx, EventType::TrafficMockRule, timeout).await?;
+    .await
+    {
+        Ok(rule) => downcast_rule_list(rule.rules, "TrafficMirror").unwrap_or_else(|err| {
+            crate::error!(
+                "[pole][traffic_governance] ignore invalid mirror rules: {}",
+                err
+            );
+            Vec::new()
+        }),
+        Err(err) => {
+            crate::error!(
+                "[pole][traffic_governance] ignore unavailable mirror rules: {}",
+                err
+            );
+            Vec::new()
+        }
+    };
+    let mock_rules =
+        match load_traffic_service_rule(resource_cache, ctx, EventType::TrafficMockRule, timeout)
+            .await
+        {
+            Ok(rule) => downcast_rule_list(rule.rules, "TrafficMock").unwrap_or_else(|err| {
+                crate::error!(
+                    "[pole][traffic_governance] ignore invalid mock rules: {}",
+                    err
+                );
+                Vec::new()
+            }),
+            Err(err) => {
+                crate::error!(
+                    "[pole][traffic_governance] ignore unavailable mock rules: {}",
+                    err
+                );
+                Vec::new()
+            }
+        };
 
-    let rules = traffic_governance_rules_from_cached_rules(
-        security_rule.rules,
-        mirror_rule.rules,
-        mock_rule.rules,
-    )?;
-
-    Ok(evaluate_traffic_governance(ctx, rules))
+    Ok(evaluate_traffic_governance(
+        ctx,
+        TrafficGovernanceRules {
+            security_rules,
+            mirror_rules,
+            mock_rules,
+        },
+    ))
 }
 
 async fn load_traffic_service_rule(
@@ -650,22 +690,132 @@ fn evaluate_security(
         .collect::<Vec<_>>();
     rules.sort_by(|a, b| a.priority.cmp(&b.priority));
 
-    let entries = rules.iter().flat_map(|rule| {
-        rule.policies
-            .iter()
-            .map(|policy| (policy, policy.apis.as_slice()))
-    });
     let input = api_match_input(ctx);
-    let index = ApiMatchIndex::new(entries);
 
-    for policy in index.candidates(&input) {
-        if !traffic_rule_matches(ctx, policy.traffic_match_rule.as_ref()) {
+    // authentication 是规则级门禁，必须在 policy 动作前执行。按规则建 API 索引
+    // 可以保留 priority/首命中语义，同时避免展平后丢失父规则的认证模式。
+    for rule in rules {
+        let index = ApiMatchIndex::new(
+            rule.policies
+                .iter()
+                .map(|policy| (policy, policy.apis.as_slice())),
+        );
+        let candidates = index.candidates(&input);
+        if candidates.is_empty() {
             continue;
         }
-        return security_decision(policy.action(), policy.reject_effect.clone());
+
+        if !security_rule_authenticated(ctx, rule.authentication.as_ref()) {
+            return TrafficSecurityDecision {
+                allowed: false,
+                reject_effect: candidates
+                    .first()
+                    .and_then(|policy| policy.reject_effect.clone()),
+            };
+        }
+
+        let managed_identity = rule
+            .authentication
+            .as_ref()
+            .map(|authentication| authentication.mode() == TrafficSecurityAuthMode::ManagedIdentity)
+            .unwrap_or(false);
+        for policy in candidates {
+            if managed_identity && !managed_caller_matches(ctx, policy.managed_caller.as_ref()) {
+                continue;
+            }
+            if !traffic_rule_matches(ctx, policy.traffic_match_rule.as_ref()) {
+                continue;
+            }
+            return security_decision(policy.action(), policy.reject_effect.clone());
+        }
+        if managed_identity {
+            // 已命中受保护 API，但没有任何 caller selector 接受该已认证主体。
+            return TrafficSecurityDecision {
+                allowed: false,
+                reject_effect: rule
+                    .policies
+                    .first()
+                    .and_then(|policy| policy.reject_effect.clone()),
+            };
+        }
     }
 
     TrafficSecurityDecision::default()
+}
+
+fn security_rule_authenticated(
+    ctx: &RouteContext,
+    authentication: Option<&TrafficSecurityAuthentication>,
+) -> bool {
+    let Some(authentication) = authentication else {
+        // 历史规则没有 authentication，保持原有 request matcher 语义。
+        return true;
+    };
+
+    match TrafficSecurityAuthMode::try_from(authentication.mode) {
+        Ok(TrafficSecurityAuthMode::LegacyRequestMatch) => {
+            authentication.managed_identity.is_none() && authentication.custom_header.is_none()
+        }
+        Ok(TrafficSecurityAuthMode::ManagedIdentity) => {
+            authentication.managed_identity.is_some()
+                && authentication.custom_header.is_none()
+                && ctx.authenticated_caller.is_some()
+        }
+        Ok(TrafficSecurityAuthMode::CustomHeader) => authentication
+            .custom_header
+            .as_ref()
+            .filter(|_| authentication.managed_identity.is_none())
+            .map(|custom| custom_header_authenticated(ctx, custom))
+            .unwrap_or(false),
+        Err(_) => false,
+    }
+}
+
+fn managed_caller_matches(ctx: &RouteContext, selector: Option<&ManagedCallerSelector>) -> bool {
+    let Some(caller) = ctx.authenticated_caller.as_ref() else {
+        return false;
+    };
+    let Some(selector) = selector else {
+        return false;
+    };
+    if selector.any_authenticated {
+        return true;
+    }
+    selector.callers.iter().any(|allowed| {
+        !allowed.namespace.is_empty()
+            && !allowed.service.is_empty()
+            && allowed.namespace == caller.namespace()
+            && allowed.service == caller.service()
+    })
+}
+
+fn custom_header_authenticated(ctx: &RouteContext, custom: &CustomHeaderAuthentication) -> bool {
+    if !custom.value.is_empty()
+        || custom.header_name.trim().is_empty()
+        || custom.value_sha256.len() != 64
+    {
+        return false;
+    }
+    let Some(actual) =
+        (ctx.route_info.traffic_label_provider)(ArgumentType::Header, &custom.header_name)
+    else {
+        return false;
+    };
+    let Ok(expected) = hex::decode(&custom.value_sha256) else {
+        return false;
+    };
+    if expected.len() != 32 {
+        return false;
+    }
+
+    let actual = Sha256::digest(actual.as_bytes());
+    actual
+        .iter()
+        .zip(expected.iter())
+        .fold(0u8, |difference, (actual, expected)| {
+            difference | (actual ^ expected)
+        })
+        == 0
 }
 
 fn evaluate_mirrors(ctx: &RouteContext, mirror_rules: &[TrafficMirror]) -> Vec<MirrorDestination> {
@@ -675,6 +825,8 @@ fn evaluate_mirrors(ctx: &RouteContext, mirror_rules: &[TrafficMirror]) -> Vec<M
         .collect::<Vec<_>>();
     rules.sort_by(|a, b| a.priority.cmp(&b.priority));
 
+    // 先按 caller 和 API 做候选收敛，再执行 traffic match rule 与采样；
+    // 这样避免大量无关接口规则进入后续较重的匹配流程。
     let entries = rules.iter().flat_map(|rule| {
         if !source_service_matches(rule.caller.as_ref(), ctx) {
             return Vec::new();
@@ -718,6 +870,8 @@ fn evaluate_mock(ctx: &RouteContext, mock_rules: &[TrafficMock]) -> Option<MockR
         .collect::<Vec<_>>();
     rules.sort_by(|a, b| a.priority.cmp(&b.priority));
 
+    // mock 和 mirror 一样先收敛 API 候选；响应构造和百分比采样仍在
+    // 候选命中后执行，避免索引层承担业务副作用。
     let entries = rules.iter().flat_map(|rule| {
         if !source_service_matches(rule.caller.as_ref(), ctx) {
             return Vec::new();
@@ -840,10 +994,11 @@ mod tests {
     use http::Response;
     use pole_specification::v1::{
         match_string::{MatchStringType, ValueType},
-        source_match, traffic_match_rule, Api, MatchString, MirrorDestination, MirrorRule,
-        MockResponse, MockRule, SourceMatch, SourceService, TrafficMatchRule, TrafficMirror,
-        TrafficMock, TrafficSecurityAction, TrafficSecurityPolicy, TrafficSecurityRejectEffect,
-        TrafficSecurityRule,
+        source_match, traffic_match_rule, Api, CustomHeaderAuthentication, ManagedCallerSelector,
+        ManagedIdentityAuthentication, MatchString, MirrorDestination, MirrorRule, MockResponse,
+        MockRule, SourceMatch, SourceService, TrafficMatchRule, TrafficMirror, TrafficMock,
+        TrafficSecurityAction, TrafficSecurityAuthMode, TrafficSecurityAuthentication,
+        TrafficSecurityPolicy, TrafficSecurityRejectEffect, TrafficSecurityRule,
     };
     use std::{
         collections::HashMap,
@@ -858,6 +1013,7 @@ mod tests {
     struct FakeTrafficRuleCache {
         calls: Arc<Mutex<Vec<ResourceEventKey>>>,
         mirror_instances: Vec<Instance>,
+        fail_event: Option<EventType>,
     }
 
     impl Plugin for FakeTrafficRuleCache {
@@ -876,6 +1032,12 @@ mod tests {
 
         async fn load_service_rule(&self, filter: Filter) -> Result<ServiceRule, PoleError> {
             self.calls.lock().unwrap().push(filter.resource_key.clone());
+            if self.fail_event == Some(filter.resource_key.event_type) {
+                return Err(PoleError::new(
+                    ErrorCode::InternalError,
+                    "simulated rule load failure".to_string(),
+                ));
+            }
             let rules: Vec<Box<dyn std::any::Any + Send>> = match filter.resource_key.event_type {
                 EventType::TrafficSecurityRule => vec![Box::new(TrafficSecurityRule {
                     id: "security-1".to_string(),
@@ -988,6 +1150,7 @@ mod tests {
         match (arg_type, key) {
             (ArgumentType::Header, "x-user") => Some("alice".to_string()),
             (ArgumentType::Header, "x-debug") => Some("true".to_string()),
+            (ArgumentType::Header, "authorization") => Some("custom-secret".to_string()),
             (ArgumentType::Method, "") => Some("GET".to_string()),
             (ArgumentType::Path, "") => Some("/orders/42".to_string()),
             _ => None,
@@ -1004,6 +1167,7 @@ mod tests {
         RouteContext {
             route_info,
             extensions: None,
+            authenticated_caller: None,
         }
     }
 
@@ -1073,6 +1237,184 @@ mod tests {
 
         assert!(!result.security.allowed);
         assert_eq!(result.security.reject_effect.unwrap().code, "DENIED");
+    }
+
+    #[test]
+    fn managed_identity_rule_fails_closed_without_authenticated_caller_context() {
+        let result = evaluate_traffic_governance(
+            &route_ctx(),
+            TrafficGovernanceRules {
+                security_rules: vec![TrafficSecurityRule {
+                    enable: true,
+                    authentication: Some(TrafficSecurityAuthentication {
+                        mode: TrafficSecurityAuthMode::ManagedIdentity.into(),
+                        managed_identity: Some(ManagedIdentityAuthentication::default()),
+                        custom_header: None,
+                    }),
+                    policies: vec![TrafficSecurityPolicy {
+                        apis: vec![api()],
+                        action: TrafficSecurityAction::TrafficSecurityAllow.into(),
+                        managed_caller: Some(ManagedCallerSelector {
+                            any_authenticated: true,
+                            callers: Vec::new(),
+                        }),
+                        ..TrafficSecurityPolicy::default()
+                    }],
+                    ..TrafficSecurityRule::default()
+                }],
+                ..TrafficGovernanceRules::default()
+            },
+        );
+
+        assert!(!result.security.allowed);
+    }
+
+    #[test]
+    fn managed_identity_rule_uses_only_typed_authenticated_caller() {
+        let rule = TrafficSecurityRule {
+            enable: true,
+            authentication: Some(TrafficSecurityAuthentication {
+                mode: TrafficSecurityAuthMode::ManagedIdentity.into(),
+                managed_identity: Some(ManagedIdentityAuthentication::default()),
+                custom_header: None,
+            }),
+            policies: vec![TrafficSecurityPolicy {
+                apis: vec![api()],
+                action: TrafficSecurityAction::TrafficSecurityAllow.into(),
+                managed_caller: Some(ManagedCallerSelector {
+                    any_authenticated: false,
+                    callers: vec![SourceService {
+                        namespace: "production".to_string(),
+                        service: "checkout".to_string(),
+                    }],
+                }),
+                ..TrafficSecurityPolicy::default()
+            }],
+            ..TrafficSecurityRule::default()
+        };
+        let mut matching_ctx = route_ctx();
+        matching_ctx.authenticated_caller = Some(crate::identity::AuthenticatedCaller::for_test(
+            "production",
+            "checkout",
+        ));
+        let matching = evaluate_traffic_governance(
+            &matching_ctx,
+            TrafficGovernanceRules {
+                security_rules: vec![rule.clone()],
+                ..TrafficGovernanceRules::default()
+            },
+        );
+        assert!(matching.security.allowed);
+
+        let mut wrong_ctx = route_ctx();
+        // 普通 caller 字段伪造成 checkout 也不能替代验签结果。
+        wrong_ctx.route_info.caller.namespace = "production".to_string();
+        wrong_ctx.route_info.caller.name = "checkout".to_string();
+        wrong_ctx.authenticated_caller = Some(crate::identity::AuthenticatedCaller::for_test(
+            "production",
+            "attacker",
+        ));
+        let wrong = evaluate_traffic_governance(
+            &wrong_ctx,
+            TrafficGovernanceRules {
+                security_rules: vec![rule],
+                ..TrafficGovernanceRules::default()
+            },
+        );
+        assert!(!wrong.security.allowed);
+    }
+
+    #[test]
+    fn custom_header_rule_accepts_only_matching_sha256_digest() {
+        let rule = |value_sha256: &str, plaintext: &str| TrafficSecurityRule {
+            enable: true,
+            authentication: Some(TrafficSecurityAuthentication {
+                mode: TrafficSecurityAuthMode::CustomHeader.into(),
+                managed_identity: None,
+                custom_header: Some(CustomHeaderAuthentication {
+                    header_name: "authorization".to_string(),
+                    value: plaintext.to_string(),
+                    value_sha256: value_sha256.to_string(),
+                }),
+            }),
+            policies: vec![TrafficSecurityPolicy {
+                apis: vec![api()],
+                action: TrafficSecurityAction::TrafficSecurityAllow.into(),
+                ..TrafficSecurityPolicy::default()
+            }],
+            ..TrafficSecurityRule::default()
+        };
+
+        let matching = evaluate_traffic_governance(
+            &route_ctx(),
+            TrafficGovernanceRules {
+                security_rules: vec![rule(
+                    "86f3f00cb77b08bb8963beabc8e08a2213caf723cb092397446667f53888bee3",
+                    "",
+                )],
+                ..TrafficGovernanceRules::default()
+            },
+        );
+        assert!(matching.security.allowed);
+
+        let wrong_digest = evaluate_traffic_governance(
+            &route_ctx(),
+            TrafficGovernanceRules {
+                security_rules: vec![rule(
+                    "539e915a40033497f3a93ce662c8c1940c84503361223312e6fab7c5f3a3fdda",
+                    "",
+                )],
+                ..TrafficGovernanceRules::default()
+            },
+        );
+        assert!(!wrong_digest.security.allowed);
+
+        let plaintext_only = evaluate_traffic_governance(
+            &route_ctx(),
+            TrafficGovernanceRules {
+                security_rules: vec![rule("", "custom-secret")],
+                ..TrafficGovernanceRules::default()
+            },
+        );
+        assert!(!plaintext_only.security.allowed);
+
+        let digest_with_unexpected_plaintext = evaluate_traffic_governance(
+            &route_ctx(),
+            TrafficGovernanceRules {
+                security_rules: vec![rule(
+                    "86f3f00cb77b08bb8963beabc8e08a2213caf723cb092397446667f53888bee3",
+                    "must-not-be-distributed",
+                )],
+                ..TrafficGovernanceRules::default()
+            },
+        );
+        assert!(!digest_with_unexpected_plaintext.security.allowed);
+    }
+
+    #[test]
+    fn explicit_legacy_mode_keeps_missing_match_rule_compatibility() {
+        let result = evaluate_traffic_governance(
+            &route_ctx(),
+            TrafficGovernanceRules {
+                security_rules: vec![TrafficSecurityRule {
+                    enable: true,
+                    authentication: Some(TrafficSecurityAuthentication {
+                        mode: TrafficSecurityAuthMode::LegacyRequestMatch.into(),
+                        managed_identity: None,
+                        custom_header: None,
+                    }),
+                    policies: vec![TrafficSecurityPolicy {
+                        apis: vec![api()],
+                        action: TrafficSecurityAction::TrafficSecurityDeny.into(),
+                        ..TrafficSecurityPolicy::default()
+                    }],
+                    ..TrafficSecurityRule::default()
+                }],
+                ..TrafficGovernanceRules::default()
+            },
+        );
+
+        assert!(!result.security.allowed);
     }
 
     #[test]
@@ -1185,6 +1527,37 @@ mod tests {
         assert_eq!(calls[0].filter.get("service").unwrap(), "orders");
         assert_eq!(calls[1].event_type, EventType::TrafficMirrorRule);
         assert_eq!(calls[2].event_type, EventType::TrafficMockRule);
+    }
+
+    #[tokio::test]
+    async fn mirror_load_failure_does_not_disable_security_evaluation() {
+        let cache: Arc<Box<dyn ResourceCache>> = Arc::new(Box::new(FakeTrafficRuleCache {
+            fail_event: Some(EventType::TrafficMirrorRule),
+            ..FakeTrafficRuleCache::default()
+        }));
+
+        let result =
+            evaluate_traffic_governance_from_cache(&route_ctx(), cache, Duration::from_millis(10))
+                .await
+                .unwrap();
+
+        assert!(!result.security.allowed);
+        assert!(result.mirrors.is_empty());
+        assert_eq!(result.mock.unwrap().code, "OK");
+    }
+
+    #[tokio::test]
+    async fn security_load_failure_is_fail_closed() {
+        let cache: Arc<Box<dyn ResourceCache>> = Arc::new(Box::new(FakeTrafficRuleCache {
+            fail_event: Some(EventType::TrafficSecurityRule),
+            ..FakeTrafficRuleCache::default()
+        }));
+
+        let result =
+            evaluate_traffic_governance_from_cache(&route_ctx(), cache, Duration::from_millis(10))
+                .await;
+
+        assert!(result.is_err());
     }
 
     struct BlockingMirrorSender {

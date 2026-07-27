@@ -8,7 +8,7 @@ use tokio::{
 };
 
 #[tokio::test]
-async fn console_client_posts_json_with_bearer_token() {
+async fn console_client_posts_json_with_control_plane_token_headers() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let server = tokio::spawn(async move {
@@ -58,7 +58,9 @@ async fn console_client_posts_json_with_bearer_token() {
     let request = server.await.unwrap();
     let request_lower = request.to_ascii_lowercase();
     assert!(request.starts_with("POST /naming/v1/services HTTP/1.1"));
-    assert!(request_lower.contains("authorization: bearer token-1"));
+    assert!(request_lower.contains("authorization: token-1"));
+    assert!(request_lower.contains("x-polaris-token: token-1"));
+    assert!(request_lower.contains("polaris-token: token-1"));
     assert!(request_lower.contains("content-type: application/json"));
     assert!(request.contains(r#"{"name":"svc-a"}"#));
 }

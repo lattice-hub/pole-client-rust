@@ -1248,16 +1248,16 @@ global:
     retryInterval: 1ms
     reportInterval: 1s
   serverConnectors:
-    addresses:
-      - discover://127.0.0.1:1
-    protocol: grpc
-    connectTimeout: 1ms
-    serverSwitchInterval: 1s
-    messageTimeout: 1ms
-    connectionIdleTimeout: 1s
-    reconnectInterval: 1ms
-  statReporter:
-    enable: false
+    discover:
+      addresses: [127.0.0.1:1]
+      protocol: grpc
+      connectTimeout: 1ms
+      messageTimeout: 1ms
+    config:
+      addresses: [127.0.0.1:2]
+      protocol: grpc
+      connectTimeout: 1ms
+      messageTimeout: 1ms
   location:
     providers:
       - name: local
@@ -1270,9 +1270,6 @@ consumer:
     beforeChain: []
     coreChain: []
     afterChain: []
-  circuitBreaker:
-    enable: false
-    enableRemotePull: false
   loadBalancer:
     defaultPolicy: weightedRandom
     plugins: []
@@ -1285,17 +1282,7 @@ consumer:
     persistEnable: false
     persistDir: ./target/test-cache
 provider:
-  rateLimit:
-    enable: false
-    service: pole.limiter
-    namespace: Pole
-    maxWindowCount: 1
-    fallbackOnExceedWindowCount: pass
-    remoteSyncTimeout: 1ms
-    maxQueuingTime: 1ms
-    reportMetrics: false
   lossless:
-    enable: false
     host: 127.0.0.1
     port: 0
     delayRegisterInterval: 1ms
@@ -1361,16 +1348,16 @@ global:
     retryInterval: 1ms
     reportInterval: 1s
   serverConnectors:
-    addresses:
-      - discover://127.0.0.1:1
-    protocol: grpc
-    connectTimeout: 1ms
-    serverSwitchInterval: 1s
-    messageTimeout: 1ms
-    connectionIdleTimeout: 1s
-    reconnectInterval: 1ms
-  statReporter:
-    enable: false
+    discover:
+      addresses: [127.0.0.1:1]
+      protocol: grpc
+      connectTimeout: 1ms
+      messageTimeout: 1ms
+    config:
+      addresses: [127.0.0.1:2]
+      protocol: grpc
+      connectTimeout: 1ms
+      messageTimeout: 1ms
   location:
     providers:
       - name: local
@@ -1383,9 +1370,6 @@ consumer:
     beforeChain: []
     coreChain: []
     afterChain: []
-  circuitBreaker:
-    enable: true
-    enableRemotePull: false
   loadBalancer:
     defaultPolicy: weightedRandom
     plugins: []
@@ -1398,17 +1382,7 @@ consumer:
     persistEnable: false
     persistDir: ./target/test-cache
 provider:
-  rateLimit:
-    enable: false
-    service: pole.limiter
-    namespace: Pole
-    maxWindowCount: 1
-    fallbackOnExceedWindowCount: pass
-    remoteSyncTimeout: 1ms
-    maxQueuingTime: 1ms
-    reportMetrics: false
   lossless:
-    enable: false
     host: 127.0.0.1
     port: 0
     delayRegisterInterval: 1ms

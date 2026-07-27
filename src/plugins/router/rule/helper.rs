@@ -13,6 +13,8 @@
 // CONDITIONS OF ANY KIND, either express or implied. See the License for the
 // specific language governing permissions and limitations under the License.
 
+use std::collections::HashMap;
+
 use pole_specification::v1::{
     match_string::ValueType, source_match, traffic_match_rule, CustomRouteRule, MatchString,
     SourceMatch, TrafficMatchRule,
@@ -22,7 +24,8 @@ use crate::core::{model::ArgumentType, plugin::router::RouteContext};
 
 static WILDCARD: &str = "*";
 
-// route_traffic_match 匹配主、被调服务信息，以及匹配请求流量标签
+// route_traffic_match 是路由规则的第一层过滤：先确认规则目标服务与当前
+// 被调服务一致，再进入请求流量标签匹配，避免无关规则参与实例筛选。
 pub fn route_traffic_match(ctx: &RouteContext, rule: &CustomRouteRule) -> bool {
     if !match_callee_caller(ctx, rule) {
         return false;
@@ -35,6 +38,8 @@ pub fn route_traffic_match(ctx: &RouteContext, rule: &CustomRouteRule) -> bool {
 }
 
 pub fn traffic_match_rule_match(ctx: &RouteContext, rule: &TrafficMatchRule) -> bool {
+    // random_percent 为 0 直接视为未命中；当前实现保留百分比字段入口，
+    // 具体随机采样由更上层治理能力按各自语义处理。
     if rule.random_percent == 0 {
         return false;
     }
@@ -64,7 +69,33 @@ fn source_match_matches(ctx: &RouteContext, source_match: &SourceMatch) -> bool 
         return false;
     };
 
+    // 新规则把 PARAMETER + 空 value 定义为“采集当前参数键”。它要求请求中
+    // 存在该值，但不再把空字符串当成固定匹配值；下游路由/限流可复用该值。
+    if rule_value.value_type() == ValueType::Parameter && rule_value.value.is_empty() {
+        return true;
+    }
+
     match_label_value(rule_value, actual_val)
+}
+
+/// traffic_match_rule_request_parameters 返回被规则显式采集的请求参数。
+///
+/// 只有 `PARAMETER + 空 value` 进入这个新语义；非空 value 继续保留旧版
+/// “引用同类参数键”行为，避免历史规则在升级后改变匹配结果。
+pub fn traffic_match_rule_request_parameters(
+    ctx: &RouteContext,
+    rule: &TrafficMatchRule,
+) -> HashMap<String, String> {
+    rule.arguments
+        .iter()
+        .filter_map(|source_match| {
+            let rule_value = source_match.value.as_ref()?;
+            if rule_value.value_type() != ValueType::Parameter || !rule_value.value.is_empty() {
+                return None;
+            }
+            current_source_value(ctx, source_match).map(|value| (source_match.key.clone(), value))
+        })
+        .collect()
 }
 
 fn resolve_actual_value(
@@ -75,20 +106,12 @@ fn resolve_actual_value(
     let traffic_provider = ctx.route_info.traffic_label_provider;
     let value_type = ValueType::try_from(rule_value.value_type).ok()?;
 
-    let mut match_key = source_match.key.as_str();
     match value_type {
-        ValueType::Text => {
-            let mut traffic_type = argument_type_from_source(source_match.r#type());
-            if source_match.key.contains('.') {
-                let parts: Vec<&str> = match_key.splitn(2, '.').collect();
-                match_key = parts[1];
-                let mut label_prefix = parts[0];
-                if parts[0].starts_with('$') {
-                    label_prefix = &parts[0][1..];
-                }
-                traffic_type = ArgumentType::parse_from_str(label_prefix);
-            }
-            traffic_provider(traffic_type, match_key)
+        ValueType::Text => current_source_value(ctx, source_match),
+        // 空 value 表示采集 SourceMatch.key 的当前请求值；非空值保持旧版
+        // “引用同类参数键”语义，确保已经保存的 PARAMETER 规则不会失效。
+        ValueType::Parameter if rule_value.value.is_empty() => {
+            current_source_value(ctx, source_match)
         }
         ValueType::Parameter => traffic_provider(
             argument_type_from_source(source_match.r#type()),
@@ -97,7 +120,25 @@ fn resolve_actual_value(
     }
 }
 
-/// match_label_value 匹配标签值
+fn current_source_value(ctx: &RouteContext, source_match: &SourceMatch) -> Option<String> {
+    let traffic_provider = ctx.route_info.traffic_label_provider;
+    let mut match_key = source_match.key.as_str();
+    // key 支持 "header.x" 或 "$header.x" 这类显式前缀写法。
+    let mut traffic_type = argument_type_from_source(source_match.r#type());
+    if source_match.key.contains('.') {
+        let parts: Vec<&str> = match_key.splitn(2, '.').collect();
+        match_key = parts[1];
+        let mut label_prefix = parts[0];
+        if parts[0].starts_with('$') {
+            label_prefix = &parts[0][1..];
+        }
+        traffic_type = ArgumentType::parse_from_str(label_prefix);
+    }
+    traffic_provider(traffic_type, match_key)
+}
+
+/// match_label_value 匹配标签值。
+/// 这里是路由、泳道、traffic policy 和 mirror 实例标签共用的 MatchString 语义边界。
 pub fn match_label_value(rule_value: &MatchString, actual_val: String) -> bool {
     let match_value = rule_value.value.clone();
     if is_match_all(&match_value) {
@@ -141,7 +182,7 @@ pub fn match_label_value(rule_value: &MatchString, actual_val: String) -> bool {
     }
 }
 
-/// match_callee_caller 匹配主被调服务信息
+/// match_callee_caller 匹配规则目标服务与当前被调服务信息。
 pub fn match_callee_caller(rctx: &RouteContext, rule: &CustomRouteRule) -> bool {
     let callee = &rctx.route_info.callee;
 
@@ -201,6 +242,7 @@ mod tests {
         RouteContext {
             route_info,
             extensions: None,
+            authenticated_caller: None,
         }
     }
 
@@ -294,14 +336,26 @@ mod tests {
     }
 
     #[test]
-    fn match_label_value_handles_invalid_range_without_panic() {
-        let value = MatchString {
-            r#type: MatchStringType::Range.into(),
-            value: "bad,50".to_string(),
-            value_type: ValueType::Text.into(),
+    fn parameter_with_empty_value_captures_current_request_key() {
+        let rule = TrafficMatchRule {
+            arguments: vec![SourceMatch {
+                r#type: source_match::Type::Header.into(),
+                key: "x-env".to_string(),
+                value: Some(MatchString {
+                    r#type: MatchStringType::Exact.into(),
+                    value: String::new(),
+                    value_type: ValueType::Parameter.into(),
+                }),
+            }],
+            random_percent: 100,
+            match_mode: traffic_match_rule::TrafficMatchMode::And.into(),
         };
 
-        assert!(!match_label_value(&value, "42".to_string()));
+        assert!(traffic_match_rule_match(&route_ctx(), &rule));
+        assert_eq!(
+            traffic_match_rule_request_parameters(&route_ctx(), &rule).get("x-env"),
+            Some(&"prod".to_string())
+        );
     }
 
     #[test]
@@ -321,5 +375,16 @@ mod tests {
         };
 
         assert!(!traffic_match_rule_match(&route_ctx(), &rule));
+    }
+
+    #[test]
+    fn match_label_value_handles_invalid_range_without_panic() {
+        let value = MatchString {
+            r#type: MatchStringType::Range.into(),
+            value: "bad,50".to_string(),
+            value_type: ValueType::Text.into(),
+        };
+
+        assert!(!match_label_value(&value, "42".to_string()));
     }
 }

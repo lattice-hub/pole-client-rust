@@ -19,6 +19,7 @@ use std::sync::Arc;
 use tokio::runtime::{Builder, Runtime};
 
 use super::flow::{CircuitBreakerFlow, ClientFlow};
+use super::identity::IdentityRuntime;
 use super::model::config::{ConfigFile, ConfigGroup};
 use super::model::naming::{ServiceContractRequest, ServiceInstances};
 use super::plugin::cache::{Filter, ResourceCache, ResourceListener};
@@ -39,9 +40,8 @@ use crate::discovery::req::{
     ReportServiceContractRequest, ServiceRuleResponse,
 };
 use crate::traffic::faultdetect::{
-    register_fault_detect_resource_listeners, CircuitBreakerFaultDetectReporter,
-    DefaultFaultDetectProbeExecutor, FaultDetectLifecycleOwner, FaultDetectScheduler,
-    FaultDetectTarget,
+    CircuitBreakerFaultDetectReporter, DefaultFaultDetectProbeExecutor, FaultDetectLifecycleOwner,
+    FaultDetectScheduler, FaultDetectServiceWatcher, FaultDetectTarget,
 };
 
 pub struct Engine
@@ -55,10 +55,20 @@ where
     location_provider: Arc<LocationProvider>,
     _client_flow: ClientFlow,
     fault_detect_owner: Arc<FaultDetectLifecycleOwner>,
+    fault_detect_watcher: Arc<FaultDetectServiceWatcher>,
+    identity_runtime: Option<IdentityRuntime>,
 }
 
 impl Engine {
     pub fn new(arc_conf: Arc<Configuration>) -> Result<Self, PoleError> {
+        if let Some(identity) = arc_conf.global.client.service_identity_discovery.as_ref() {
+            identity.validate().map_err(|message| {
+                PoleError::new(
+                    crate::core::model::error::ErrorCode::InvalidConfig,
+                    message.into(),
+                )
+            })?;
+        }
         let runtime = Arc::new(
             Builder::new_multi_thread()
                 .enable_all()
@@ -67,6 +77,9 @@ impl Engine {
                 .build()
                 .unwrap(),
         );
+        // 插件初始化会创建 gRPC channel 和后台任务；SDKContext 是同步入口，因此必须显式进入
+        // 自己创建的 runtime，不能依赖调用方已经处于 Tokio runtime 中。
+        let _runtime_guard = runtime.enter();
         let client_ctx = crate::core::plugin::plugins::acquire_client_context(arc_conf.clone());
         let client_ctx = Arc::new(client_ctx);
 
@@ -91,15 +104,19 @@ impl Engine {
                 Arc::new(CircuitBreakerFaultDetectReporter::new(circuit_breaker_flow)),
             ),
         )));
-        let fault_detect_cache = local_cache.clone();
-        let fault_detect_owner_for_listener = fault_detect_owner.clone();
-        runtime.spawn(async move {
-            register_fault_detect_resource_listeners(
-                fault_detect_cache,
-                fault_detect_owner_for_listener,
-            )
-            .await;
-        });
+        let fault_detect_watcher = Arc::new(FaultDetectServiceWatcher::new(
+            local_cache.clone(),
+            fault_detect_owner.clone(),
+        ));
+
+        let identity_runtime = arc_conf
+            .global
+            .client
+            .service_identity_discovery
+            .clone()
+            .map(|config| {
+                IdentityRuntime::start(runtime.clone(), server_connector.clone(), config)
+            });
 
         Ok(Self {
             extensions: extension.clone(),
@@ -109,6 +126,8 @@ impl Engine {
             location_provider: location_provider,
             _client_flow: client_flow,
             fault_detect_owner,
+            fault_detect_watcher,
+            identity_runtime,
         })
     }
 
@@ -202,28 +221,11 @@ impl Engine {
         req: GetAllInstanceRequest,
         only_available: bool,
     ) -> Result<InstancesResponse, PoleError> {
-        let mut filter = HashMap::<String, String>::new();
-        filter.insert("service".to_string(), req.service.clone());
-
-        let ret = self
-            .local_cache
-            .load_service_instances(Filter {
-                resource_key: ResourceEventKey {
-                    namespace: req.namespace.clone(),
-                    event_type: EventType::Instance,
-                    filter,
-                },
-                internal_request: false,
-                include_cache: true,
-                timeout: req.timeout,
-            })
-            .await;
-
-        if ret.is_err() {
-            return Err(ret.err().unwrap());
-        }
-
-        let svc_ins = ret.unwrap();
+        // namespace/service 已明确时按需建立主动探测规则与实例订阅，避免启动期无界枚举。
+        let svc_ins = self
+            .fault_detect_watcher
+            .load_service_instances_for_access(&req.namespace, &req.service, req.timeout)
+            .await?;
 
         Ok(InstancesResponse {
             instances: ServiceInstances::new(
@@ -416,8 +418,28 @@ impl Engine {
         self.extensions.clone()
     }
 
+    pub(crate) fn workload_identity(&self) -> Option<crate::identity::WorkloadIdentity> {
+        self.identity_runtime
+            .as_ref()
+            .map(IdentityRuntime::workload_identity)
+    }
+
     pub fn start_fault_detect_targets(&self, targets: Vec<FaultDetectTarget>) {
         self.fault_detect_owner.start_targets(targets);
+    }
+
+    /// 为明确的服务目标启动主动探测规则与实例订阅。
+    ///
+    /// SDK 不枚举并订阅全部服务；调用方应在确定要治理的服务时显式调用此方法。
+    pub async fn start_fault_detect_for_service(
+        &self,
+        namespace: &str,
+        service: &str,
+        timeout: std::time::Duration,
+    ) -> Result<(), PoleError> {
+        self.fault_detect_watcher
+            .watch_service(namespace, service, timeout)
+            .await
     }
 
     pub fn get_fault_detect_lifecycle_owner(&self) -> Arc<FaultDetectLifecycleOwner> {

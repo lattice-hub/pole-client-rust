@@ -23,6 +23,7 @@ use crate::core::{
     },
     plugin::plugins::Plugin,
 };
+use crate::identity::AuthenticatedCaller;
 
 use super::plugins::Extensions;
 
@@ -47,6 +48,8 @@ impl RouterContainer {
 pub struct RouteContext {
     pub route_info: RouteInfo,
     pub extensions: Option<Arc<Extensions>>,
+    /// 仅能由 WorkloadCredential 验签器生成；不得从 caller/header/metadata 推导。
+    pub authenticated_caller: Option<AuthenticatedCaller>,
 }
 
 #[async_trait::async_trait]

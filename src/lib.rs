@@ -18,6 +18,8 @@ pub mod config;
 pub mod core;
 pub mod discovery;
 pub mod faultdetect;
+pub mod identity;
+pub mod observability;
 pub mod plugins;
 pub mod ratelimit;
 pub mod router;

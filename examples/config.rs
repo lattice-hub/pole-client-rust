@@ -145,6 +145,8 @@ async fn main() -> Result<(), PoleError> {
                 file_name: "rust.toml".to_string(),
                 release_name: "rust".to_string(),
                 md5: "".to_string(),
+                release_type: "normal".to_string(),
+                beta_labels: Vec::new(),
             },
         })
         .await;

@@ -69,6 +69,70 @@ fn explicit_discover_and_config_addrs_override_shared_client_addr() {
 }
 
 #[test]
+fn builds_sdk_bootstrap_configuration_from_e2e_addresses() {
+    let cfg = RunConfig::from_sources(
+        [
+            "e2e_tests",
+            "--console-url",
+            "http://127.0.0.1:8080",
+            "--discover-addr",
+            "10.0.0.1:8091",
+            "--config-addr",
+            "10.0.0.2:8093",
+        ],
+        env(&[]),
+    )
+    .expect("args should parse");
+
+    let configuration = cfg
+        .sdk_configuration("e2e-client")
+        .expect("e2e bootstrap configuration should be valid");
+
+    assert_eq!(configuration.global.client.id, "e2e-client");
+    assert_eq!(
+        configuration.global.server_connectors.discover.addresses,
+        vec!["10.0.0.1:8091".to_string()]
+    );
+    assert_eq!(
+        configuration.global.server_connectors.config.addresses,
+        vec!["10.0.0.2:8093".to_string()]
+    );
+}
+
+#[test]
+fn builds_independent_labeled_clients_for_gray_release_verification() {
+    let cfg = RunConfig::from_sources(
+        [
+            "e2e_tests",
+            "--console-url",
+            "http://127.0.0.1:8080",
+            "--client-addr",
+            "127.0.0.1:8091",
+        ],
+        env(&[]),
+    )
+    .unwrap();
+
+    let blue = cfg
+        .sdk_configuration_with_labels(
+            "client-blue",
+            HashMap::from([("tenant".to_string(), "blue".to_string())]),
+        )
+        .unwrap();
+    let green = cfg
+        .sdk_configuration_with_labels(
+            "client-green",
+            HashMap::from([("tenant".to_string(), "green".to_string())]),
+        )
+        .unwrap();
+
+    assert_eq!(blue.global.client.id, "client-blue");
+    assert_eq!(blue.global.client.labels["tenant"], "blue");
+    assert_eq!(green.global.client.id, "client-green");
+    assert_eq!(green.global.client.labels["tenant"], "green");
+}
+
+#[test]
 fn reads_required_inputs_from_environment() {
     let cfg = RunConfig::from_sources(
         ["e2e_tests"],

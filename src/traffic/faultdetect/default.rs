@@ -22,6 +22,7 @@ use std::{
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpStream, UdpSocket},
+    sync::OnceCell,
     task::JoinHandle,
     time::timeout,
 };
@@ -29,11 +30,14 @@ use tokio::{
 use crate::core::{
     flow::CircuitBreakerFlow,
     model::{
-        cache::{CacheItemType, EventType, ServerEvent},
+        cache::{
+            CacheItemType, EventType, ResourceEventKey, ServerEvent, ServiceInstancesCacheItem,
+        },
         circuitbreaker::{Resource, ResourceStat, RetStatus, ServiceResource},
-        naming::{ServiceInstances, ServiceKey},
+        error::{ErrorCode, PoleError},
+        naming::{ServiceInstances, ServiceKey, ServiceRule},
     },
-    plugin::cache::{Action, ResourceCache, ResourceListener},
+    plugin::cache::{Action, Filter, ResourceCache, ResourceListener},
 };
 use crate::traffic::faultdetect::{
     api::{FaultDetectProbeExecutor, FaultDetectReporter},
@@ -45,6 +49,7 @@ use crate::traffic::faultdetect::{
 
 #[derive(Clone)]
 pub struct FaultDetectScheduler {
+    // executor 只负责实际探测，reporter 负责把探测结果映射到熔断或其它统计面。
     executor: Arc<dyn FaultDetectProbeExecutor>,
     reporter: Arc<dyn FaultDetectReporter>,
 }
@@ -58,6 +63,7 @@ impl FaultDetectScheduler {
     }
 
     pub async fn run_once(&self, host: &str, plans: Vec<FaultDetectPlan>) {
+        // 单次执行用于测试和手动触发，不启动后台循环。
         for plan in plans {
             let result = self.executor.execute(host, &plan).await;
             self.reporter.report(&plan, &result).await;
@@ -75,6 +81,7 @@ impl FaultDetectScheduler {
         host: String,
         plans: Vec<FaultDetectPlan>,
     ) -> Vec<JoinHandle<()>> {
+        // 每个探测计划独立循环，避免一个慢探测阻塞同实例上的其它协议探测。
         plans
             .into_iter()
             .map(|plan| {
@@ -104,6 +111,7 @@ impl FaultDetectProbeExecutor for DefaultFaultDetectProbeExecutor {
 
 pub struct FaultDetectLifecycleOwner {
     scheduler: Arc<FaultDetectScheduler>,
+    // handles 是当前规则和实例快照生成的全部后台探测任务。
     handles: Mutex<Vec<JoinHandle<()>>>,
 }
 
@@ -140,8 +148,205 @@ impl Drop for FaultDetectLifecycleOwner {
     }
 }
 
+pub struct FaultDetectServiceWatcher {
+    resource_cache: Arc<Box<dyn ResourceCache>>,
+    rule_listener: Arc<FaultDetectResourceListener>,
+    instance_listener: Arc<FaultDetectResourceListener>,
+    listeners_registered: OnceCell<()>,
+}
+
+impl FaultDetectServiceWatcher {
+    pub fn new(
+        resource_cache: Arc<Box<dyn ResourceCache>>,
+        owner: Arc<FaultDetectLifecycleOwner>,
+    ) -> Self {
+        let state = Arc::new(FaultDetectResourceListenerState::default());
+        Self {
+            resource_cache,
+            rule_listener: Arc::new(FaultDetectResourceListener::with_state(
+                owner.clone(),
+                EventType::FaultDetectRule,
+                state.clone(),
+            )),
+            instance_listener: Arc::new(FaultDetectResourceListener::with_state(
+                owner,
+                EventType::Instance,
+                state,
+            )),
+            listeners_registered: OnceCell::new(),
+        }
+    }
+
+    pub async fn watch_service(
+        &self,
+        namespace: &str,
+        service: &str,
+        timeout: Duration,
+    ) -> Result<(), PoleError> {
+        self.ensure_listeners_registered().await;
+
+        let rule_filter =
+            fault_detect_service_filter(namespace, service, EventType::FaultDetectRule, timeout);
+        let instance_filter =
+            fault_detect_service_filter(namespace, service, EventType::Instance, timeout);
+        // 两个 future 都必须被轮询，确保即使其中一个加载失败，另一类 watch 仍会建立。
+        let (rules, instances) = tokio::join!(
+            self.resource_cache.load_service_rule(rule_filter),
+            self.resource_cache.load_service_instances(instance_filter)
+        );
+        let rules = rules?;
+        let instances = instances?;
+
+        self.apply_initial_snapshot(namespace, service, rules, &instances)
+            .await
+    }
+
+    /// 正常服务实例访问的集成入口：同一次明确服务加载建立实例与主动探测规则 watch。
+    ///
+    /// 主动探测规则暂时不可用时不阻断基础服务发现；实例快照仍会保存，后续规则事件到达
+    /// 后即可生成探测目标。
+    pub(crate) async fn load_service_instances_for_access(
+        &self,
+        namespace: &str,
+        service: &str,
+        timeout: Duration,
+    ) -> Result<ServiceInstancesCacheItem, PoleError> {
+        self.ensure_listeners_registered().await;
+
+        let rule_filter =
+            fault_detect_service_filter(namespace, service, EventType::FaultDetectRule, timeout);
+        let mut instance_filter =
+            fault_detect_service_filter(namespace, service, EventType::Instance, timeout);
+        instance_filter.internal_request = false;
+        let (rules, instances) = tokio::join!(
+            self.resource_cache.load_service_rule(rule_filter),
+            self.resource_cache.load_service_instances(instance_filter)
+        );
+        let instances = instances?;
+
+        match rules {
+            Ok(rules) => {
+                if let Err(err) = self
+                    .apply_initial_snapshot(namespace, service, rules, &instances)
+                    .await
+                {
+                    crate::warn!(
+                        "[pole][fault-detect] apply rules for {}/{} failed: {:?}",
+                        namespace,
+                        service,
+                        err
+                    );
+                    self.apply_instance_snapshot(namespace, service, &instances)
+                        .await;
+                    self.rule_listener.reload_targets();
+                }
+            }
+            Err(err) => {
+                crate::warn!(
+                    "[pole][fault-detect] load rules for {}/{} failed: {:?}",
+                    namespace,
+                    service,
+                    err
+                );
+                self.apply_instance_snapshot(namespace, service, &instances)
+                    .await;
+                self.rule_listener.reload_targets();
+            }
+        }
+
+        Ok(instances)
+    }
+
+    async fn ensure_listeners_registered(&self) {
+        self.listeners_registered
+            .get_or_init(|| async {
+                self.resource_cache
+                    .register_resource_listener(self.rule_listener.clone())
+                    .await;
+                self.resource_cache
+                    .register_resource_listener(self.instance_listener.clone())
+                    .await;
+            })
+            .await;
+    }
+
+    async fn apply_initial_snapshot(
+        &self,
+        namespace: &str,
+        service: &str,
+        service_rule: ServiceRule,
+        instances: &ServiceInstancesCacheItem,
+    ) -> Result<(), PoleError> {
+        let mut rules = Vec::with_capacity(service_rule.rules.len());
+        for rule in service_rule.rules {
+            let type_id = rule.type_id();
+            match rule.downcast::<FaultDetectRule>() {
+                Ok(rule) => rules.push(*rule),
+                Err(_) => {
+                    return Err(PoleError::new(
+                        ErrorCode::InvalidRule,
+                        format!(
+                            "rule type error, expect FaultDetectRule, but got {:?}",
+                            type_id
+                        ),
+                    ));
+                }
+            }
+        }
+
+        let key = format!("{}#{}", namespace, service);
+        self.rule_listener
+            .state
+            .plans
+            .lock()
+            .unwrap()
+            .insert(key.clone(), build_fault_detect_plans(&rules));
+        self.apply_instance_snapshot(namespace, service, instances)
+            .await;
+        self.rule_listener.reload_targets();
+        Ok(())
+    }
+
+    async fn apply_instance_snapshot(
+        &self,
+        namespace: &str,
+        service: &str,
+        instances: &ServiceInstancesCacheItem,
+    ) {
+        let service_instances = ServiceInstances::new(
+            instances.get_service_info(),
+            instances.list_instances(false).await,
+        );
+        self.rule_listener
+            .state
+            .instances
+            .lock()
+            .unwrap()
+            .insert(format!("{}#{}", namespace, service), service_instances);
+    }
+}
+
+fn fault_detect_service_filter(
+    namespace: &str,
+    service: &str,
+    event_type: EventType,
+    timeout: Duration,
+) -> Filter {
+    Filter {
+        resource_key: ResourceEventKey {
+            namespace: namespace.to_string(),
+            event_type,
+            filter: HashMap::from([("service".to_string(), service.to_string())]),
+        },
+        internal_request: true,
+        include_cache: true,
+        timeout,
+    }
+}
+
 #[derive(Default)]
 struct FaultDetectResourceListenerState {
+    // plans 和 instances 分别来自不同事件流，只有两边都到达后才能生成探测目标。
     plans: Mutex<HashMap<String, Vec<FaultDetectPlan>>>,
     instances: Mutex<HashMap<String, ServiceInstances>>,
 }
@@ -175,6 +380,7 @@ impl FaultDetectResourceListener {
 
     pub fn paired(owner: Arc<FaultDetectLifecycleOwner>) -> Vec<Arc<dyn ResourceListener>> {
         let state = Arc::new(FaultDetectResourceListenerState::default());
+        // 规则和实例监听器共享状态，任一侧更新都会重建当前服务的探测任务集合。
         vec![
             Arc::new(Self::with_state(
                 owner.clone(),
@@ -187,6 +393,7 @@ impl FaultDetectResourceListener {
 
     async fn apply_event(&self, action: Action, event: ServerEvent) {
         let key = fault_detect_service_key(&event);
+        // 删除事件只移除对应快照；新增/更新事件先落快照，再统一 reload_targets。
         match (action, event.value) {
             (Action::Delete, CacheItemType::FaultDetectRule(_)) => {
                 self.state.plans.lock().unwrap().remove(&key);
@@ -218,27 +425,20 @@ impl FaultDetectResourceListener {
     }
 
     fn reload_targets(&self) {
-        let all_plans = self
-            .state
-            .plans
-            .lock()
-            .unwrap()
-            .values()
-            .flat_map(|plans| plans.clone())
-            .collect::<Vec<_>>();
-        let instances = self
-            .state
-            .instances
-            .lock()
-            .unwrap()
-            .values()
-            .cloned()
-            .collect::<Vec<_>>();
-
-        let targets = instances
+        // 简化生命周期处理：每次规则或实例变化后停止旧任务，用最新快照重建。
+        // 这样不会留下引用旧规则或旧实例的后台探测循环。
+        // 规则与实例必须通过同一个 namespace#service 事件键配对。不能先展平规则，
+        // 否则缓存载荷中的服务信息陈旧时，可能把 A 服务的规则应用到 B 服务事件的实例。
+        let plans_by_service = self.state.plans.lock().unwrap().clone();
+        let instances_by_service = self.state.instances.lock().unwrap().clone();
+        let targets = instances_by_service
             .into_iter()
-            .flat_map(|service_instances| {
-                build_fault_detect_targets(&service_instances, all_plans.clone())
+            .flat_map(|(service_key, service_instances)| {
+                let plans = plans_by_service
+                    .get(&service_key)
+                    .cloned()
+                    .unwrap_or_default();
+                build_fault_detect_targets(&service_instances, plans)
             })
             .collect::<Vec<_>>();
 
@@ -306,6 +506,8 @@ pub fn fault_detect_result_to_resource_stat(
     plan: &FaultDetectPlan,
     result: &FaultDetectResult,
 ) -> ResourceStat {
+    // 主动探测结果汇入熔断统计时按服务资源上报，ret_code 使用规则 ID
+    // 便于后续区分是哪条探测规则触发的失败或超时。
     let status = if result.success {
         RetStatus::RetSuccess
     } else if result.message.to_ascii_lowercase().contains("timeout") {
@@ -329,6 +531,8 @@ pub fn build_fault_detect_plans(rules: &[FaultDetectRule]) -> Vec<FaultDetectPla
     let mut rules = rules.iter().collect::<Vec<_>>();
     rules.sort_by(|a, b| a.priority.cmp(&b.priority));
 
+    // spec 中一条 FaultDetectRule 可以包含多个子探测规则，这里展开为调度器
+    // 可直接执行的扁平计划列表。
     rules
         .into_iter()
         .flat_map(|rule| {
@@ -990,9 +1194,111 @@ mod tests {
         owner.stop();
     }
 
+    #[tokio::test]
+    async fn fault_detect_resource_listener_keeps_two_services_isolated() {
+        let executor = Arc::new(RecordingProbeExecutor::default());
+        let owner = Arc::new(FaultDetectLifecycleOwner::new(Arc::new(
+            FaultDetectScheduler::new(
+                executor.clone(),
+                Arc::new(RecordingFaultDetectReporter::default()),
+            ),
+        )));
+        let listener = FaultDetectResourceListener::new(owner.clone());
+
+        listener
+            .on_event(
+                Action::Update,
+                fault_detect_rule_event("orders", "fd-orders"),
+            )
+            .await;
+        listener
+            .on_event(
+                Action::Update,
+                fault_detect_rule_event("billing", "fd-billing"),
+            )
+            .await;
+        listener
+            .on_event(
+                Action::Update,
+                service_instances_event("orders", "orders", "10.0.0.1").await,
+            )
+            .await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        executor.calls.lock().unwrap().clear();
+
+        listener
+            .on_event(
+                Action::Update,
+                service_instances_event("billing", "billing", "10.0.0.2").await,
+            )
+            .await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        let mut calls = executor.calls.lock().unwrap().clone();
+        calls.sort();
+        assert_eq!(
+            calls,
+            vec![
+                ("10.0.0.1".to_string(), "fd-orders".to_string()),
+                ("10.0.0.2".to_string(), "fd-billing".to_string()),
+            ]
+        );
+        owner.stop();
+    }
+
+    #[tokio::test]
+    async fn fault_detect_resource_listener_never_uses_another_service_plan_for_stale_payload() {
+        let executor = Arc::new(RecordingProbeExecutor::default());
+        let owner = Arc::new(FaultDetectLifecycleOwner::new(Arc::new(
+            FaultDetectScheduler::new(
+                executor.clone(),
+                Arc::new(RecordingFaultDetectReporter::default()),
+            ),
+        )));
+        let listener = FaultDetectResourceListener::new(owner.clone());
+
+        listener
+            .on_event(
+                Action::Update,
+                fault_detect_rule_event("orders", "fd-orders"),
+            )
+            .await;
+        listener
+            .on_event(
+                Action::Update,
+                fault_detect_rule_event("billing", "fd-billing"),
+            )
+            .await;
+        listener
+            .on_event(
+                Action::Update,
+                service_instances_event("orders", "orders", "10.0.0.1").await,
+            )
+            .await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        executor.calls.lock().unwrap().clear();
+
+        // 事件键属于 billing，但缓存载荷仍带着旧的 orders 服务信息。
+        listener
+            .on_event(
+                Action::Update,
+                service_instances_event("billing", "orders", "10.0.0.2").await,
+            )
+            .await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        assert_eq!(
+            executor.calls.lock().unwrap().as_slice(),
+            &[("10.0.0.1".to_string(), "fd-orders".to_string())]
+        );
+        owner.stop();
+    }
+
     #[derive(Default)]
     struct RecordingResourceCache {
         watch_keys: Arc<Mutex<Vec<EventType>>>,
+        load_keys: Arc<Mutex<Vec<ResourceEventKey>>>,
+        serve_initial_snapshot: bool,
     }
 
     impl Plugin for RecordingResourceCache {
@@ -1009,8 +1315,35 @@ mod tests {
     impl ResourceCache for RecordingResourceCache {
         fn set_failover_provider(&mut self, _failover: Arc<dyn ResourceCacheFailover>) {}
 
-        async fn load_service_rule(&self, _filter: Filter) -> Result<ServiceRule, PoleError> {
-            Err(test_error())
+        async fn load_service_rule(&self, filter: Filter) -> Result<ServiceRule, PoleError> {
+            self.load_keys.lock().unwrap().push(filter.resource_key);
+            if self.serve_initial_snapshot {
+                return Ok(ServiceRule {
+                    rules: vec![Box::new(FaultDetectRule {
+                        id: "fd-orders".to_string(),
+                        target_service: Some(fault_detect_rule::DestinationService {
+                            namespace: "default".to_string(),
+                            service: "orders".to_string(),
+                            ..fault_detect_rule::DestinationService::default()
+                        }),
+                        rules: vec![FaultDetectSubRule {
+                            protocol: fault_detect_rule::Protocol::Tcp.into(),
+                            interval: 1,
+                            timeout: 1,
+                            port: 8080,
+                            ..FaultDetectSubRule::default()
+                        }],
+                        ..FaultDetectRule::default()
+                    })],
+                    revision: "rule-rev".to_string(),
+                    initialized: true,
+                });
+            }
+            Ok(ServiceRule {
+                rules: Vec::new(),
+                revision: "rule-rev".to_string(),
+                initialized: true,
+            })
         }
 
         async fn load_services(&self, _filter: Filter) -> Result<Services, PoleError> {
@@ -1019,9 +1352,13 @@ mod tests {
 
         async fn load_service_instances(
             &self,
-            _filter: Filter,
+            filter: Filter,
         ) -> Result<ServiceInstancesCacheItem, PoleError> {
-            Err(test_error())
+            self.load_keys.lock().unwrap().push(filter.resource_key);
+            if self.serve_initial_snapshot {
+                return Ok(service_instances_cache_item().await);
+            }
+            Ok(ServiceInstancesCacheItem::new())
         }
 
         async fn load_config_file(&self, _filter: Filter) -> Result<ConfigFile, PoleError> {
@@ -1058,11 +1395,152 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn fault_detect_service_watcher_subscribes_rules_and_instances_for_explicit_target() {
+        let cache = RecordingResourceCache::default();
+        let load_keys = cache.load_keys.clone();
+        let owner = Arc::new(FaultDetectLifecycleOwner::new(Arc::new(
+            FaultDetectScheduler::new(
+                Arc::new(RecordingProbeExecutor::default()),
+                Arc::new(RecordingFaultDetectReporter::default()),
+            ),
+        )));
+        let watcher = FaultDetectServiceWatcher::new(Arc::new(Box::new(cache)), owner);
+
+        watcher
+            .watch_service("prod", "orders", Duration::from_millis(50))
+            .await
+            .unwrap();
+
+        let mut load_keys = load_keys.lock().unwrap().clone();
+        load_keys.sort_by_key(|key| key.event_type.to_string());
+        assert_eq!(load_keys.len(), 2);
+        assert_eq!(load_keys[0].event_type, EventType::FaultDetectRule);
+        assert_eq!(load_keys[1].event_type, EventType::Instance);
+        for key in load_keys {
+            assert_eq!(key.namespace, "prod");
+            assert_eq!(key.filter.get("service"), Some(&"orders".to_string()));
+        }
+    }
+
+    #[tokio::test]
+    async fn fault_detect_service_watcher_starts_from_initial_cache_snapshot() {
+        let cache = RecordingResourceCache {
+            serve_initial_snapshot: true,
+            ..RecordingResourceCache::default()
+        };
+        let executor = Arc::new(RecordingProbeExecutor::default());
+        let owner = Arc::new(FaultDetectLifecycleOwner::new(Arc::new(
+            FaultDetectScheduler::new(
+                executor.clone(),
+                Arc::new(RecordingFaultDetectReporter::default()),
+            ),
+        )));
+        let watcher = FaultDetectServiceWatcher::new(Arc::new(Box::new(cache)), owner.clone());
+
+        watcher
+            .watch_service("default", "orders", Duration::from_millis(50))
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        assert_eq!(owner.running_task_count(), 1);
+        assert_eq!(
+            executor.calls.lock().unwrap().as_slice(),
+            &[("10.0.0.1".to_string(), "fd-orders".to_string())]
+        );
+        owner.stop();
+    }
+
+    #[tokio::test]
+    async fn normal_service_instance_access_starts_fault_detect_watch() {
+        let cache = RecordingResourceCache::default();
+        let load_keys = cache.load_keys.clone();
+        let owner = Arc::new(FaultDetectLifecycleOwner::new(Arc::new(
+            FaultDetectScheduler::new(
+                Arc::new(RecordingProbeExecutor::default()),
+                Arc::new(RecordingFaultDetectReporter::default()),
+            ),
+        )));
+        let watcher = FaultDetectServiceWatcher::new(Arc::new(Box::new(cache)), owner);
+
+        watcher
+            .load_service_instances_for_access("prod", "orders", Duration::from_millis(50))
+            .await
+            .unwrap();
+
+        let keys = load_keys.lock().unwrap();
+        assert_eq!(keys.len(), 2);
+        assert!(keys.iter().any(|key| {
+            key.event_type == EventType::FaultDetectRule
+                && key.namespace == "prod"
+                && key.filter.get("service") == Some(&"orders".to_string())
+        }));
+        assert!(keys.iter().any(|key| {
+            key.event_type == EventType::Instance
+                && key.namespace == "prod"
+                && key.filter.get("service") == Some(&"orders".to_string())
+        }));
+    }
+
     fn resource_event_key(event_type: EventType) -> ResourceEventKey {
         ResourceEventKey {
             namespace: "default".to_string(),
             event_type,
             filter: HashMap::from([("service".to_string(), "orders".to_string())]),
+        }
+    }
+
+    fn fault_detect_rule_event(service: &str, rule_id: &str) -> ServerEvent {
+        let mut item = FaultDetectRulesCacheItem::new();
+        item.value = vec![FaultDetectRule {
+            id: rule_id.to_string(),
+            target_service: Some(fault_detect_rule::DestinationService {
+                namespace: "default".to_string(),
+                service: service.to_string(),
+                ..fault_detect_rule::DestinationService::default()
+            }),
+            rules: vec![FaultDetectSubRule {
+                protocol: fault_detect_rule::Protocol::Tcp.into(),
+                interval: 1,
+                timeout: 1,
+                port: 8080,
+                ..FaultDetectSubRule::default()
+            }],
+            ..FaultDetectRule::default()
+        }];
+        ServerEvent {
+            event_key: ResourceEventKey {
+                namespace: "default".to_string(),
+                event_type: EventType::FaultDetectRule,
+                filter: HashMap::from([("service".to_string(), service.to_string())]),
+            },
+            value: CacheItemType::FaultDetectRule(item),
+        }
+    }
+
+    async fn service_instances_event(
+        event_service: &str,
+        payload_service: &str,
+        ip: &str,
+    ) -> ServerEvent {
+        let mut item = service_instances_cache_item().await;
+        item.svc_info.name = payload_service.to_string();
+        for instance in item.value.write().await.iter_mut() {
+            instance.service = payload_service.to_string();
+            instance.ip = ip.to_string();
+        }
+        for instance in item.available_instances.write().await.iter_mut() {
+            instance.service = payload_service.to_string();
+            instance.ip = ip.to_string();
+        }
+        ServerEvent {
+            event_key: ResourceEventKey {
+                namespace: "default".to_string(),
+                event_type: EventType::Instance,
+                filter: HashMap::from([("service".to_string(), event_service.to_string())]),
+            },
+            value: CacheItemType::Instance(item),
         }
     }
 

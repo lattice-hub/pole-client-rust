@@ -13,71 +13,52 @@
 // CONDITIONS OF ANY KIND, either express or implied. See the License for the
 // specific language governing permissions and limitations under the License.
 
+use std::sync::Arc;
+
 use crate::core::config::config::{load_default, Configuration};
 use crate::core::engine::Engine;
 use crate::core::model::error::{ErrorCode, PoleError};
 use crate::info;
-use std::sync::Arc;
 
+/// SDKContext 持有启动期静态配置和与其对应的 Engine。
+///
+/// 流量治理能力默认参与执行，是否产生实际效果完全由控制面下发的规则及规则自身状态决定。
 pub struct SDKContext {
     pub conf: Arc<Configuration>,
     engine: Arc<Engine>,
 }
 
-impl Drop for SDKContext {
-    fn drop(&mut self) {}
-}
-
 impl SDKContext {
-    // default
+    /// default 从本地配置文件创建 SDK 上下文。
     pub fn default() -> Result<SDKContext, PoleError> {
-        let cfg_opt = load_default();
-        match cfg_opt {
+        match load_default() {
             Ok(conf) => SDKContext::create_by_configuration(conf),
             Err(err) => Err(PoleError::new(ErrorCode::InternalError, err.to_string())),
         }
     }
 
-    // create_by_addresses
+    /// create_by_addresses 使用本地配置，并以调用方提供的控制面地址覆盖 connector 地址。
     pub fn create_by_addresses(addresses: Vec<String>) -> Result<SDKContext, PoleError> {
-        let cfg_opt = load_default();
-        if cfg_opt.is_err() {
-            return Err(PoleError::new(
-                ErrorCode::InternalError,
-                cfg_opt.err().unwrap().to_string(),
-            ));
-        }
-        let mut conf = cfg_opt.unwrap();
-
+        let mut conf = load_default()
+            .map_err(|err| PoleError::new(ErrorCode::InternalError, err.to_string()))?;
         conf.global.update_server_connector_address(addresses);
-
         SDKContext::create_by_configuration(conf)
     }
 
-    // create_by_configuration
-    pub fn create_by_configuration(cfg: Configuration) -> Result<SDKContext, PoleError> {
+    pub fn create_by_configuration(conf: Configuration) -> Result<SDKContext, PoleError> {
         let start_time = std::time::Instant::now();
-        let cfg = Arc::new(cfg);
-        let ret = Engine::new(cfg.clone());
+        let conf = Arc::new(conf);
+        let engine = Arc::new(Engine::new(conf.clone())?);
         info!("create engine cost: {:?}", start_time.elapsed());
-        info!("create engine cost: {:?}", start_time.elapsed());
-        if ret.is_err() {
-            return Err(ret.err().unwrap());
-        }
-        Ok(Self {
-            conf: cfg,
-            engine: Arc::new(ret.ok().unwrap()),
-        })
+        Ok(Self { conf, engine })
     }
 
     pub fn get_engine(&self) -> Arc<Engine> {
         self.engine.clone()
     }
-}
 
-mod tests {
-    #[test]
-    fn it_works() {
-        assert_eq!(2 + 2, 4);
+    /// 返回数据面 workload 身份句柄。业务需要显式挂载 HTTP/tonic 适配器。
+    pub fn workload_identity(&self) -> Option<crate::identity::WorkloadIdentity> {
+        self.engine.workload_identity()
     }
 }

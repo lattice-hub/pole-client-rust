@@ -26,6 +26,9 @@ use crate::core::model::naming::{
 };
 use crate::core::model::{ClientContext, ReportClientRequest};
 use crate::core::plugin::plugins::Plugin;
+use pole_specification::v1::{
+    WorkloadCredentialIssueRequest, WorkloadCredentialRenewRequest, WorkloadCredentialResponse,
+};
 
 use super::filter::DiscoverFilter;
 
@@ -91,6 +94,22 @@ pub trait Connector: Plugin {
         &self,
         req: ConfigPublishRequest,
     ) -> Result<bool, PoleError>;
+
+    /// 使用 control-plane metadata 中的 service token 领取数据面凭证。
+    async fn issue_workload_credential(
+        &self,
+        _req: WorkloadCredentialIssueRequest,
+    ) -> Result<WorkloadCredentialResponse, PoleError> {
+        Err(unsupported_connector("issue_workload_credential"))
+    }
+
+    /// 使用 service token 与尚未过期的当前凭证续期。
+    async fn renew_workload_credential(
+        &self,
+        _req: WorkloadCredentialRenewRequest,
+    ) -> Result<WorkloadCredentialResponse, PoleError> {
+        Err(unsupported_connector("renew_workload_credential"))
+    }
 }
 
 #[derive(Default)]
@@ -110,6 +129,13 @@ fn unsupported_noop_connector(operation: &str) -> PoleError {
     PoleError::new(
         ErrorCode::NotSupport,
         format!("noop connector does not support {operation}"),
+    )
+}
+
+fn unsupported_connector(operation: &str) -> PoleError {
+    PoleError::new(
+        ErrorCode::NotSupport,
+        format!("connector does not support {operation}"),
     )
 }
 
@@ -229,6 +255,8 @@ mod noop_tests {
                 file_name: "file".to_string(),
                 release_name: "release".to_string(),
                 md5: String::new(),
+                release_type: "normal".to_string(),
+                beta_labels: Vec::new(),
             },
         }
     }

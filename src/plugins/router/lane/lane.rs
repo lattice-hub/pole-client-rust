@@ -55,6 +55,8 @@ impl LaneRouter {
         let local_cache = extensions.get_resource_cache();
         let callee = &route_ctx.route_info.callee;
 
+        // 泳道规则以被调服务为发布和缓存主键，主调条件在 LaneRule 的
+        // traffic_match_rule 中表达。
         let mut filter = HashMap::<String, String>::new();
         filter.insert("service".to_string(), callee.name.clone());
         let service_rule = local_cache
@@ -130,6 +132,7 @@ impl ServiceRouter for LaneRouter {
 }
 
 fn lane_groups_from_service_rule(service_rule: ServiceRule) -> Result<Vec<LaneGroup>, PoleError> {
+    // ResourceCache 统一返回 Any，这里只接受 LaneGroup，避免路由链误用其它规则。
     let mut groups = Vec::with_capacity(service_rule.rules.len());
     for rule in service_rule.rules {
         let type_id = rule.type_id();
@@ -152,6 +155,7 @@ fn filter_instances_by_lane_groups(
     instances: &ServiceInstances,
     lane_groups: &[LaneGroup],
 ) -> ServiceInstances {
+    // 多个泳道组最终展开为 LaneRule 列表，并按 priority 从小到大尝试命中。
     let mut rules = lane_groups
         .iter()
         .flat_map(|group| group.rules.iter())
@@ -163,10 +167,12 @@ fn filter_instances_by_lane_groups(
         let Some(traffic_match_rule) = &rule.traffic_match_rule else {
             continue;
         };
+        // 泳道先匹配请求流量，再用实例 metadata 上的泳道标签选目标实例。
         if !traffic_match_rule_match(route_ctx, traffic_match_rule) {
             continue;
         }
 
+        // spec 未显式配置 label_key 时使用默认 lane 标签，兼容最常见的泳道模型。
         let label_key = if rule.label_key.is_empty() {
             "lane"
         } else {
@@ -190,6 +196,8 @@ fn filter_instances_by_lane_groups(
             return ServiceInstances::new(instances.service.clone(), filtered);
         }
 
+        // 流量命中泳道规则但没有可用泳道实例时，Permissive 回退全量实例，
+        // Strict 返回空实例，交由上层路由链处理无实例结果。
         return match rule.match_mode() {
             lane_rule::LaneMatchMode::Permissive => instances.clone(),
             lane_rule::LaneMatchMode::Strict => {
@@ -229,6 +237,7 @@ mod tests {
         RouteContext {
             route_info,
             extensions: None,
+            authenticated_caller: None,
         }
     }
 

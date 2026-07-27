@@ -378,6 +378,8 @@ pub enum ServiceRuleType {
 
 impl ServiceRuleType {
     pub fn to_event_type(&self) -> EventType {
+        // 对外 API 使用 ServiceRuleType，缓存和订阅系统使用 EventType；
+        // 这里是所有治理规则从 API 请求进入本地缓存的统一映射边界。
         match self {
             ServiceRuleType::Router => EventType::RouterRule,
             ServiceRuleType::CircuitBreaker => EventType::CircuitBreakerRule,

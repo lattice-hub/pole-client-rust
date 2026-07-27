@@ -2,11 +2,35 @@
 title: 知识库变更日志
 tags: [meta, log]
 links: [index]
-updated: 2026-07-04
+updated: 2026-07-18
 sources: 1
 ---
 
 # 知识库变更日志
+
+## [2026-07-18] ingest | 补齐规则驱动的分布式限流与连接配置收敛
+
+- 新增页面：`technical/observability-architecture.md`
+- 更新页面：`technical/sdk-module-architecture.md`、`tasks/todo.md`、`tasks/lessons.md`
+- 变更摘要：发布公开 `polaris.metric.v2` Rust API 的 specification tag，SDK 按 `RateLimit.cluster` 懒加载并复用双向 gRPC 配额流；`serverConnectors` 收敛为 discover/config/observability 三个直连目标，观测 Collector 不再经 SDK 二次发现。
+
+## [2026-07-17] ingest | 收敛 SDK 样例配置与 schema
+
+- 新增页面：无
+- 更新页面：`technical/sdk-module-architecture.md`、`_meta/log.md`、`tasks/todo.md`
+- 变更摘要：将样例缓存配置迁移到 `consumer.localCache`，补齐 client identity 和默认负载均衡策略；删除失效 stat reporter 与治理模块本地开关，并以反序列化测试约束样例和 schema 同步。
+
+## [2026-07-17] ingest | 撤销 SDK 动态治理开关
+
+- 新增页面：无
+- 更新页面：`technical/sdk-module-architecture.md`、`_meta/index.md`、`_meta/log.md`、`tasks/todo.md`
+- 变更摘要：治理能力默认参与执行，实际效果只由控制面规则及规则自身状态决定；移除 SDK 模块级远端开关、订阅和 E2E case，避免两套状态来源。
+
+## [2026-07-12] ingest | 记录 Rust SDK 观测能力基础架构
+
+- 新增页面：`technical/observability-architecture.md`
+- 更新页面：`_meta/index.md`、`_meta/log.md`、`tasks/todo.md`
+- 变更摘要：根据控制面观测 ADR 和本仓实现记录 `observability` 顶层模块、`global.observability` 配置入口、OTel env 解析、Pole endpoint discovery、治理决策关联字段和 metrics 低基数保护边界。
 
 ## [2026-07-04] ingest | 记录流量治理 API 匹配索引
 

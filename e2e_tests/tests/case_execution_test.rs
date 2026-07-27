@@ -72,6 +72,7 @@ async fn lossless_case_executes_behavior_assertion_before_cleanup() {
 
     let mut cfg = config();
     cfg.console_url = format!("http://{addr}");
+    cfg.client_addr = Some("127.0.0.1:1".to_string());
     cfg.execute_governance_control_plane = true;
     let lossless = default_cases()
         .into_iter()
@@ -134,6 +135,7 @@ async fn fault_detect_case_executes_behavior_assertion_before_cleanup() {
 
     let mut cfg = config();
     cfg.console_url = format!("http://{addr}");
+    cfg.client_addr = Some("127.0.0.1:1".to_string());
     cfg.execute_governance_control_plane = true;
     let case = default_cases()
         .into_iter()
@@ -248,6 +250,7 @@ async fn routing_case_executes_behavior_assertion_before_cleanup() {
 
     let mut cfg = config();
     cfg.console_url = format!("http://{addr}");
+    cfg.client_addr = Some("127.0.0.1:1".to_string());
     cfg.execute_governance_control_plane = true;
     let routing = default_cases()
         .into_iter()

@@ -19,7 +19,6 @@ use std::time::Duration;
 #[derive(Deserialize, Debug)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ProviderConfig {
-    pub rate_limit: RateLimitConfig,
     pub lossless: LosslessConfig,
     #[serde(with = "serde_duration_ext", default = "default_min_register_interval")]
     pub min_register_interval: Duration,
@@ -32,24 +31,7 @@ fn default_min_register_interval() -> Duration {
 
 #[derive(Deserialize, Debug)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct RateLimitConfig {
-    pub enable: bool,
-    pub service: String,
-    pub namespace: String,
-    pub addresses: Option<Vec<String>>,
-    pub max_window_count: u32,
-    pub fallback_on_exceed_window_count: String,
-    #[serde(with = "serde_duration_ext")]
-    pub remote_sync_timeout: Duration,
-    #[serde(with = "serde_duration_ext")]
-    pub max_queuing_time: Duration,
-    pub report_metrics: bool,
-}
-
-#[derive(Deserialize, Debug)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct LosslessConfig {
-    pub enable: bool,
     pub host: String,
     pub port: u32,
     #[serde(with = "serde_duration_ext")]

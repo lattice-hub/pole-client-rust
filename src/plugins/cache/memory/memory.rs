@@ -35,12 +35,12 @@ use crate::core::plugin::plugins::Plugin;
 use crate::{error, info};
 use std::any::Any;
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock as SyncRwLock};
 
 static MEMORY_CACHE_NAME: &str = "memory";
 
 struct MemoryResourceHandler {
-    failover: Option<Arc<dyn ResourceCacheFailover>>,
+    failover: SyncRwLock<Option<Arc<dyn ResourceCacheFailover>>>,
     // 资源类型变化监听
     listeners: Arc<RwLock<HashMap<EventType, Vec<Arc<dyn ResourceListener>>>>>,
     // services 服务列表缓存
@@ -77,8 +77,6 @@ pub struct MemoryCache {
     server_connector: Arc<Box<dyn Connector>>,
     handler: Arc<MemoryResourceHandler>,
     remote_sender: UnboundedSender<RemoteData>,
-    //
-    failover: Option<Arc<dyn ResourceCacheFailover>>,
 }
 
 impl MemoryCache {
@@ -134,6 +132,36 @@ impl MemoryCache {
         });
     }
 
+    async fn recover_service_rule_from_failover(&self, filter: &Filter) {
+        if !filter.include_cache {
+            return;
+        }
+        let failover = self
+            .handler
+            .failover
+            .read()
+            .ok()
+            .and_then(|provider| provider.clone());
+        let Some(failover) = failover else {
+            return;
+        };
+        let Ok(response) = failover.failover_naming_load(filter.clone()).await else {
+            return;
+        };
+        if response.service.is_none() {
+            return;
+        }
+        Self::on_spec_event(
+            self.handler.clone(),
+            RemoteData {
+                event_key: filter.resource_key.clone(),
+                discover_value: Some(response),
+                config_value: None,
+            },
+        )
+        .await;
+    }
+
     async fn on_spec_event(handler: Arc<MemoryResourceHandler>, event: RemoteData) {
         info!("[pole][resource_cache][memory] on spec event: {:?}", event);
         let mut notify_event = ServerEvent {
@@ -165,11 +193,17 @@ impl MemoryCache {
                 }
                 let cache_val = cache_val_opt.unwrap();
                 let mut instances = cache_val.value.write().await;
+                let mut available_instances = cache_val.available_instances.write().await;
 
                 instances.clear();
+                available_instances.clear();
                 let remote_instances = remote_val.instances;
                 for (_, val) in remote_instances.iter().enumerate() {
-                    instances.push(Instance::convert_from_spec(val.clone()));
+                    let instance = Instance::convert_from_spec(val.clone());
+                    if instance.is_available() {
+                        available_instances.push(instance.clone());
+                    }
+                    instances.push(instance);
                 }
 
                 cache_val.revision = svc.revision;
@@ -389,10 +423,12 @@ impl MemoryCache {
                     return;
                 }
                 let cache_val = cache_val_opt.unwrap();
-                let remote_rules = event.config_value.unwrap().file.unwrap_or_default();
+                let remote_value = event.config_value.unwrap();
+                let revision = remote_value.revision.clone();
+                let remote_rules = remote_value.file.unwrap_or_default();
                 cache_val.value.clone_from(&remote_rules);
 
-                cache_val.revision = remote_rules.version.to_string();
+                cache_val.revision = revision;
                 cache_val.finish_initialize();
                 notify_event.value = CacheItemType::ConfigFile(cache_val.clone());
             }
@@ -431,20 +467,28 @@ impl MemoryCache {
 
         // 容灾调用
         if copy_event.discover_value.is_some() {
-            let _ = handler
+            let failover = handler
                 .failover
-                .clone()
-                .unwrap()
-                .save_naming_failover(copy_event.discover_value.unwrap())
-                .await;
+                .read()
+                .ok()
+                .and_then(|provider| provider.clone());
+            if let Some(failover) = failover {
+                let _ = failover
+                    .save_naming_failover(copy_event.discover_value.unwrap())
+                    .await;
+            }
         }
         if copy_event.config_value.is_some() {
-            let _ = handler
+            let failover = handler
                 .failover
-                .clone()
-                .unwrap()
-                .save_config_failover(copy_event.config_value.unwrap())
-                .await;
+                .read()
+                .ok()
+                .and_then(|provider| provider.clone());
+            if let Some(failover) = failover {
+                let _ = failover
+                    .save_config_failover(copy_event.config_value.unwrap())
+                    .await;
+            }
         }
 
         // 通知所有的 listener
@@ -469,7 +513,7 @@ fn new_resource_cache(opt: InitResourceCacheOption) -> Box<dyn ResourceCache> {
         opt,
         server_connector,
         handler: Arc::new(MemoryResourceHandler {
-            failover: Some(failover.clone()),
+            failover: SyncRwLock::new(Some(failover)),
             listeners: Arc::new(RwLock::new(HashMap::new())),
             services: Arc::new(RwLock::new(HashMap::new())),
             instances: Arc::new(RwLock::new(HashMap::new())),
@@ -486,8 +530,6 @@ fn new_resource_cache(opt: InitResourceCacheOption) -> Box<dyn ResourceCache> {
             config_files: Arc::new(RwLock::new(HashMap::new())),
         }),
         remote_sender: sx,
-        // 默认使用磁盘容灾
-        failover: Some(failover),
     };
 
     let handler = mc.handler.clone();
@@ -511,10 +553,12 @@ impl Plugin for MemoryCache {
 #[async_trait::async_trait]
 impl ResourceCache for MemoryCache {
     fn set_failover_provider(&mut self, failover: Arc<dyn ResourceCacheFailover>) {
-        self.failover = Some(failover);
+        *self.handler.failover.write().unwrap() = Some(failover);
     }
 
     async fn load_service_rule(&self, filter: Filter) -> Result<ServiceRule, PoleError> {
+        // 治理规则按 namespace#service 缓存。首次读取时创建占位缓存并提交 watch，
+        // 随后在锁外等待初始化完成，最后以 Any 列表返回给各治理能力自行 downcast。
         let event_type = filter.get_event_type();
         let search_namespace = filter.resource_key.namespace.clone();
         let search_service = filter.resource_key.filter.get("service").unwrap();
@@ -541,6 +585,13 @@ impl ResourceCache for MemoryCache {
                 };
                 waiter();
 
+                let initialized = {
+                    let safe_map = self.handler.router_rules.read().await;
+                    safe_map.get(&search_key).unwrap().is_initialized()
+                };
+                if !initialized {
+                    self.recover_service_rule_from_failover(&filter).await;
+                }
                 let safe_map = self.handler.router_rules.read().await;
                 let cache_val = safe_map.get(&search_key).unwrap();
                 // 如果还是没有初始化
@@ -581,6 +632,13 @@ impl ResourceCache for MemoryCache {
                 };
                 waiter();
 
+                let initialized = {
+                    let safe_map = self.handler.ratelimit_rules.read().await;
+                    safe_map.get(&search_key).unwrap().is_initialized()
+                };
+                if !initialized {
+                    self.recover_service_rule_from_failover(&filter).await;
+                }
                 let safe_map = self.handler.ratelimit_rules.read().await;
                 let cache_val = safe_map.get(&search_key).unwrap();
                 // 如果还是没有初始化
@@ -621,6 +679,13 @@ impl ResourceCache for MemoryCache {
                 };
                 waiter();
 
+                let initialized = {
+                    let safe_map = self.handler.circuitbreaker_rules.read().await;
+                    safe_map.get(&search_key).unwrap().is_initialized()
+                };
+                if !initialized {
+                    self.recover_service_rule_from_failover(&filter).await;
+                }
                 let safe_map = self.handler.circuitbreaker_rules.read().await;
                 let cache_val = safe_map.get(&search_key).unwrap();
                 // 如果还是没有初始化
@@ -661,6 +726,13 @@ impl ResourceCache for MemoryCache {
                 };
                 waiter();
 
+                let initialized = {
+                    let safe_map = self.handler.faultdetect_rules.read().await;
+                    safe_map.get(&search_key).unwrap().is_initialized()
+                };
+                if !initialized {
+                    self.recover_service_rule_from_failover(&filter).await;
+                }
                 let safe_map = self.handler.faultdetect_rules.read().await;
                 let cache_val = safe_map.get(&search_key).unwrap();
                 // 如果还是没有初始化
@@ -695,6 +767,13 @@ impl ResourceCache for MemoryCache {
                 };
                 waiter();
 
+                let initialized = {
+                    let safe_map = self.handler.lane_rules.read().await;
+                    safe_map.get(&search_key).unwrap().is_initialized()
+                };
+                if !initialized {
+                    self.recover_service_rule_from_failover(&filter).await;
+                }
                 let safe_map = self.handler.lane_rules.read().await;
                 let cache_val = safe_map.get(&search_key).unwrap();
                 if !cache_val.is_initialized() {
@@ -732,6 +811,13 @@ impl ResourceCache for MemoryCache {
                 };
                 waiter();
 
+                let initialized = {
+                    let safe_map = self.handler.lossless_rules.read().await;
+                    safe_map.get(&search_key).unwrap().is_initialized()
+                };
+                if !initialized {
+                    self.recover_service_rule_from_failover(&filter).await;
+                }
                 let safe_map = self.handler.lossless_rules.read().await;
                 let cache_val = safe_map.get(&search_key).unwrap();
                 if !cache_val.is_initialized() {
@@ -769,6 +855,13 @@ impl ResourceCache for MemoryCache {
                 };
                 waiter();
 
+                let initialized = {
+                    let safe_map = self.handler.traffic_security_rules.read().await;
+                    safe_map.get(&search_key).unwrap().is_initialized()
+                };
+                if !initialized {
+                    self.recover_service_rule_from_failover(&filter).await;
+                }
                 let safe_map = self.handler.traffic_security_rules.read().await;
                 let cache_val = safe_map.get(&search_key).unwrap();
                 if !cache_val.is_initialized() {
@@ -806,6 +899,13 @@ impl ResourceCache for MemoryCache {
                 };
                 waiter();
 
+                let initialized = {
+                    let safe_map = self.handler.traffic_mirror_rules.read().await;
+                    safe_map.get(&search_key).unwrap().is_initialized()
+                };
+                if !initialized {
+                    self.recover_service_rule_from_failover(&filter).await;
+                }
                 let safe_map = self.handler.traffic_mirror_rules.read().await;
                 let cache_val = safe_map.get(&search_key).unwrap();
                 if !cache_val.is_initialized() {
@@ -843,6 +943,13 @@ impl ResourceCache for MemoryCache {
                 };
                 waiter();
 
+                let initialized = {
+                    let safe_map = self.handler.traffic_mock_rules.read().await;
+                    safe_map.get(&search_key).unwrap().is_initialized()
+                };
+                if !initialized {
+                    self.recover_service_rule_from_failover(&filter).await;
+                }
                 let safe_map = self.handler.traffic_mock_rules.read().await;
                 let cache_val = safe_map.get(&search_key).unwrap();
                 if !cache_val.is_initialized() {
@@ -1080,11 +1187,14 @@ mod tests {
         TrafficMirrorRulesCacheItem, TrafficMockRulesCacheItem, TrafficSecurityRulesCacheItem,
     };
     use crate::core::plugin::cache::ResourceCacheFailover;
+    use crate::core::plugin::connector::NoopConnector;
     use pole_specification::v1::{
-        discover_response::DiscoverResponseType, Code, ConfigDiscoverResponse, DiscoverResponse,
-        FaultDetectRule, LaneGroup, LosslessRule, Service, TrafficMirror, TrafficMock,
-        TrafficSecurityRule,
+        discover_response::DiscoverResponseType, CircuitBreakerRule, Code, ConfigDiscoverResponse,
+        DiscoverResponse, FaultDetectRule, LaneGroup, LosslessRule, RateLimit, RouteRule, Service,
+        TrafficMirror, TrafficMock, TrafficSecurityRule,
     };
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
 
     struct NoopFailover;
 
@@ -1116,14 +1226,135 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct RecordingFailover {
+        load_calls: AtomicUsize,
+        save_calls: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl ResourceCacheFailover for RecordingFailover {
+        async fn failover_naming_load(
+            &self,
+            filter: Filter,
+        ) -> Result<DiscoverResponse, PoleError> {
+            self.load_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(governance_response(filter.get_event_type()))
+        }
+
+        async fn save_naming_failover(&self, _value: DiscoverResponse) -> Result<(), PoleError> {
+            self.save_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        async fn failover_config_load(
+            &self,
+            _filter: Filter,
+        ) -> Result<ConfigDiscoverResponse, PoleError> {
+            Ok(ConfigDiscoverResponse::default())
+        }
+
+        async fn save_config_failover(
+            &self,
+            _value: ConfigDiscoverResponse,
+        ) -> Result<(), PoleError> {
+            Ok(())
+        }
+    }
+
+    fn governance_response(event_type: EventType) -> DiscoverResponse {
+        let mut response = DiscoverResponse {
+            code: Code::ExecuteSuccess as u32,
+            service: Some(Service {
+                namespace: "default".to_string(),
+                name: "svc-a".to_string(),
+                revision: "failover-rev".to_string(),
+                ..Service::default()
+            }),
+            ..DiscoverResponse::default()
+        };
+        match event_type {
+            EventType::RouterRule => {
+                response.set_type(DiscoverResponseType::CustomRouteRule);
+                response.custom_route_rules.push(RouteRule::default());
+            }
+            EventType::RateLimitRule => {
+                response.set_type(DiscoverResponseType::RateLimit);
+                response.rate_limit.push(RateLimit::default());
+            }
+            EventType::CircuitBreakerRule => {
+                response.set_type(DiscoverResponseType::CircuitBreaker);
+                response.circuit_breaker.push(CircuitBreakerRule::default());
+            }
+            EventType::FaultDetectRule => {
+                response.set_type(DiscoverResponseType::FaultDetector);
+                response.fault_detect_rules.push(FaultDetectRule::default());
+            }
+            EventType::LaneRule => {
+                response.set_type(DiscoverResponseType::Lane);
+                response.lanes.push(LaneGroup::default());
+            }
+            EventType::LosslessRule => {
+                response.set_type(DiscoverResponseType::Lossless);
+                response.lossless_rules.push(LosslessRule::default());
+            }
+            EventType::TrafficSecurityRule => {
+                response.set_type(DiscoverResponseType::TrafficSecurityRule);
+                response
+                    .traffic_security_rules
+                    .push(TrafficSecurityRule::default());
+            }
+            EventType::TrafficMirrorRule => {
+                response.set_type(DiscoverResponseType::TrafficMirrorRule);
+                response.traffic_mirror_rules.push(TrafficMirror::default());
+            }
+            EventType::TrafficMockRule => {
+                response.set_type(DiscoverResponseType::TrafficMockRule);
+                response.traffic_mock_rules.push(TrafficMock::default());
+            }
+            _ => panic!("not a governance event type: {event_type:?}"),
+        }
+        response
+    }
+
+    fn governance_filter(event_type: EventType) -> Filter {
+        Filter {
+            resource_key: event_key(event_type),
+            include_cache: true,
+            timeout: Duration::ZERO,
+            ..Filter::default()
+        }
+    }
+
+    fn memory_cache_for_failover_test(
+        runtime: Arc<tokio::runtime::Runtime>,
+    ) -> Box<dyn ResourceCache> {
+        new_resource_cache(InitResourceCacheOption {
+            conf: crate::core::config::global::LocalCacheConfig {
+                name: "memory".to_string(),
+                service_expire_enable: false,
+                service_expire_time: Duration::ZERO,
+                service_refresh_interval: Duration::ZERO,
+                service_list_refresh_interval: Duration::ZERO,
+                persist_enable: false,
+                persist_dir: String::new(),
+            },
+            runtime,
+            server_connector: Arc::new(Box::new(NoopConnector::default())),
+        })
+    }
+
     fn handler_for_rule_tests() -> Arc<MemoryResourceHandler> {
         let service_key = "default#svc-a".to_string();
 
         Arc::new(MemoryResourceHandler {
-            failover: Some(Arc::new(NoopFailover)),
+            failover: SyncRwLock::new(Some(Arc::new(NoopFailover))),
             listeners: Arc::new(RwLock::new(HashMap::new())),
             services: Arc::new(RwLock::new(HashMap::new())),
-            instances: Arc::new(RwLock::new(HashMap::new())),
+            instances: Arc::new(RwLock::new(HashMap::from([(
+                service_key.clone(),
+                ServiceInstancesCacheItem::new(),
+            )]))),
             router_rules: Arc::new(RwLock::new(HashMap::new())),
             ratelimit_rules: Arc::new(RwLock::new(HashMap::new())),
             circuitbreaker_rules: Arc::new(RwLock::new(HashMap::new())),
@@ -1324,5 +1555,110 @@ mod tests {
         assert!(mock_item.is_initialized());
         assert_eq!(mock_item.revision(), "rev-2");
         assert_eq!(mock_item.value[0].id, "mock-a");
+    }
+
+    #[tokio::test]
+    async fn on_spec_event_updates_available_instance_cache() {
+        let handler = handler_for_rule_tests();
+
+        emit(
+            handler.clone(),
+            EventType::Instance,
+            DiscoverResponse {
+                code: Code::ExecuteSuccess as u32,
+                r#type: DiscoverResponseType::Instance.into(),
+                service: Some(service()),
+                instances: vec![
+                    pole_specification::v1::Instance {
+                        namespace: "default".to_string(),
+                        service: "svc-a".to_string(),
+                        host: "127.0.0.1".to_string(),
+                        port: 8080,
+                        weight: 100,
+                        healthy: true,
+                        isolate: false,
+                        ..pole_specification::v1::Instance::default()
+                    },
+                    pole_specification::v1::Instance {
+                        namespace: "default".to_string(),
+                        service: "svc-a".to_string(),
+                        host: "127.0.0.2".to_string(),
+                        port: 8080,
+                        weight: 0,
+                        healthy: true,
+                        isolate: false,
+                        ..pole_specification::v1::Instance::default()
+                    },
+                ],
+                ..DiscoverResponse::default()
+            },
+        )
+        .await;
+
+        let instances = handler.instances.read().await;
+        let item = instances.get("default#svc-a").unwrap();
+        assert!(item.is_initialized());
+        assert_eq!(item.list_instances(false).await.len(), 2);
+
+        let available = item.list_instances(true).await;
+        assert_eq!(available.len(), 1);
+        assert_eq!(available[0].ip, "127.0.0.1");
+        assert_eq!(available[0].weight, 100);
+    }
+
+    #[test]
+    fn load_service_rule_recovers_every_governance_type_from_configured_failover() {
+        let runtime = Arc::new(tokio::runtime::Runtime::new().unwrap());
+        runtime.block_on(async {
+            let event_types = [
+                EventType::RouterRule,
+                EventType::RateLimitRule,
+                EventType::CircuitBreakerRule,
+                EventType::FaultDetectRule,
+                EventType::LaneRule,
+                EventType::LosslessRule,
+                EventType::TrafficSecurityRule,
+                EventType::TrafficMirrorRule,
+                EventType::TrafficMockRule,
+            ];
+
+            for event_type in event_types {
+                let mut cache = memory_cache_for_failover_test(runtime.clone());
+                let failover = Arc::new(RecordingFailover::default());
+                cache.set_failover_provider(failover.clone());
+
+                let first = cache
+                    .load_service_rule(governance_filter(event_type))
+                    .await
+                    .unwrap();
+                assert!(first.initialized, "{event_type:?}");
+                assert_eq!(first.revision, "failover-rev", "{event_type:?}");
+                assert_eq!(first.rules.len(), 1, "{event_type:?}");
+
+                let second = cache
+                    .load_service_rule(governance_filter(event_type))
+                    .await
+                    .unwrap();
+                assert_eq!(second.revision, "failover-rev", "{event_type:?}");
+                assert_eq!(failover.load_calls.load(Ordering::SeqCst), 1);
+                assert_eq!(failover.save_calls.load(Ordering::SeqCst), 1);
+            }
+        });
+    }
+
+    #[test]
+    fn load_service_rule_does_not_use_failover_when_cache_is_excluded() {
+        let runtime = Arc::new(tokio::runtime::Runtime::new().unwrap());
+        runtime.block_on(async {
+            let mut cache = memory_cache_for_failover_test(runtime.clone());
+            let failover = Arc::new(RecordingFailover::default());
+            cache.set_failover_provider(failover.clone());
+            let mut filter = governance_filter(EventType::RouterRule);
+            filter.include_cache = false;
+
+            assert!(cache.load_service_rule(filter).await.is_err());
+            assert_eq!(failover.load_calls.load(Ordering::SeqCst), 0);
+            assert_eq!(failover.save_calls.load(Ordering::SeqCst), 0);
+        });
     }
 }

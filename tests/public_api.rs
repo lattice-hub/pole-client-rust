@@ -47,6 +47,44 @@ fn traffic_domain_exposes_all_governance_capabilities() {
 }
 
 #[test]
+fn observability_exposes_public_semantic_boundaries() {
+    use pole_rust::observability::{
+        api::{NoopObservabilityRecorder, ObservabilityRecorder},
+        default::DefaultObservability,
+        req::{
+            GovernanceDecisionContext, MetricRecord, ObservabilityConfig, ObservabilityEvent,
+            ResourceAttributes, SpanAttributes, TelemetryEndpoint,
+        },
+    };
+
+    fn _accept_recorder<T: ObservabilityRecorder>() {}
+
+    _accept_recorder::<NoopObservabilityRecorder>();
+    let _default = std::mem::size_of::<DefaultObservability>();
+    let _config = std::mem::size_of::<ObservabilityConfig>();
+    let _resource = std::mem::size_of::<ResourceAttributes>();
+    let _endpoint = std::mem::size_of::<TelemetryEndpoint>();
+    let _metric = std::mem::size_of::<MetricRecord>();
+    let _event = std::mem::size_of::<ObservabilityEvent>();
+    let _span = std::mem::size_of::<SpanAttributes>();
+    let _decision = std::mem::size_of::<GovernanceDecisionContext>();
+}
+
+#[test]
+fn workload_identity_exposes_explicit_transport_adapters() {
+    use pole_rust::identity::{
+        AuthenticatedCaller, WorkloadCredentialClientInterceptor,
+        WorkloadCredentialServerInterceptor, WorkloadIdentity, WORKLOAD_CREDENTIAL_HEADER,
+    };
+
+    let _identity = std::mem::size_of::<WorkloadIdentity>();
+    let _caller = std::mem::size_of::<AuthenticatedCaller>();
+    let _client = std::mem::size_of::<WorkloadCredentialClientInterceptor>();
+    let _server = std::mem::size_of::<WorkloadCredentialServerInterceptor>();
+    assert_eq!(WORKLOAD_CREDENTIAL_HEADER, "x-pole-workload-credential");
+}
+
+#[test]
 fn legacy_top_level_governance_paths_stay_compatible() {
     use pole_rust::{
         circuitbreaker::api::CircuitBreakerAPI, faultdetect::api::FaultDetectProbeExecutor,

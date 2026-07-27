@@ -36,7 +36,9 @@ use crate::traffic::policy::{
 pub struct DefaultRouterAPI {
     manage_sdk: bool,
     context: Arc<SDKContext>,
+    // RouterFlow 负责原有实例路由链；traffic policy 只在进入路由链前后补治理结果。
     flow: Arc<RouterFlow>,
+    // 镜像发送器是可选副作用，匹配失败、请求缺失或 sender 缺失都不能影响主路由。
     mirror_sender: Option<Arc<dyn MirrorSender>>,
 }
 
@@ -91,6 +93,7 @@ impl Drop for DefaultRouterAPI {
 }
 
 fn reject_denied_traffic(governance: &TrafficGovernanceResult) -> Result<(), PoleError> {
+    // traffic security 是路由前置门禁；拒绝后不再进入实例路由和镜像派发。
     if governance.security.allowed {
         return Ok(());
     }
@@ -114,6 +117,7 @@ fn mock_route_response(
     governance: &TrafficGovernanceResult,
     service_instances: &ServiceInstances,
 ) -> Option<ProcessRouteResponse> {
+    // mock 命中时短路返回治理结果，保留原实例列表只用于响应结构兼容。
     if governance.mock.is_none() {
         return None;
     }
@@ -129,6 +133,7 @@ fn dispatch_route_mirrors(
     governance: &TrafficGovernanceResult,
     mirror_request: Option<MirrorRequest>,
 ) -> Vec<JoinHandle<()>> {
+    // 镜像是旁路能力：只要主请求治理结果中没有目标，就不创建任何异步任务。
     if governance.mirrors.is_empty() {
         return Vec::new();
     }
@@ -260,20 +265,16 @@ impl RouterAPI for DefaultRouterAPI {
         let route_ctx = RouteContext {
             route_info: req.route_info.clone(),
             extensions: Some(extensions.clone()),
+            authenticated_caller: None,
         };
         let traffic_governance = evaluate_traffic_governance_from_cache(
             &route_ctx,
             extensions.get_resource_cache(),
             Duration::from_secs(1),
         )
-        .await
-        .unwrap_or_else(|err| {
-            crate::error!(
-                "[pole][router_api] evaluate traffic governance failed: {}",
-                err.to_string()
-            );
-            TrafficGovernanceResult::default()
-        });
+        .await?;
+        // security/mock/mirror 都依赖同一份治理评估结果；security 先执行，
+        // mirror 作为旁路派发，mock 再决定是否短路主路由。
         reject_denied_traffic(&traffic_governance)?;
         let mirror_handles = dispatch_route_mirrors(
             self.mirror_sender.clone(),

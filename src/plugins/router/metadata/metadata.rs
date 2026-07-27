@@ -205,6 +205,7 @@ mod tests {
                 ..Default::default()
             },
             extensions: None,
+            authenticated_caller: None,
         };
         let instances = ServiceInstances {
             service: ServiceInfo {
@@ -239,6 +240,7 @@ mod tests {
                 ..Default::default()
             },
             extensions: None,
+            authenticated_caller: None,
         };
         let instances = ServiceInstances {
             service: ServiceInfo {
@@ -281,6 +283,7 @@ mod tests {
                 ..Default::default()
             },
             extensions: None,
+            authenticated_caller: None,
         };
         let instances = ServiceInstances {
             service: ServiceInfo {

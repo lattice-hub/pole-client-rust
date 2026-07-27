@@ -7,6 +7,8 @@ use pole_specification::v1::{
 
 use crate::plugins::router::rule::helper::match_label_value;
 
+// API 匹配只关心请求本身可稳定提取的维度。其它 header/query/custom 参数
+// 仍由各治理能力自己的 TrafficMatchRule 或 MatchArgument 继续判断。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct ApiMatchInput {
     pub method: Option<String>,
@@ -36,6 +38,8 @@ struct PathTrie<T> {
     root: PathTrieNode<T>,
 }
 
+// exact path 使用字符前缀树做候选定位，但只在完整 path 节点上取值；
+// 因此这里不会把 spec 的 Exact 语义改成前缀匹配语义。
 struct PathTrieNode<T> {
     children: HashMap<char, PathTrieNode<T>>,
     values: Vec<Candidate<T>>,
@@ -80,8 +84,11 @@ impl<T: Clone> PathTrie<T> {
 }
 
 struct MethodApiIndex<T> {
+    // API 未声明 path 时，只受 method 桶约束。
     pathless: Vec<Candidate<T>>,
+    // 只有 text exact path 进入前缀树，便于大量接口规则下快速收敛候选。
     exact_paths: PathTrie<T>,
+    // regex、参数化 value、not-in/range 等复杂 MatchString 必须保留完整匹配。
     fallback_paths: Vec<FallbackCandidate<T>>,
 }
 
@@ -136,6 +143,8 @@ pub(crate) struct ApiMatchIndex<T> {
 }
 
 impl<T: Clone> ApiMatchIndex<T> {
+    // entries 的遍历顺序就是治理规则优先级排序后的顺序，后续 candidates
+    // 会按该顺序恢复结果，避免索引改变原有“先匹配先命中”的语义。
     pub(crate) fn new<'a, I>(entries: I) -> Self
     where
         I: IntoIterator<Item = (T, &'a [Api])>,
@@ -185,6 +194,7 @@ impl<T: Clone> ApiMatchIndex<T> {
     }
 
     fn insert_api(&mut self, api: &Api, candidate: Candidate<T>) {
+        // 空 method 和 "*" 语义一致，进入通配 method 桶。
         let method_index = if api.method.is_empty() || api.method == "*" {
             &mut self.wildcard_method
         } else {
@@ -209,6 +219,8 @@ fn exact_text_path(path: Option<&MatchString>) -> PathIndexKind<'_> {
     let Some(path) = path else {
         return PathIndexKind::Any;
     };
+    // 只有最便宜且语义确定的 exact text path 可以索引化；其它类型统一
+    // 走 fallback，确保 match_label_value 的完整语义不被绕过。
     if path.r#type() == MatchStringType::Exact && path.value_type() == ValueType::Text {
         PathIndexKind::Exact(path.value.as_str())
     } else {
@@ -216,6 +228,8 @@ fn exact_text_path(path: Option<&MatchString>) -> PathIndexKind<'_> {
     }
 }
 
+// 单个 API 的兜底匹配函数用于 fallback path 和单元测试，语义上保持和
+// spec 的空 method、通配 method、可选 path 一致。
 pub(crate) fn api_matches(input: &ApiMatchInput, api: &Api) -> bool {
     if !api.method.is_empty() && api.method != "*" {
         if input.method.as_deref() != Some(api.method.as_str()) {

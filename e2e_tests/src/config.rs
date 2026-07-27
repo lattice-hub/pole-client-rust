@@ -1,5 +1,11 @@
 use std::{collections::HashMap, error::Error, fmt, path::PathBuf};
 
+use pole_rust::core::{
+    config::config::Configuration,
+    context::SDKContext,
+    model::error::{ErrorCode, PoleError},
+};
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunConfig {
     pub console_url: String,
@@ -119,6 +125,107 @@ impl RunConfig {
             connector_addr("discover", discover),
             connector_addr("config", config),
         ]
+    }
+
+    /// 仅依赖 e2e 命令行地址生成 bootstrap 配置，避免测试环境依赖工作目录中的 pole.yaml。
+    pub fn create_sdk_context(&self) -> Result<SDKContext, PoleError> {
+        SDKContext::create_by_configuration(self.sdk_configuration("pole-e2e-client")?)
+    }
+
+    pub fn sdk_configuration(&self, client_id: &str) -> Result<Configuration, PoleError> {
+        self.sdk_configuration_with_labels(client_id, HashMap::new())
+    }
+
+    pub fn sdk_configuration_with_labels(
+        &self,
+        client_id: &str,
+        labels: HashMap<String, String>,
+    ) -> Result<Configuration, PoleError> {
+        let mut configuration: Configuration =
+            serde_yaml::from_str(&self.sdk_configuration_yaml(client_id)).map_err(|err| {
+                PoleError::new(
+                    ErrorCode::InvalidConfig,
+                    format!("invalid e2e SDK bootstrap configuration: {err}"),
+                )
+            })?;
+        configuration.global.client.labels = labels;
+        Ok(configuration)
+    }
+
+    pub fn create_sdk_context_with_labels(
+        &self,
+        client_id: &str,
+        labels: HashMap<String, String>,
+    ) -> Result<SDKContext, PoleError> {
+        SDKContext::create_by_configuration(self.sdk_configuration_with_labels(client_id, labels)?)
+    }
+
+    pub fn sdk_configuration_yaml(&self, client_id: &str) -> String {
+        let addresses = self.sdk_addresses();
+        let discover = addresses
+            .iter()
+            .find(|address| address.starts_with("discover://"))
+            .expect("e2e SDK addresses always contain discover endpoint")
+            .trim_start_matches("discover://");
+        let config = addresses
+            .iter()
+            .find(|address| address.starts_with("config://"))
+            .expect("e2e SDK addresses always contain config endpoint")
+            .trim_start_matches("config://");
+        format!(
+            r#"global:
+  api:
+    timeout: 3s
+    maxRetryTimes: 1
+    retryInterval: 100ms
+    reportInterval: 1s
+  serverConnectors:
+    discover:
+      addresses: [{discover}]
+      protocol: grpc
+      connectTimeout: 1s
+      messageTimeout: 3s
+    config:
+      addresses: [{config}]
+      protocol: grpc
+      connectTimeout: 1s
+      messageTimeout: 3s
+  location:
+    providers: []
+  client:
+    id: {client_id}
+    labels: {{}}
+consumer:
+  serviceRouter:
+    beforeChain: []
+    coreChain: []
+    afterChain: []
+  loadBalancer:
+    defaultPolicy: weightedRandom
+    plugins: []
+  localCache:
+    name: memory
+    serviceExpireEnable: false
+    serviceExpireTime: 1s
+    serviceRefreshInterval: 1s
+    serviceListRefreshInterval: 1s
+    persistEnable: false
+    persistDir: ./target/e2e-sdk-cache
+provider:
+  lossless:
+    host: 127.0.0.1
+    port: 0
+    delayRegisterInterval: 1s
+    healthCheckInterval: 1s
+config:
+  propertiesValueCacheSize: 1
+  propertiesValueExpireTime: 1
+  configFilter:
+    enable: false
+    chain: []
+    plugin: {{}}
+"#
+        )
     }
 }
 
