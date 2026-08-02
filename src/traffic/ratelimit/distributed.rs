@@ -1,8 +1,8 @@
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet},
     sync::{
         atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering},
-        Arc, Mutex as StdMutex,
+        Arc,
     },
     time::Duration,
 };
@@ -10,18 +10,17 @@ use std::{
 use dashmap::DashMap;
 use pole_specification::{
     polaris::metric::v2::{
-        rate_limit_grpcv2_client::RateLimitGrpcv2Client, LimitTarget, QuotaMode as RemoteQuotaMode,
-        QuotaSum, QuotaTotal, RateLimitCmd, RateLimitInitRequest, RateLimitReportRequest,
-        RateLimitRequest as RemoteRateLimitRequest, RateLimitResponse as RemoteRateLimitResponse,
-        TimeAdjustRequest,
+        rate_limit_grpc_client::RateLimitGrpcClient, LimitTarget, Mode, QuotaAccounting,
+        QuotaConsumption as RemoteQuotaConsumption, QuotaCounter, QuotaMode as RemoteQuotaMode,
+        QuotaReservation, QuotaReserveRequest, QuotaSettleRequest, QuotaTotal, QuotaUpdateRequest,
+        RateLimitCmd, RateLimitInitRequest, RateLimitRequest as RemoteRateLimitRequest,
+        RateLimitResponse as RemoteRateLimitResponse, TimeAdjustRequest,
     },
-    v1::{limit_trigger::AmountMode, LimitTrigger, RateLimit},
+    v1::{limit_trigger, limit_trigger::AmountMode, LimitTrigger, RateLimit},
 };
 use sha2::{Digest, Sha256};
-use tokio::{
-    sync::{mpsc, Mutex, Notify},
-    time::timeout,
-};
+use tokio::sync::{mpsc, oneshot, Mutex};
+use tokio::time::timeout;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::transport::Endpoint;
 
@@ -30,18 +29,15 @@ use crate::{
         error::{ErrorCode, PoleError},
         naming::Instance,
     },
-    traffic::ratelimit::req::{QuotaRequest, QuotaResponse},
+    traffic::ratelimit::{
+        api::{QuotaConsumption, QuotaLeaseBackend},
+        req::{QuotaRequest, QuotaResource},
+    },
 };
 
 const RATE_LIMIT_SUCCESS_CODE: u32 = 200_000;
-const RATE_LIMIT_NOT_FOUND_CODE: u32 = 404_001;
-const RATE_LIMIT_INVALID_COUNTER_CODE: u32 = 400_214;
 const TIME_ADJUST_INTERVAL: Duration = Duration::from_secs(30);
-const WINDOW_CACHE_LIMIT: usize = 10_000;
-const WINDOW_CLEANUP_INTERVAL: u64 = 256;
 
-/// 分布式限流窗口的稳定身份。规则 revision 是 key 的一部分，规则更新后会重新 INIT，
-/// 不会误用旧阈值或旧集群下发的剩余配额。
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct WindowKey {
     endpoint: String,
@@ -77,16 +73,12 @@ impl WindowKey {
                 format!("global rate limit rule {} has an invalid cluster", rule.id),
             ));
         }
-
         Ok(Self {
-            // client_key 与 counter_key 由单条远端 gRPC 流分配，不能跨限流实例复用。
             endpoint: endpoint.to_string(),
             cluster_namespace: cluster.namespace.clone(),
             cluster_service: cluster.service.clone(),
             target_namespace: req.namespace.clone(),
             target_service: req.service.clone(),
-            // limiter 只把 labels 当作跨 SDK counter 身份；规则 revision 保留在本地
-            // WindowKey 触发重新 INIT，不能进入远端 labels 造成新旧 SDK 分桶。
             labels: super::default::remote_quota_labels(req, trigger),
             rule_id: rule.id.clone(),
             trigger_name: trigger.name.clone(),
@@ -104,295 +96,49 @@ impl WindowKey {
     }
 }
 
-struct RemoteCounter {
-    counter_key: u32,
-    left: i64,
-    unreported_used: u32,
-    inflight_used: VecDeque<PendingReports>,
-}
-
-struct PendingReports {
-    epoch: i64,
-    used: u32,
-    count: u32,
-}
-
-#[derive(Default)]
-struct WindowState {
-    owner_session_id: u64,
-    initializing: bool,
-    initialized: bool,
-    failure: Option<String>,
+struct InitializedWindow {
+    session_id: u64,
     client_key: u32,
-    counters: HashMap<u32, RemoteCounter>,
+    counters: Vec<QuotaCounter>,
+}
+
+#[derive(Clone)]
+struct LeaseCounterGroup {
+    resource: QuotaResource,
+    amount: u32,
+    accounting: QuotaAccounting,
+    counter_keys: Vec<u32>,
 }
 
 struct QuotaWindow {
     key: WindowKey,
-    state: Mutex<WindowState>,
-    changed: Notify,
-    last_used_ms: AtomicI64,
-    idle_ttl_ms: i64,
-    active_checks: AtomicU64,
+    initialized: Mutex<Option<InitializedWindow>>,
+    initialize_lock: Mutex<()>,
 }
 
 impl QuotaWindow {
-    fn new(key: WindowKey, trigger: &LimitTrigger) -> Self {
-        let longest_window_ms = trigger
-            .amounts
-            .iter()
-            .map(|amount| i64::from(amount_duration_seconds(amount)) * 1_000)
-            .max()
-            .unwrap_or(1_000);
+    fn new(key: WindowKey) -> Self {
         Self {
             key,
-            state: Mutex::new(WindowState::default()),
-            changed: Notify::new(),
-            last_used_ms: AtomicI64::new(now_millis()),
-            // 至少跨过两个最长配额周期再回收；短周期高基数维度也保留一分钟，
-            // 避免正常间歇流量频繁 INIT。
-            idle_ttl_ms: (longest_window_ms * 2).max(60_000),
-            active_checks: AtomicU64::new(0),
+            initialized: Mutex::new(None),
+            initialize_lock: Mutex::new(()),
         }
-    }
-
-    fn touch(&self) {
-        self.last_used_ms.store(now_millis(), Ordering::Release);
-    }
-
-    fn is_expired(&self, now: i64) -> bool {
-        now - self.last_used_ms.load(Ordering::Acquire) > self.idle_ttl_ms
-    }
-
-    async fn mark_initialized(
-        &self,
-        session_id: u64,
-        client_key: u32,
-        counters: Vec<pole_specification::polaris::metric::v2::QuotaCounter>,
-    ) {
-        let mut state = self.state.lock().await;
-        if state.owner_session_id != session_id {
-            return;
-        }
-        state.initializing = false;
-        state.initialized = true;
-        state.failure = None;
-        state.client_key = client_key;
-        state.counters = counters
-            .into_iter()
-            .map(|counter| {
-                (
-                    counter.duration,
-                    RemoteCounter {
-                        counter_key: counter.counter_key,
-                        left: counter.left,
-                        unreported_used: 0,
-                        inflight_used: VecDeque::new(),
-                    },
-                )
-            })
-            .collect();
-        drop(state);
-        self.changed.notify_waiters();
-    }
-
-    async fn mark_failed(&self, session_id: u64, message: String) {
-        let mut state = self.state.lock().await;
-        if state.owner_session_id != session_id {
-            return;
-        }
-        state.initializing = false;
-        state.initialized = false;
-        state.failure = Some(message);
-        drop(state);
-        self.changed.notify_waiters();
-    }
-
-    async fn invalidate(&self, session_id: u64) {
-        let mut state = self.state.lock().await;
-        if state.owner_session_id != session_id {
-            return;
-        }
-        state.initializing = false;
-        state.initialized = false;
-        state.failure = None;
-        state.client_key = 0;
-        state.counters.clear();
-        drop(state);
-        self.changed.notify_waiters();
-    }
-
-    async fn update_counters(
-        &self,
-        session_id: u64,
-        response_timestamp: i64,
-        counters: Vec<pole_specification::polaris::metric::v2::QuotaLeft>,
-    ) {
-        let mut state = self.state.lock().await;
-        if state.owner_session_id != session_id {
-            return;
-        }
-        for counter in counters {
-            if let Some((duration, local)) = state
-                .counters
-                .iter_mut()
-                .find(|(_, local)| local.counter_key == counter.counter_key)
-            {
-                // 服务端回包已经计入当前 report，但不包含仍在流中排队的后续 report
-                // 和尚未上报的本地扣减。按流顺序确认一批，再扣除剩余 pending，
-                // 避免较早的绝对余量覆盖较新的本地消费。
-                let period_ms = i64::from(*duration) * 1_000;
-                let response_epoch = response_timestamp / period_ms;
-                while local
-                    .inflight_used
-                    .front()
-                    .map(|pending| pending.epoch < response_epoch)
-                    .unwrap_or(false)
-                {
-                    local.inflight_used.pop_front();
-                }
-                // limiter 的主动 push 只在 left <= 0 时产生；正余量回包必然
-                // 对应本客户端 report，可以安全确认同周期 FIFO 的一项。
-                if counter.left > 0
-                    && local
-                        .inflight_used
-                        .front()
-                        .map(|pending| pending.epoch == response_epoch)
-                        .unwrap_or(false)
-                {
-                    let pending = local
-                        .inflight_used
-                        .front_mut()
-                        .expect("pending report exists after epoch check");
-                    pending.count -= 1;
-                    if pending.count == 0 {
-                        local.inflight_used.pop_front();
-                    }
-                }
-                let pending = local.unreported_used
-                    + local
-                        .inflight_used
-                        .iter()
-                        .map(|pending| pending.used.saturating_mul(pending.count))
-                        .sum::<u32>();
-                local.left = counter.left - i64::from(pending);
-            }
-        }
-    }
-
-    fn mark_reported(state: &mut WindowState, timestamp: i64, sums: &[QuotaSum]) {
-        for sum in sums {
-            if let Some((duration, counter)) = state
-                .counters
-                .iter_mut()
-                .find(|(_, counter)| counter.counter_key == sum.counter_key)
-            {
-                counter.unreported_used = counter.unreported_used.saturating_sub(sum.used);
-                // 每个 report 都对应一个服务端回包；拒绝报告 used=0 也必须占据
-                // FIFO 槽位，否则它的回包会错误确认后面的消费报告。
-                let epoch = timestamp / (i64::from(*duration) * 1_000);
-                if let Some(pending) = counter.inflight_used.back_mut() {
-                    if pending.epoch == epoch && pending.used == sum.used {
-                        pending.count = pending.count.saturating_add(1);
-                        continue;
-                    }
-                }
-                counter.inflight_used.push_back(PendingReports {
-                    epoch,
-                    used: sum.used,
-                    count: 1,
-                });
-            }
-        }
-    }
-
-    async fn acquire(
-        &self,
-        trigger: &LimitTrigger,
-    ) -> Result<(bool, Vec<QuotaSum>, u32), PoleError> {
-        let mut state = self.state.lock().await;
-        if !state.initialized {
-            return Err(PoleError::new(
-                ErrorCode::InvalidState,
-                "distributed rate limit window is not initialized".to_string(),
-            ));
-        }
-
-        let durations = trigger
-            .amounts
-            .iter()
-            .map(amount_duration_seconds)
-            .collect::<Vec<_>>();
-        if durations.is_empty() {
-            return Err(PoleError::new(
-                ErrorCode::InvalidRule,
-                format!("rate limit trigger {} has no amounts", trigger.name),
-            ));
-        }
-
-        let allowed = durations.iter().all(|duration| {
-            state
-                .counters
-                .get(duration)
-                .map(|counter| counter.left > 0)
-                .unwrap_or(false)
-        });
-        let mut sums = Vec::with_capacity(durations.len());
-        for duration in durations {
-            if let Some(counter) = state.counters.get_mut(&duration) {
-                if allowed {
-                    counter.left -= 1;
-                    counter.unreported_used += 1;
-                    sums.push(QuotaSum {
-                        counter_key: counter.counter_key,
-                        used: 1,
-                        limited: 0,
-                    });
-                } else {
-                    sums.push(QuotaSum {
-                        counter_key: counter.counter_key,
-                        used: 0,
-                        limited: 1,
-                    });
-                }
-            }
-        }
-        Ok((allowed, sums, state.client_key))
     }
 }
 
-struct WindowUseGuard {
-    window: Arc<QuotaWindow>,
-}
+type PendingResponse = oneshot::Sender<Result<RemoteRateLimitResponse, String>>;
 
-impl WindowUseGuard {
-    fn new(window: Arc<QuotaWindow>) -> Self {
-        window.active_checks.fetch_add(1, Ordering::AcqRel);
-        Self { window }
-    }
-}
-
-impl Drop for WindowUseGuard {
-    fn drop(&mut self) {
-        self.window.active_checks.fetch_sub(1, Ordering::AcqRel);
-    }
-}
-
-/// 每个 endpoint 保持一条双向 gRPC 流。窗口初始化和用量上报都复用该流，
-/// 服务端返回的剩余额度按 counter key 回写到对应窗口。
 struct QuotaSession {
     id: u64,
     sender: mpsc::Sender<RemoteRateLimitRequest>,
-    windows: DashMap<WindowKey, Arc<QuotaWindow>>,
-    counters: DashMap<u32, Arc<QuotaWindow>>,
+    pending: Mutex<Option<PendingResponse>>,
+    request_lock: Mutex<()>,
     clock_offset_ms: AtomicI64,
     last_time_adjust_ms: AtomicI64,
     time_adjust_lock: Mutex<()>,
-    target_init_locks: DashMap<String, Arc<Mutex<()>>>,
     endpoint: String,
     request_timeout: Duration,
     healthy: AtomicBool,
-    response_task: StdMutex<Option<tokio::task::AbortHandle>>,
 }
 
 impl QuotaSession {
@@ -402,336 +148,349 @@ impl QuotaSession {
         request_timeout: Duration,
     ) -> Result<Arc<Self>, PoleError> {
         let channel = Endpoint::from_shared(format!("http://{endpoint}"))
-            .map_err(|err| network_error("create rate limit endpoint", err))?
+            .map_err(|error| network_error("create rate limit endpoint", error))?
             .connect_lazy();
-        let (sender, receiver) = mpsc::channel(128);
-        let mut client = RateLimitGrpcv2Client::new(channel);
+        let mut client = RateLimitGrpcClient::new(channel);
         let adjust_started_at = now_millis();
         let adjustment = timeout(request_timeout, client.time_adjust(TimeAdjustRequest {}))
             .await
-            .map_err(|_| {
-                PoleError::new(
-                    ErrorCode::ApiTimeout,
-                    "rate limit time adjustment timed out".to_string(),
-                )
-            })?
-            .map_err(|err| network_error("adjust rate limit server time", err))?
+            .map_err(|_| api_timeout("rate limit time adjustment timed out"))?
+            .map_err(|error| network_error("adjust rate limit server time", error))?
             .into_inner();
         let adjust_finished_at = now_millis();
         let local_midpoint = adjust_started_at + (adjust_finished_at - adjust_started_at) / 2;
         let clock_offset_ms = adjustment.server_timestamp - local_midpoint;
+
+        let (sender, receiver) = mpsc::channel(128);
         let response = timeout(
             request_timeout,
             client.service(ReceiverStream::new(receiver)),
         )
         .await
-        .map_err(|_| {
-            PoleError::new(
-                ErrorCode::ApiTimeout,
-                "open rate limit stream timed out".to_string(),
-            )
-        })?
-        .map_err(|err| network_error("open rate limit stream", err))?;
+        .map_err(|_| api_timeout("open rate limit stream timed out"))?
+        .map_err(|error| network_error("open rate limit stream", error))?;
 
         let session = Arc::new(Self {
             id,
             sender,
-            windows: DashMap::new(),
-            counters: DashMap::new(),
+            pending: Mutex::new(None),
+            request_lock: Mutex::new(()),
             clock_offset_ms: AtomicI64::new(clock_offset_ms),
             last_time_adjust_ms: AtomicI64::new(adjust_finished_at),
             time_adjust_lock: Mutex::new(()),
-            target_init_locks: DashMap::new(),
             endpoint,
             request_timeout,
             healthy: AtomicBool::new(true),
-            response_task: StdMutex::new(None),
         });
         let response_session = session.clone();
-        let response_task = tokio::spawn(async move {
+        tokio::spawn(async move {
             let mut stream = response.into_inner();
             loop {
                 match stream.message().await {
-                    Ok(Some(message)) => response_session.handle_response(message).await,
+                    Ok(Some(message)) => {
+                        if let Some(pending) = response_session.pending.lock().await.take() {
+                            let _ = pending.send(Ok(message));
+                        }
+                    }
                     Ok(None) => {
                         response_session
-                            .mark_stream_failed("rate limit stream closed".to_string())
+                            .mark_failed("rate limit stream closed".to_string())
                             .await;
                         return;
                     }
-                    Err(err) => {
+                    Err(error) => {
                         response_session
-                            .mark_stream_failed(format!("rate limit stream receive failed: {err}"))
+                            .mark_failed(format!("rate limit stream receive failed: {error}"))
                             .await;
                         return;
                     }
                 }
             }
         });
-        *session.response_task.lock().unwrap() = Some(response_task.abort_handle());
         Ok(session)
     }
 
-    async fn handle_response(&self, response: RemoteRateLimitResponse) {
-        match RateLimitCmd::try_from(response.cmd).ok() {
-            Some(RateLimitCmd::Init) => {
-                let Some(init) = response.rate_limit_init_response else {
-                    return;
-                };
-                let Some(target) = init.target.as_ref() else {
-                    return;
-                };
-                let window = self.windows.iter().find_map(|entry| {
-                    let key = entry.key();
-                    (key.target_namespace == target.namespace
-                        && key.target_service == target.service
-                        && key.labels == target.labels)
-                        .then(|| entry.value().clone())
-                });
-                let Some(window) = window else {
-                    return;
-                };
-                if init.code != RATE_LIMIT_SUCCESS_CODE {
-                    window
-                        .mark_failed(
-                            self.id,
-                            format!("rate limit init returned code {}", init.code),
-                        )
-                        .await;
-                    return;
-                }
-                for counter in &init.counters {
-                    self.counters.insert(counter.counter_key, window.clone());
-                }
-                window
-                    .mark_initialized(self.id, init.client_key, init.counters)
-                    .await;
-            }
-            Some(RateLimitCmd::Acquire) => {
-                let Some(report) = response.rate_limit_report_response else {
-                    return;
-                };
-                if report.code != RATE_LIMIT_SUCCESS_CODE {
-                    if report.code == RATE_LIMIT_NOT_FOUND_CODE {
-                        self.invalidate_windows().await;
-                    } else if report.code == RATE_LIMIT_INVALID_COUNTER_CODE {
-                        self.mark_stream_failed(format!(
-                            "rate limit report returned code {}",
-                            report.code
-                        ))
-                        .await;
-                    } else {
-                        self.mark_windows_failed(format!(
-                            "rate limit report returned code {}",
-                            report.code
-                        ))
-                        .await;
-                    }
-                    return;
-                }
-                let mut grouped = HashMap::<WindowKey, Vec<_>>::new();
-                let response_timestamp = report.timestamp;
-                for counter in report.quota_lefts {
-                    if let Some(window) = self.counters.get(&counter.counter_key) {
-                        grouped.entry(window.key.clone()).or_default().push(counter);
-                    }
-                }
-                for (key, counters) in grouped {
-                    let window = self.windows.get(&key).map(|entry| entry.value().clone());
-                    if let Some(window) = window {
-                        window
-                            .update_counters(self.id, response_timestamp, counters)
-                            .await;
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-
-    async fn mark_stream_failed(&self, message: String) {
+    async fn mark_failed(&self, message: String) {
         self.healthy.store(false, Ordering::Release);
-        self.mark_windows_failed(message).await;
-        self.counters.clear();
-    }
-
-    async fn mark_windows_failed(&self, message: String) {
-        let windows = self
-            .windows
-            .iter()
-            .map(|entry| entry.value().clone())
-            .collect::<Vec<_>>();
-        for window in windows {
-            window.mark_failed(self.id, message.clone()).await;
+        if let Some(pending) = self.pending.lock().await.take() {
+            let _ = pending.send(Err(message));
         }
     }
 
-    async fn invalidate_windows(&self) {
-        let windows = self
-            .windows
-            .iter()
-            .map(|entry| entry.value().clone())
-            .collect::<Vec<_>>();
-        self.counters.clear();
-        for window in windows {
-            window.invalidate(self.id).await;
+    async fn round_trip(
+        &self,
+        request: RemoteRateLimitRequest,
+    ) -> Result<RemoteRateLimitResponse, PoleError> {
+        let _request_guard = self.request_lock.lock().await;
+        if !self.healthy.load(Ordering::Acquire) || self.sender.is_closed() {
+            return Err(network_error_message("rate limit stream is unavailable"));
         }
-    }
-
-    fn remove_window(&self, key: &WindowKey) {
-        self.windows.remove(key);
-        self.counters.retain(|_, window| &window.key != key);
-        let target_still_active = self.windows.iter().any(|entry| {
-            let current = entry.key();
-            current.target_namespace == key.target_namespace
-                && current.target_service == key.target_service
-                && current.labels == key.labels
-        });
-        if !target_still_active {
-            self.target_init_locks.remove(&format!(
-                "{}#{}#{}",
-                key.target_namespace, key.target_service, key.labels
+        let expected_cmd = request.cmd;
+        let (sender, receiver) = oneshot::channel();
+        *self.pending.lock().await = Some(sender);
+        if self.sender.send(request).await.is_err() {
+            self.mark_failed("rate limit stream is unavailable".to_string())
+                .await;
+            return Err(network_error_message("rate limit stream is unavailable"));
+        }
+        let response = match timeout(self.request_timeout, receiver).await {
+            Ok(Ok(Ok(response))) => response,
+            Ok(Ok(Err(message))) => return Err(network_error_message(message)),
+            Ok(Err(_)) => return Err(network_error_message("rate limit response was canceled")),
+            Err(_) => {
+                self.mark_failed("rate limit request timed out".to_string())
+                    .await;
+                return Err(api_timeout("rate limit request timed out"));
+            }
+        };
+        if response.cmd != expected_cmd {
+            self.mark_failed("rate limit response command is out of order".to_string())
+                .await;
+            return Err(PoleError::new(
+                ErrorCode::InvalidResponse,
+                "rate limit response command is out of order".to_string(),
             ));
         }
-    }
-
-    fn shutdown(&self) {
-        self.healthy.store(false, Ordering::Release);
-        if let Some(task) = self.response_task.lock().unwrap().take() {
-            task.abort();
-        }
+        Ok(response)
     }
 
     async fn ensure_window(
         &self,
-        window: Arc<QuotaWindow>,
+        window: &QuotaWindow,
         client_id: &str,
         trigger: &LimitTrigger,
-        request_timeout: Duration,
-    ) -> Result<(), PoleError> {
-        let target_key = format!(
-            "{}#{}#{}",
-            window.key.target_namespace, window.key.target_service, window.key.labels
-        );
-        let init_lock = self
-            .target_init_locks
-            .entry(target_key)
-            .or_insert_with(|| Arc::new(Mutex::new(())))
-            .clone();
-        let _init_guard = init_lock.lock().await;
-        let session_has_window = self.windows.contains_key(&window.key);
-        let should_initialize = {
-            let mut state = window.state.lock().await;
-            if session_has_window && state.owner_session_id == self.id && state.initialized {
-                return Ok(());
+    ) -> Result<(u32, Vec<QuotaCounter>), PoleError> {
+        if let Some(initialized) = window.initialized.lock().await.as_ref() {
+            if initialized.session_id == self.id {
+                return Ok((initialized.client_key, initialized.counters.clone()));
             }
-            if state.owner_session_id == self.id && state.initializing {
-                false
-            } else {
-                state.owner_session_id = self.id;
-                state.initializing = true;
-                // 当前 session 第一次使用该窗口时，即便窗口曾由断开的旧 session
-                // 初始化，也必须清空旧 client/counter 标识并重新申请配额。
-                state.initialized = false;
-                state.failure = None;
-                state.client_key = 0;
-                state.counters.clear();
-                true
+        }
+        let _initialize_guard = window.initialize_lock.lock().await;
+        if let Some(initialized) = window.initialized.lock().await.as_ref() {
+            if initialized.session_id == self.id {
+                return Ok((initialized.client_key, initialized.counters.clone()));
             }
+        }
+        let response = self
+            .round_trip(remote_request(
+                RateLimitCmd::Init,
+                Some(build_init_request(client_id, &window.key, trigger)?),
+                None,
+                None,
+                None,
+            ))
+            .await?;
+        let init = response.rate_limit_init_response.ok_or_else(|| {
+            PoleError::new(
+                ErrorCode::InvalidResponse,
+                "rate limit init response is missing".to_string(),
+            )
+        })?;
+        if init.code != RATE_LIMIT_SUCCESS_CODE {
+            return Err(PoleError::new(
+                ErrorCode::ServerError,
+                format!("rate limit init returned code {}", init.code),
+            ));
+        }
+        if init.counters.is_empty() {
+            return Err(PoleError::new(
+                ErrorCode::InvalidResponse,
+                "rate limit init returned no counters".to_string(),
+            ));
+        }
+        let initialized = InitializedWindow {
+            session_id: self.id,
+            client_key: init.client_key,
+            counters: init.counters,
         };
-
-        if should_initialize {
-            // 同一个远端 target 更新 revision 时，响应只回显 target，不携带 revision。
-            // session 内只保留该 target 的最新窗口，避免 INIT 响应落到旧 revision。
-            let stale_keys = self
-                .windows
-                .iter()
-                .filter_map(|entry| {
-                    let key = entry.key();
-                    (key.target_namespace == window.key.target_namespace
-                        && key.target_service == window.key.target_service
-                        && key.labels == window.key.labels
-                        && *key != window.key)
-                        .then(|| key.clone())
-                })
-                .collect::<Vec<_>>();
-            self.windows.insert(window.key.clone(), window.clone());
-            for key in stale_keys {
-                self.remove_window(&key);
-            }
-            let init = build_init_request(client_id, &window.key, trigger);
-            if self
-                .sender
-                .send(RemoteRateLimitRequest {
-                    cmd: RateLimitCmd::Init.into(),
-                    rate_limit_init_request: Some(init),
-                    rate_limit_report_request: None,
-                    rate_limit_batch_init_request: None,
-                })
-                .await
-                .is_err()
-            {
-                let message = "rate limit stream is unavailable".to_string();
-                self.mark_stream_failed(message.clone()).await;
-                return Err(PoleError::new(ErrorCode::NetworkError, message));
-            }
-        }
-
-        let initialized = timeout(request_timeout, async {
-            loop {
-                let notified = window.changed.notified();
-                let state = window.state.lock().await;
-                if state.initialized {
-                    return Ok(());
-                }
-                if let Some(message) = &state.failure {
-                    return Err(PoleError::new(ErrorCode::NetworkError, message.clone()));
-                }
-                drop(state);
-                notified.await;
-            }
-        })
-        .await;
-        match initialized {
-            Ok(result) => result,
-            Err(_) => {
-                let message = "rate limit init timed out".to_string();
-                window.mark_failed(self.id, message.clone()).await;
-                Err(PoleError::new(ErrorCode::ApiTimeout, message))
-            }
-        }
+        let result = (initialized.client_key, initialized.counters.clone());
+        *window.initialized.lock().await = Some(initialized);
+        Ok(result)
     }
 
-    async fn report(
-        &self,
-        window: &QuotaWindow,
+    async fn reserve(
+        self: &Arc<Self>,
         client_key: u32,
-        sums: Vec<QuotaSum>,
+        groups: Vec<LeaseCounterGroup>,
+        req: &QuotaRequest,
+    ) -> Result<DistributedReserveResult, PoleError> {
+        self.adjust_time_if_due().await;
+        let response = self
+            .round_trip(remote_request(
+                RateLimitCmd::Reserve,
+                None,
+                Some(QuotaReserveRequest {
+                    client_key,
+                    idempotency_key: uuid::Uuid::new_v4().to_string(),
+                    reservations: groups
+                        .iter()
+                        .flat_map(|group| {
+                            group
+                                .counter_keys
+                                .iter()
+                                .map(move |counter_key| QuotaReservation {
+                                    counter_key: *counter_key,
+                                    amount: group.amount,
+                                })
+                        })
+                        .collect(),
+                    ttl_seconds: ttl_seconds(req.lease_ttl),
+                    timestamp: self.server_timestamp(),
+                }),
+                None,
+                None,
+            ))
+            .await?;
+        let reserve = response.quota_reserve_response.ok_or_else(|| {
+            PoleError::new(
+                ErrorCode::InvalidResponse,
+                "quota reserve response is missing".to_string(),
+            )
+        })?;
+        if reserve.code != RATE_LIMIT_SUCCESS_CODE {
+            return Ok(DistributedReserveResult::Rejected(format!(
+                "distributed rate limit quota exhausted, code {}",
+                reserve.code
+            )));
+        }
+        if reserve.lease_id.is_empty() {
+            return Err(PoleError::new(
+                ErrorCode::InvalidResponse,
+                "quota reserve response has an empty lease id".to_string(),
+            ));
+        }
+        Ok(DistributedReserveResult::Reserved(Arc::new(
+            DistributedLeaseBackend {
+                session: self.clone(),
+                client_key,
+                lease_id: reserve.lease_id,
+                groups,
+            },
+        )))
+    }
+
+    async fn update_lease(
+        &self,
+        client_key: u32,
+        lease_id: &str,
+        consumptions: Vec<RemoteQuotaConsumption>,
+        sequence: u64,
     ) -> Result<(), PoleError> {
         self.adjust_time_if_due().await;
-        let report_timestamp = now_millis() + self.clock_offset_ms.load(Ordering::Relaxed);
-        let request = RemoteRateLimitRequest {
-            cmd: RateLimitCmd::Acquire.into(),
-            rate_limit_init_request: None,
-            rate_limit_report_request: Some(RateLimitReportRequest {
-                client_key,
-                quota_uses: sums.clone(),
-                timestamp: report_timestamp,
-            }),
-            rate_limit_batch_init_request: None,
-        };
-        let send_result = {
-            // 与回包更新共用同一把窗口锁，使 FIFO 登记与入流不可被回包插入。
-            let mut state = window.state.lock().await;
-            QuotaWindow::mark_reported(&mut state, report_timestamp, &sums);
-            self.sender.try_send(request)
-        };
-        if send_result.is_err() {
-            let message = "rate limit stream is unavailable or backpressured".to_string();
-            self.mark_stream_failed(message.clone()).await;
-            return Err(PoleError::new(ErrorCode::NetworkError, message));
+        let response = self
+            .round_trip(remote_request(
+                RateLimitCmd::Update,
+                None,
+                None,
+                Some(QuotaUpdateRequest {
+                    client_key,
+                    lease_id: lease_id.to_string(),
+                    consumptions: consumptions.clone(),
+                    sequence,
+                    timestamp: self.server_timestamp(),
+                }),
+                None,
+            ))
+            .await?;
+        let update = response.quota_update_response.ok_or_else(|| {
+            PoleError::new(
+                ErrorCode::InvalidResponse,
+                "quota update response is missing".to_string(),
+            )
+        })?;
+        if update.code != RATE_LIMIT_SUCCESS_CODE {
+            return Err(PoleError::new(
+                ErrorCode::ServerError,
+                format!("quota update returned code {}", update.code),
+            ));
+        }
+        if update.sequence != sequence
+            || normalize_consumptions(update.consumptions) != normalize_consumptions(consumptions)
+        {
+            return Err(PoleError::new(
+                ErrorCode::InvalidResponse,
+                "quota update response does not match the request".to_string(),
+            ));
         }
         Ok(())
+    }
+
+    async fn settle_lease(
+        &self,
+        client_key: u32,
+        lease_id: &str,
+        groups: &[LeaseCounterGroup],
+        consumptions: Vec<RemoteQuotaConsumption>,
+        sequence: u64,
+    ) -> Result<(), PoleError> {
+        self.adjust_time_if_due().await;
+        let requested = normalize_consumptions(consumptions.clone());
+        let response = self
+            .round_trip(remote_request(
+                RateLimitCmd::Settle,
+                None,
+                None,
+                None,
+                Some(QuotaSettleRequest {
+                    client_key,
+                    lease_id: lease_id.to_string(),
+                    consumptions,
+                    sequence,
+                    timestamp: self.server_timestamp(),
+                }),
+            ))
+            .await?;
+        let settle = response.quota_settle_response.ok_or_else(|| {
+            PoleError::new(
+                ErrorCode::InvalidResponse,
+                "quota settle response is missing".to_string(),
+            )
+        })?;
+        if settle.code != RATE_LIMIT_SUCCESS_CODE {
+            return Err(PoleError::new(
+                ErrorCode::ServerError,
+                format!("quota settle returned code {}", settle.code),
+            ));
+        }
+        let settlements = settle
+            .settlements
+            .into_iter()
+            .map(|settlement| {
+                (
+                    settlement.counter_key,
+                    (settlement.consumed_total, settlement.returned_amount),
+                )
+            })
+            .collect::<HashMap<_, _>>();
+        let valid = groups.iter().all(|group| {
+            group.counter_keys.iter().all(|counter_key| {
+                let consumed_total = requested
+                    .iter()
+                    .find(|(key, _)| key == counter_key)
+                    .map(|(_, total)| *total)
+                    .unwrap_or(u32::MAX);
+                let expected_returned = match group.accounting {
+                    QuotaAccounting::Consumable => group.amount.saturating_sub(consumed_total),
+                    QuotaAccounting::Occupancy => group.amount,
+                };
+                settlements.get(counter_key) == Some(&(consumed_total, expected_returned))
+            })
+        }) && settlements.len()
+            == groups
+                .iter()
+                .map(|group| group.counter_keys.len())
+                .sum::<usize>();
+        if !valid {
+            return Err(PoleError::new(
+                ErrorCode::InvalidResponse,
+                "quota settle response does not match the request".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn server_timestamp(&self) -> i64 {
+        now_millis() + self.clock_offset_ms.load(Ordering::Relaxed)
     }
 
     async fn adjust_time_if_due(&self) {
@@ -748,18 +507,11 @@ impl QuotaSession {
         {
             return;
         }
-
-        // TimeAdjust 是同 endpoint 上的独立 unary RPC；失败时保留上次偏移，
-        // 不让周期性校时影响已经健康的配额流。
         let channel = match Endpoint::from_shared(format!("http://{}", self.endpoint)) {
             Ok(endpoint) => endpoint.connect_lazy(),
-            Err(_) => {
-                self.last_time_adjust_ms
-                    .store(now_millis(), Ordering::Release);
-                return;
-            }
+            Err(_) => return,
         };
-        let mut client = RateLimitGrpcv2Client::new(channel);
+        let mut client = RateLimitGrpcClient::new(channel);
         let adjustment = timeout(
             self.request_timeout,
             client.time_adjust(TimeAdjustRequest {}),
@@ -778,16 +530,89 @@ impl QuotaSession {
     }
 }
 
-/// 规则驱动的分布式限流连接管理器。连接仅在 GLOBAL 规则命中后创建，
-/// cluster 变化或 rule revision 变化会自然落到新的 window，不污染本地限流路径。
+struct DistributedLeaseBackend {
+    session: Arc<QuotaSession>,
+    client_key: u32,
+    lease_id: String,
+    groups: Vec<LeaseCounterGroup>,
+}
+
+#[async_trait::async_trait]
+impl QuotaLeaseBackend for DistributedLeaseBackend {
+    async fn update(
+        &self,
+        consumptions: Vec<QuotaConsumption>,
+        sequence: u64,
+    ) -> Result<(), PoleError> {
+        let remote = expand_consumptions(&self.groups, &consumptions)?;
+        self.session
+            .update_lease(self.client_key, &self.lease_id, remote, sequence)
+            .await
+    }
+
+    async fn finish(
+        &self,
+        consumptions: Vec<QuotaConsumption>,
+        sequence: u64,
+    ) -> Result<(), PoleError> {
+        let remote = expand_consumptions(&self.groups, &consumptions)?;
+        self.session
+            .settle_lease(
+                self.client_key,
+                &self.lease_id,
+                &self.groups,
+                remote,
+                sequence,
+            )
+            .await
+    }
+
+    fn abandon(&self, consumptions: Vec<QuotaConsumption>, sequence: u64) {
+        let Ok(remote) = expand_consumptions(&self.groups, &consumptions) else {
+            return;
+        };
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            tracing::warn!("quota lease dropped outside a Tokio runtime; waiting for server TTL");
+            return;
+        };
+        let session = self.session.clone();
+        let client_key = self.client_key;
+        let lease_id = self.lease_id.clone();
+        let groups = self.groups.clone();
+        runtime.spawn(async move {
+            if let Err(error) = session
+                .settle_lease(
+                    client_key,
+                    &lease_id,
+                    &groups,
+                    remote,
+                    sequence,
+                )
+                .await
+            {
+                tracing::warn!(error = %error, "quota lease drop settlement failed; waiting for server TTL");
+            }
+        });
+    }
+}
+
+pub(super) enum DistributedReserveResult {
+    Reserved(Arc<dyn QuotaLeaseBackend>),
+    Rejected(String),
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct DistributedQuotaSpec<'a> {
+    pub rule: &'a RateLimit,
+    pub trigger: &'a LimitTrigger,
+    pub amount: u32,
+}
+
 pub(super) struct DistributedQuotaManager {
     sessions: DashMap<String, Arc<QuotaSession>>,
     windows: DashMap<WindowKey, Arc<QuotaWindow>>,
-    current_windows: DashMap<String, WindowKey>,
     endpoint_bindings: DashMap<String, String>,
     connect_lock: Mutex<()>,
-    window_cache_lock: StdMutex<()>,
-    check_count: AtomicU64,
     next_session_id: AtomicU64,
 }
 
@@ -796,75 +621,79 @@ impl Default for DistributedQuotaManager {
         Self {
             sessions: DashMap::new(),
             windows: DashMap::new(),
-            current_windows: DashMap::new(),
             endpoint_bindings: DashMap::new(),
             connect_lock: Mutex::new(()),
-            window_cache_lock: StdMutex::new(()),
-            check_count: AtomicU64::new(0),
             next_session_id: AtomicU64::new(1),
         }
     }
 }
 
 impl DistributedQuotaManager {
-    pub(super) async fn check(
+    pub(super) async fn reserve_many(
         &self,
         req: &QuotaRequest,
-        rule: &RateLimit,
-        trigger: &LimitTrigger,
+        specs: &[DistributedQuotaSpec<'_>],
         instances: &[Instance],
         client_id: &str,
-    ) -> Result<QuotaResponse, PoleError> {
-        let affinity = window_affinity(req, rule, trigger)?;
-        let (window, _window_use, logical_key) = {
-            let _cache_guard = self.window_cache_lock.lock().unwrap();
-            self.cleanup_windows_if_needed();
-            let endpoint = self.endpoint_for(instances, &affinity)?;
-            let key = WindowKey::from_rule(req, rule, trigger, &endpoint)?;
-            if !self.windows.contains_key(&key) && self.windows.len() >= WINDOW_CACHE_LIMIT {
-                return Err(PoleError::new(
-                    ErrorCode::InvalidState,
-                    "distributed rate limit window cache is at capacity".to_string(),
-                ));
-            }
+    ) -> Result<DistributedReserveResult, PoleError> {
+        if specs.is_empty() {
+            return Err(PoleError::new(
+                ErrorCode::ApiInvalidArgument,
+                "distributed quota reservation is empty".to_string(),
+            ));
+        }
+        ensure_same_cluster(specs)?;
+        let affinity = specs
+            .iter()
+            .map(|spec| window_affinity(req, spec.rule, spec.trigger))
+            .collect::<Result<Vec<_>, _>>()?
+            .join("|");
+        let endpoint = self.endpoint_for(instances, &affinity)?;
+        let session = self.session_for(&endpoint, req.timeout).await?;
+        let mut client_key = None;
+        let mut groups = Vec::with_capacity(specs.len());
+        let mut counter_keys = HashSet::new();
+        for spec in specs {
+            let key = WindowKey::from_rule(req, spec.rule, spec.trigger, &endpoint)?;
+            self.remove_stale_windows(&key);
             let window = self
                 .windows
                 .entry(key.clone())
-                .or_insert_with(|| Arc::new(QuotaWindow::new(key.clone(), trigger)))
+                .or_insert_with(|| Arc::new(QuotaWindow::new(key)))
                 .clone();
-            let logical_key = logical_window_key(&key);
-            self.current_windows.insert(logical_key.clone(), key);
-            let window_use = WindowUseGuard::new(window.clone());
-            (window, window_use, logical_key)
-        };
-        window.touch();
-        let session = self.session_for(&window.key.endpoint, req.timeout).await?;
-        session
-            .ensure_window(window.clone(), client_id, trigger, req.timeout)
-            .await?;
-        {
-            // 等新 revision 完成 INIT 后再淘汰旧窗口，避免仍在途的旧 INIT
-            // 失去接收者；target init lock 已保证此时旧回包处理完毕。
-            let _cache_guard = self.window_cache_lock.lock().unwrap();
-            let is_current = self
-                .current_windows
-                .get(&logical_key)
-                .map(|current| current.value() == &window.key)
-                .unwrap_or(false);
-            if is_current {
-                self.remove_stale_windows(&window.key);
-            }
-        }
-        let (allowed, sums, client_key) = window.acquire(trigger).await?;
-        session.report(&window, client_key, sums).await?;
-        Ok(QuotaResponse {
-            allowed,
-            message: if allowed {
-                String::new()
+            let (current_client_key, counters) = session
+                .ensure_window(&window, client_id, spec.trigger)
+                .await?;
+            if let Some(client_key) = client_key {
+                if client_key != current_client_key {
+                    return Err(PoleError::new(
+                        ErrorCode::InvalidResponse,
+                        "rate limit init responses disagree on client key".to_string(),
+                    ));
+                }
             } else {
-                "distributed rate limit quota exhausted".to_string()
-            },
-        })
+                client_key = Some(current_client_key);
+            }
+            if counters
+                .iter()
+                .any(|counter| !counter_keys.insert(counter.counter_key))
+            {
+                return Err(PoleError::new(
+                    ErrorCode::InvalidResponse,
+                    "rate limit init returned duplicate counter keys".to_string(),
+                ));
+            }
+            groups.push(LeaseCounterGroup {
+                resource: quota_resource(spec.trigger.resource())?,
+                amount: spec.amount,
+                accounting: quota_accounting(spec.trigger.resource()),
+                counter_keys: counters
+                    .into_iter()
+                    .map(|counter| counter.counter_key)
+                    .collect(),
+            });
+        }
+        session.reserve(client_key.unwrap(), groups, req).await
     }
 
     fn remove_stale_windows(&self, current: &WindowKey) {
@@ -873,7 +702,7 @@ impl DistributedQuotaManager {
             .iter()
             .filter_map(|entry| {
                 let key = entry.key();
-                ((key.cluster_namespace == current.cluster_namespace
+                (key.cluster_namespace == current.cluster_namespace
                     && key.cluster_service == current.cluster_service
                     && key.target_namespace == current.target_namespace
                     && key.target_service == current.target_service
@@ -881,95 +710,11 @@ impl DistributedQuotaManager {
                     && key.rule_id == current.rule_id
                     && key.trigger_name == current.trigger_name
                     && key != current)
-                    && entry.value().active_checks.load(Ordering::Acquire) == 0)
                     .then(|| key.clone())
             })
             .collect::<Vec<_>>();
         for key in stale {
-            self.remove_window(&key);
-        }
-    }
-
-    fn cleanup_windows_if_needed(&self) {
-        let check = self.check_count.fetch_add(1, Ordering::Relaxed);
-        if self.windows.len() < WINDOW_CACHE_LIMIT && check % WINDOW_CLEANUP_INTERVAL != 0 {
-            return;
-        }
-        let now = now_millis();
-        let mut candidates = self
-            .windows
-            .iter()
-            .map(|entry| {
-                (
-                    entry.key().clone(),
-                    entry.value().last_used_ms.load(Ordering::Acquire),
-                    entry.value().is_expired(now),
-                    entry.value().active_checks.load(Ordering::Acquire) == 0,
-                )
-            })
-            .collect::<Vec<_>>();
-        let mut remove = candidates
-            .iter()
-            .filter_map(|(key, _, expired, inactive)| (*expired && *inactive).then(|| key.clone()))
-            .collect::<Vec<_>>();
-        let remaining = self.windows.len().saturating_sub(remove.len());
-        if remaining >= WINDOW_CACHE_LIMIT {
-            candidates.sort_unstable_by_key(|(_, last_used, _, _)| *last_used);
-            let overflow = remaining - WINDOW_CACHE_LIMIT + 1;
-            remove.extend(
-                candidates
-                    .into_iter()
-                    .filter(|(_, _, expired, inactive)| !expired && *inactive)
-                    .take(overflow)
-                    .map(|(key, _, _, _)| key),
-            );
-        }
-        for key in remove {
-            self.remove_window(&key);
-            let affinity = format!(
-                "{}#{}#{}#{}#{}",
-                key.cluster_namespace,
-                key.cluster_service,
-                key.target_namespace,
-                key.target_service,
-                key.labels
-            );
-            let still_active = self.windows.iter().any(|entry| {
-                let current = entry.key();
-                current.cluster_namespace == key.cluster_namespace
-                    && current.cluster_service == key.cluster_service
-                    && current.target_namespace == key.target_namespace
-                    && current.target_service == key.target_service
-                    && current.labels == key.labels
-            });
-            if !still_active {
-                self.endpoint_bindings.remove(&affinity);
-            }
-        }
-    }
-
-    fn remove_window(&self, key: &WindowKey) {
-        self.windows.remove(key);
-        let logical_key = logical_window_key(key);
-        let is_current = self
-            .current_windows
-            .get(&logical_key)
-            .map(|current| current.value() == key)
-            .unwrap_or(false);
-        if is_current {
-            self.current_windows.remove(&logical_key);
-        }
-        if let Some(session) = self.sessions.get(&key.endpoint) {
-            session.remove_window(key);
-        }
-        let endpoint_in_use = self
-            .windows
-            .iter()
-            .any(|entry| entry.key().endpoint == key.endpoint);
-        if !endpoint_in_use {
-            if let Some((_, session)) = self.sessions.remove(&key.endpoint) {
-                session.shutdown();
-            }
+            self.windows.remove(&key);
         }
     }
 
@@ -983,17 +728,15 @@ impl DistributedQuotaManager {
                 return Ok(session.clone());
             }
         }
-        let _connect_guard = self.connect_lock.lock().await;
+        let _guard = self.connect_lock.lock().await;
         if let Some(session) = self.sessions.get(endpoint) {
             if session.healthy.load(Ordering::Acquire) && !session.sender.is_closed() {
                 return Ok(session.clone());
             }
-            drop(session);
-            self.sessions.remove(endpoint);
         }
-        let session_id = self.next_session_id.fetch_add(1, Ordering::Relaxed);
-        let session =
-            QuotaSession::connect(session_id, endpoint.to_string(), request_timeout).await?;
+        self.sessions.remove(endpoint);
+        let id = self.next_session_id.fetch_add(1, Ordering::Relaxed);
+        let session = QuotaSession::connect(id, endpoint.to_string(), request_timeout).await?;
         self.sessions.insert(endpoint.to_string(), session.clone());
         Ok(session)
     }
@@ -1004,25 +747,11 @@ impl DistributedQuotaManager {
             if available.binary_search(endpoint.value()).is_ok() {
                 return Ok(endpoint.clone());
             }
-            drop(endpoint);
-            self.endpoint_bindings.remove(affinity);
         }
         let endpoint = select_endpoint_from_available(&available, affinity);
         self.endpoint_bindings
             .insert(affinity.to_string(), endpoint.clone());
         Ok(endpoint)
-    }
-
-    #[cfg(test)]
-    pub(super) async fn check_with_instances(
-        &self,
-        req: &QuotaRequest,
-        rule: &RateLimit,
-        trigger: &LimitTrigger,
-        instances: &[Instance],
-    ) -> Result<QuotaResponse, PoleError> {
-        self.check(req, rule, trigger, instances, "test-client")
-            .await
     }
 }
 
@@ -1030,24 +759,113 @@ fn build_init_request(
     client_id: &str,
     key: &WindowKey,
     trigger: &LimitTrigger,
-) -> RateLimitInitRequest {
-    RateLimitInitRequest {
-        target: Some(key.target()),
-        client_id: client_id.to_string(),
-        totals: trigger
+) -> Result<RateLimitInitRequest, PoleError> {
+    let accounting = quota_accounting(trigger.resource());
+    let totals = match trigger.resource() {
+        limit_trigger::Resource::Qps | limit_trigger::Resource::Token => trigger
             .amounts
             .iter()
+            .filter(|amount| amount.max_amount > 0)
             .map(|amount| QuotaTotal {
                 mode: quota_mode(trigger).into(),
                 duration: amount_duration_seconds(amount),
                 max_amount: amount.max_amount,
+                accounting: accounting.into(),
             })
-            .collect(),
-        slide_count: 0,
-        // SDK 侧维护已授权配额并向服务端报告实际消耗，使用 batch occupy 与
-        // Polaris Go 客户端保持一致；服务端返回的 counter.left 才是最终配额来源。
-        mode: pole_specification::polaris::metric::v2::Mode::BatchOccupy.into(),
+            .collect::<Vec<_>>(),
+        limit_trigger::Resource::Concurrency => trigger
+            .concurrency_amount
+            .as_ref()
+            .filter(|amount| amount.max_amount > 0)
+            .map(|amount| {
+                vec![QuotaTotal {
+                    mode: quota_mode(trigger).into(),
+                    duration: 0,
+                    max_amount: amount.max_amount,
+                    accounting: accounting.into(),
+                }]
+            })
+            .unwrap_or_default(),
+        _ => Vec::new(),
+    };
+    if totals.is_empty() {
+        return Err(PoleError::new(
+            ErrorCode::InvalidRule,
+            format!("rate limit trigger {} has no quota total", trigger.name),
+        ));
     }
+    Ok(RateLimitInitRequest {
+        target: Some(key.target()),
+        client_id: client_id.to_string(),
+        totals,
+        slide_count: 0,
+        mode: Mode::BatchOccupy.into(),
+    })
+}
+
+fn remote_request(
+    cmd: RateLimitCmd,
+    init: Option<RateLimitInitRequest>,
+    reserve: Option<QuotaReserveRequest>,
+    update: Option<QuotaUpdateRequest>,
+    settle: Option<QuotaSettleRequest>,
+) -> RemoteRateLimitRequest {
+    RemoteRateLimitRequest {
+        cmd: cmd.into(),
+        rate_limit_init_request: init,
+        quota_reserve_request: reserve,
+        rate_limit_batch_init_request: None,
+        quota_update_request: update,
+        quota_settle_request: settle,
+    }
+}
+
+fn quota_accounting(resource: limit_trigger::Resource) -> QuotaAccounting {
+    match resource {
+        limit_trigger::Resource::Concurrency => QuotaAccounting::Occupancy,
+        _ => QuotaAccounting::Consumable,
+    }
+}
+
+fn quota_resource(resource: limit_trigger::Resource) -> Result<QuotaResource, PoleError> {
+    match resource {
+        limit_trigger::Resource::Qps => Ok(QuotaResource::Qps),
+        limit_trigger::Resource::Token => Ok(QuotaResource::Token),
+        limit_trigger::Resource::Concurrency => Ok(QuotaResource::Concurrency),
+        _ => Err(PoleError::new(
+            ErrorCode::InvalidRule,
+            "unsupported distributed quota resource".to_string(),
+        )),
+    }
+}
+
+fn expand_consumptions(
+    groups: &[LeaseCounterGroup],
+    consumptions: &[QuotaConsumption],
+) -> Result<Vec<RemoteQuotaConsumption>, PoleError> {
+    let mut expanded = Vec::new();
+    for group in groups {
+        let consumed_total = consumptions
+            .iter()
+            .find(|consumption| consumption.resource == group.resource)
+            .map(|consumption| consumption.consumed_total)
+            .ok_or_else(|| {
+                PoleError::new(
+                    ErrorCode::ApiInvalidArgument,
+                    format!("quota consumption for {:?} is missing", group.resource),
+                )
+            })?;
+        expanded.extend(
+            group
+                .counter_keys
+                .iter()
+                .map(|counter_key| RemoteQuotaConsumption {
+                    counter_key: *counter_key,
+                    consumed_total,
+                }),
+        );
+    }
+    Ok(expanded)
 }
 
 fn quota_mode(trigger: &LimitTrigger) -> RemoteQuotaMode {
@@ -1055,6 +873,23 @@ fn quota_mode(trigger: &LimitTrigger) -> RemoteQuotaMode {
         AmountMode::ShareEqually => RemoteQuotaMode::Divide,
         AmountMode::GlobalTotal => RemoteQuotaMode::Whole,
     }
+}
+
+fn normalize_consumptions(consumptions: Vec<RemoteQuotaConsumption>) -> Vec<(u32, u32)> {
+    let mut normalized = consumptions
+        .into_iter()
+        .map(|consumption| (consumption.counter_key, consumption.consumed_total))
+        .collect::<Vec<_>>();
+    normalized.sort_unstable();
+    normalized
+}
+
+fn ttl_seconds(ttl: Duration) -> u32 {
+    let rounded = ttl
+        .as_secs()
+        .saturating_add(u64::from(ttl.subsec_nanos() > 0))
+        .max(1);
+    rounded.min(u64::from(u32::MAX)) as u32
 }
 
 fn amount_duration_seconds(amount: &pole_specification::v1::Amount) -> u32 {
@@ -1088,23 +923,29 @@ fn window_affinity(
     ))
 }
 
-fn logical_window_key(key: &WindowKey) -> String {
-    format!(
-        "{}#{}#{}#{}#{}#{}#{}",
-        key.cluster_namespace,
-        key.cluster_service,
-        key.target_namespace,
-        key.target_service,
-        key.labels,
-        key.rule_id,
-        key.trigger_name
-    )
-}
-
-#[cfg(test)]
-fn select_endpoint(instances: &[Instance], affinity: &str) -> Result<String, PoleError> {
-    let available = available_grpc_endpoints(instances)?;
-    Ok(select_endpoint_from_available(&available, affinity))
+fn ensure_same_cluster(specs: &[DistributedQuotaSpec<'_>]) -> Result<(), PoleError> {
+    let first = specs
+        .first()
+        .and_then(|spec| spec.rule.cluster.as_ref())
+        .ok_or_else(|| {
+            PoleError::new(
+                ErrorCode::InvalidRule,
+                "global rate limit rule does not declare cluster".to_string(),
+            )
+        })?;
+    if specs.iter().all(|spec| {
+        spec.rule
+            .cluster
+            .as_ref()
+            .map(|cluster| cluster.namespace == first.namespace && cluster.service == first.service)
+            == Some(true)
+    }) {
+        return Ok(());
+    }
+    Err(PoleError::new(
+        ErrorCode::InvalidRule,
+        "one quota lease cannot span multiple limiter clusters".to_string(),
+    ))
 }
 
 fn available_grpc_endpoints(instances: &[Instance]) -> Result<Vec<String>, PoleError> {
@@ -1143,34 +984,39 @@ fn now_millis() -> i64 {
         .as_millis() as i64
 }
 
+fn api_timeout(message: impl Into<String>) -> PoleError {
+    PoleError::new(ErrorCode::ApiTimeout, message.into())
+}
+
 fn network_error(context: &str, error: impl std::fmt::Display) -> PoleError {
-    PoleError::new(ErrorCode::NetworkError, format!("{context}: {error}"))
+    network_error_message(format!("{context}: {error}"))
+}
+
+fn network_error_message(message: impl Into<String>) -> PoleError {
+    PoleError::new(ErrorCode::NetworkError, message.into())
 }
 
 #[cfg(test)]
 mod tests {
     use std::{
+        collections::HashMap,
         pin::Pin,
         sync::{
-            atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering},
+            atomic::{AtomicU32, Ordering},
             Arc, Mutex as StdMutex,
         },
-        time::Duration,
     };
 
     use pole_specification::{
         polaris::metric::v2::{
-            rate_limit_grpcv2_server::{RateLimitGrpcv2, RateLimitGrpcv2Server},
-            QuotaCounter, QuotaLeft, RateLimitCmd, RateLimitInitResponse, RateLimitReportResponse,
-            RateLimitRequest, RateLimitResponse, TimeAdjustRequest, TimeAdjustResponse,
+            rate_limit_grpc_server::{RateLimitGrpc, RateLimitGrpcServer},
+            QuotaLeft, QuotaReserveResponse, QuotaSettleResponse, QuotaSettlement,
+            QuotaUpdateResponse, RateLimitInitResponse, RateLimitResponse, TimeAdjustResponse,
         },
-        v1::{
-            limit_trigger, match_argument, match_string, rate_limit, Amount, LimitTrigger,
-            MatchArgument, MatchString, RateLimit, RateLimitCluster,
-        },
+        v1::{rate_limit, Amount, ConcurrencyAmount, RateLimitCluster},
     };
     use prost_types::Duration as ProstDuration;
-    use tokio::{net::TcpListener, sync::mpsc};
+    use tokio::net::TcpListener;
     use tokio_stream::{
         wrappers::{ReceiverStream, TcpListenerStream},
         Stream,
@@ -1178,149 +1024,314 @@ mod tests {
     use tonic::{Request, Response, Status};
 
     use super::*;
-    use crate::{
-        core::{config::config::Configuration, context::SDKContext, model::ArgumentType},
-        traffic::ratelimit::{api::RateLimitAPI, default::DefaultRateLimitAPI},
-    };
+    use crate::{core::model::ArgumentType, traffic::ratelimit::api::QuotaLease};
 
-    struct TestRateLimitServer {
-        remaining: Arc<AtomicI64>,
-        observation: TestServerObservation,
-        clock_offset_ms: i64,
+    const REJECTED_CODE: u32 = 429_001;
+    const INVALID_LEASE_CODE: u32 = 400_001;
+
+    #[derive(Clone, Copy)]
+    struct CounterState {
+        max_amount: u32,
+        accounting: QuotaAccounting,
+        committed: u32,
+        reserved: u32,
+    }
+
+    struct ServerLease {
+        reservations: HashMap<u32, u32>,
+        consumptions: HashMap<u32, u32>,
+        sequence: u64,
+    }
+
+    #[derive(Default)]
+    struct ServerState {
+        counters: HashMap<u32, CounterState>,
+        leases: HashMap<String, ServerLease>,
+        settled: HashMap<String, Vec<QuotaSettlement>>,
+        next_lease: u64,
     }
 
     #[derive(Clone, Default)]
-    struct TestServerObservation {
+    struct Observation {
         init_count: Arc<AtomicU32>,
-        client_ids: Arc<StdMutex<Vec<String>>>,
-        labels: Arc<StdMutex<Vec<String>>>,
-        report_timestamps: Arc<StdMutex<Vec<i64>>>,
-        time_adjust_count: Arc<AtomicU32>,
-        stream_count: Arc<AtomicU32>,
-        report_code_once: Arc<AtomicU32>,
-        close_after_report_error: Arc<AtomicBool>,
-        init_delay_ms: Arc<AtomicU64>,
+        reserve_count: Arc<AtomicU32>,
+        update_count: Arc<AtomicU32>,
+        settle_count: Arc<AtomicU32>,
+        update_consumptions: Arc<StdMutex<Vec<Vec<RemoteQuotaConsumption>>>>,
+    }
+
+    struct TestRateLimitServer {
+        state: Arc<StdMutex<ServerState>>,
+        observation: Observation,
     }
 
     #[tonic::async_trait]
-    impl RateLimitGrpcv2 for TestRateLimitServer {
+    impl RateLimitGrpc for TestRateLimitServer {
         type ServiceStream = Pin<Box<dyn Stream<Item = Result<RateLimitResponse, Status>> + Send>>;
 
         async fn service(
             &self,
-            request: Request<tonic::Streaming<RateLimitRequest>>,
+            request: Request<tonic::Streaming<RemoteRateLimitRequest>>,
         ) -> Result<Response<Self::ServiceStream>, Status> {
-            self.observation
-                .stream_count
-                .fetch_add(1, Ordering::Relaxed);
             let mut inbound = request.into_inner();
             let (sender, receiver) = mpsc::channel(16);
-            let remaining = self.remaining.clone();
+            let state = self.state.clone();
             let observation = self.observation.clone();
-            let clock_offset_ms = self.clock_offset_ms;
             tokio::spawn(async move {
                 while let Ok(Some(request)) = inbound.message().await {
-                    match RateLimitCmd::try_from(request.cmd).ok() {
+                    let response = match RateLimitCmd::try_from(request.cmd).ok() {
                         Some(RateLimitCmd::Init) => {
+                            observation.init_count.fetch_add(1, Ordering::Relaxed);
                             let Some(init) = request.rate_limit_init_request else {
                                 return;
                             };
-                            observation.init_count.fetch_add(1, Ordering::Relaxed);
-                            let init_delay_ms = observation.init_delay_ms.load(Ordering::Relaxed);
-                            if init_delay_ms > 0 {
-                                tokio::time::sleep(Duration::from_millis(init_delay_ms)).await;
-                            }
-                            observation
-                                .client_ids
-                                .lock()
-                                .unwrap()
-                                .push(init.client_id.clone());
-                            observation
-                                .labels
-                                .lock()
-                                .unwrap()
-                                .push(init.target.as_ref().unwrap().labels.clone());
-                            let duration =
-                                init.totals.first().map(|total| total.duration).unwrap_or(1);
-                            let response = RateLimitResponse {
+                            let mut state = state.lock().unwrap();
+                            let first_counter_key = 100 + state.counters.len() as u32;
+                            let counters = init
+                                .totals
+                                .iter()
+                                .enumerate()
+                                .map(|(index, total)| {
+                                    let counter_key = first_counter_key + index as u32;
+                                    state.counters.insert(
+                                        counter_key,
+                                        CounterState {
+                                            max_amount: total.max_amount,
+                                            accounting: QuotaAccounting::try_from(total.accounting)
+                                                .unwrap(),
+                                            committed: 0,
+                                            reserved: 0,
+                                        },
+                                    );
+                                    QuotaCounter {
+                                        duration: total.duration,
+                                        counter_key,
+                                        left: i64::from(total.max_amount),
+                                        mode: total.mode,
+                                        client_count: 1,
+                                    }
+                                })
+                                .collect();
+                            RateLimitResponse {
                                 cmd: RateLimitCmd::Init.into(),
                                 rate_limit_init_response: Some(RateLimitInitResponse {
                                     code: RATE_LIMIT_SUCCESS_CODE,
                                     target: init.target,
                                     client_key: 7,
-                                    counters: vec![QuotaCounter {
-                                        duration,
-                                        counter_key: 101,
-                                        left: remaining.load(Ordering::Relaxed),
-                                        mode: 1,
-                                        client_count: 1,
-                                    }],
+                                    counters,
                                     slide_count: 1,
-                                    timestamp: now_millis() + clock_offset_ms,
+                                    timestamp: now_millis(),
                                 }),
-                                rate_limit_report_response: None,
-                                rate_limit_batch_init_response: None,
-                            };
-                            if sender.send(Ok(response)).await.is_err() {
-                                return;
+                                ..Default::default()
                             }
                         }
-                        Some(RateLimitCmd::Acquire) => {
-                            let Some(report) = request.rate_limit_report_request else {
+                        Some(RateLimitCmd::Reserve) => {
+                            observation.reserve_count.fetch_add(1, Ordering::Relaxed);
+                            let Some(reserve) = request.quota_reserve_request else {
+                                return;
+                            };
+                            let mut state = state.lock().unwrap();
+                            let allowed = reserve.reservations.iter().all(|reservation| {
+                                state
+                                    .counters
+                                    .get(&reservation.counter_key)
+                                    .map(|counter| {
+                                        counter
+                                            .committed
+                                            .saturating_add(counter.reserved)
+                                            .saturating_add(reservation.amount)
+                                            <= counter.max_amount
+                                    })
+                                    .unwrap_or(false)
+                            });
+                            if !allowed {
+                                RateLimitResponse {
+                                    cmd: RateLimitCmd::Reserve.into(),
+                                    quota_reserve_response: Some(QuotaReserveResponse {
+                                        code: REJECTED_CODE,
+                                        ..Default::default()
+                                    }),
+                                    ..Default::default()
+                                }
+                            } else {
+                                for reservation in &reserve.reservations {
+                                    state
+                                        .counters
+                                        .get_mut(&reservation.counter_key)
+                                        .unwrap()
+                                        .reserved += reservation.amount;
+                                }
+                                state.next_lease += 1;
+                                let lease_id = format!("lease-{}", state.next_lease);
+                                state.leases.insert(
+                                    lease_id.clone(),
+                                    ServerLease {
+                                        reservations: reserve
+                                            .reservations
+                                            .iter()
+                                            .map(|reservation| {
+                                                (reservation.counter_key, reservation.amount)
+                                            })
+                                            .collect(),
+                                        consumptions: reserve
+                                            .reservations
+                                            .iter()
+                                            .map(|reservation| (reservation.counter_key, 0))
+                                            .collect(),
+                                        sequence: 0,
+                                    },
+                                );
+                                RateLimitResponse {
+                                    cmd: RateLimitCmd::Reserve.into(),
+                                    quota_reserve_response: Some(QuotaReserveResponse {
+                                        code: RATE_LIMIT_SUCCESS_CODE,
+                                        lease_id,
+                                        quota_lefts: reserve
+                                            .reservations
+                                            .iter()
+                                            .map(|reservation| {
+                                                let counter = state
+                                                    .counters
+                                                    .get(&reservation.counter_key)
+                                                    .unwrap();
+                                                QuotaLeft {
+                                                    counter_key: reservation.counter_key,
+                                                    left: i64::from(
+                                                        counter.max_amount
+                                                            - counter.committed
+                                                            - counter.reserved,
+                                                    ),
+                                                    mode: Mode::BatchOccupy.into(),
+                                                    client_count: 1,
+                                                }
+                                            })
+                                            .collect(),
+                                        expires_at: now_millis()
+                                            + i64::from(reserve.ttl_seconds) * 1_000,
+                                        timestamp: now_millis(),
+                                    }),
+                                    ..Default::default()
+                                }
+                            }
+                        }
+                        Some(RateLimitCmd::Update) => {
+                            observation.update_count.fetch_add(1, Ordering::Relaxed);
+                            let Some(update) = request.quota_update_request else {
                                 return;
                             };
                             observation
-                                .report_timestamps
+                                .update_consumptions
                                 .lock()
                                 .unwrap()
-                                .push(report.timestamp);
-                            let report_code =
-                                observation.report_code_once.swap(0, Ordering::Relaxed);
-                            if report_code != 0 {
-                                let response = RateLimitResponse {
-                                    cmd: RateLimitCmd::Acquire.into(),
-                                    rate_limit_init_response: None,
-                                    rate_limit_report_response: Some(RateLimitReportResponse {
-                                        code: report_code,
-                                        quota_lefts: Vec::new(),
-                                        timestamp: now_millis() + clock_offset_ms,
-                                    }),
-                                    rate_limit_batch_init_response: None,
-                                };
-                                if sender.send(Ok(response)).await.is_err()
-                                    || observation.close_after_report_error.load(Ordering::Relaxed)
+                                .push(update.consumptions.clone());
+                            let mut state = state.lock().unwrap();
+                            let code = match state.leases.get_mut(&update.lease_id) {
+                                Some(lease)
+                                    if update.sequence == lease.sequence + 1
+                                        && update.consumptions.iter().all(|consumption| {
+                                            let current = lease
+                                                .consumptions
+                                                .get(&consumption.counter_key)
+                                                .copied()
+                                                .unwrap_or(u32::MAX);
+                                            let reserved = lease
+                                                .reservations
+                                                .get(&consumption.counter_key)
+                                                .copied()
+                                                .unwrap_or(0);
+                                            consumption.consumed_total >= current
+                                                && consumption.consumed_total <= reserved
+                                        }) =>
                                 {
+                                    lease.sequence = update.sequence;
+                                    for consumption in &update.consumptions {
+                                        lease.consumptions.insert(
+                                            consumption.counter_key,
+                                            consumption.consumed_total,
+                                        );
+                                    }
+                                    RATE_LIMIT_SUCCESS_CODE
+                                }
+                                _ => INVALID_LEASE_CODE,
+                            };
+                            RateLimitResponse {
+                                cmd: RateLimitCmd::Update.into(),
+                                quota_update_response: Some(QuotaUpdateResponse {
+                                    code,
+                                    consumptions: update.consumptions,
+                                    sequence: update.sequence,
+                                    timestamp: now_millis(),
+                                }),
+                                ..Default::default()
+                            }
+                        }
+                        Some(RateLimitCmd::Settle) => {
+                            observation.settle_count.fetch_add(1, Ordering::Relaxed);
+                            let Some(settle) = request.quota_settle_request else {
+                                return;
+                            };
+                            let mut state = state.lock().unwrap();
+                            if let Some(previous) = state.settled.get(&settle.lease_id).cloned() {
+                                RateLimitResponse {
+                                    cmd: RateLimitCmd::Settle.into(),
+                                    quota_settle_response: Some(QuotaSettleResponse {
+                                        code: RATE_LIMIT_SUCCESS_CODE,
+                                        settlements: previous,
+                                        timestamp: now_millis(),
+                                    }),
+                                    ..Default::default()
+                                }
+                            } else {
+                                let Some(lease) = state.leases.remove(&settle.lease_id) else {
+                                    return;
+                                };
+                                if settle.sequence != lease.sequence + 1 {
                                     return;
                                 }
-                                continue;
-                            }
-                            let used = report.quota_uses.iter().map(|sum| sum.used).sum::<u32>();
-                            let left = remaining.fetch_sub(i64::from(used), Ordering::Relaxed)
-                                - i64::from(used);
-                            let response = RateLimitResponse {
-                                cmd: RateLimitCmd::Acquire.into(),
-                                rate_limit_init_response: None,
-                                rate_limit_report_response: Some(RateLimitReportResponse {
-                                    code: RATE_LIMIT_SUCCESS_CODE,
-                                    quota_lefts: report
-                                        .quota_uses
-                                        .iter()
-                                        .map(|sum| QuotaLeft {
-                                            counter_key: sum.counter_key,
-                                            left,
-                                            mode: 1,
-                                            client_count: 1,
-                                        })
-                                        .collect(),
-                                    timestamp: now_millis() + clock_offset_ms,
-                                }),
-                                rate_limit_batch_init_response: None,
-                            };
-                            if sender.send(Ok(response)).await.is_err() {
-                                return;
+                                let consumed = settle
+                                    .consumptions
+                                    .iter()
+                                    .map(|consumption| {
+                                        (consumption.counter_key, consumption.consumed_total)
+                                    })
+                                    .collect::<HashMap<_, _>>();
+                                let settlements = lease
+                                    .reservations
+                                    .iter()
+                                    .map(|(counter_key, amount)| {
+                                        let consumed_total = *consumed.get(counter_key).unwrap();
+                                        let counter = state.counters.get_mut(counter_key).unwrap();
+                                        counter.reserved -= amount;
+                                        let returned_amount = match counter.accounting {
+                                            QuotaAccounting::Consumable => {
+                                                counter.committed += consumed_total;
+                                                amount - consumed_total
+                                            }
+                                            QuotaAccounting::Occupancy => *amount,
+                                        };
+                                        QuotaSettlement {
+                                            counter_key: *counter_key,
+                                            consumed_total,
+                                            returned_amount,
+                                        }
+                                    })
+                                    .collect::<Vec<_>>();
+                                state.settled.insert(settle.lease_id, settlements.clone());
+                                RateLimitResponse {
+                                    cmd: RateLimitCmd::Settle.into(),
+                                    quota_settle_response: Some(QuotaSettleResponse {
+                                        code: RATE_LIMIT_SUCCESS_CODE,
+                                        settlements,
+                                        timestamp: now_millis(),
+                                    }),
+                                    ..Default::default()
+                                }
                             }
                         }
                         _ => return,
+                    };
+                    if sender.send(Ok(response)).await.is_err() {
+                        return;
                     }
                 }
             });
@@ -1331,222 +1342,133 @@ mod tests {
             &self,
             _request: Request<TimeAdjustRequest>,
         ) -> Result<Response<TimeAdjustResponse>, Status> {
-            self.observation
-                .time_adjust_count
-                .fetch_add(1, Ordering::Relaxed);
             Ok(Response::new(TimeAdjustResponse {
-                server_timestamp: now_millis() + self.clock_offset_ms,
+                server_timestamp: now_millis(),
             }))
         }
     }
 
-    async fn start_test_server() -> (u32, TestServerObservation, tokio::task::JoinHandle<()>) {
-        start_test_server_with_clock_offset(0).await
-    }
-
-    async fn start_test_server_with_clock_offset(
-        clock_offset_ms: i64,
-    ) -> (u32, TestServerObservation, tokio::task::JoinHandle<()>) {
+    async fn start_server() -> (u32, Observation, tokio::task::JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let observation = TestServerObservation::default();
+        let port = u32::from(listener.local_addr().unwrap().port());
+        let observation = Observation::default();
         let server = TestRateLimitServer {
-            remaining: Arc::new(AtomicI64::new(2)),
+            state: Arc::new(StdMutex::new(ServerState::default())),
             observation: observation.clone(),
-            clock_offset_ms,
         };
         let task = tokio::spawn(async move {
             tonic::transport::Server::builder()
-                .add_service(RateLimitGrpcv2Server::new(server))
+                .add_service(RateLimitGrpcServer::new(server))
                 .serve_with_incoming(TcpListenerStream::new(listener))
                 .await
                 .unwrap();
         });
-        (u32::from(port), observation, task)
-    }
-
-    fn entry_test_configuration() -> Configuration {
-        let connector_map = serde_yaml::from_str(
-            r#"
-global:
-  api:
-    timeout: 1s
-    maxRetryTimes: 1
-    retryInterval: 1ms
-    reportInterval: 1s
-  serverConnectors:
-    discover:
-      addresses: [127.0.0.1:1]
-      protocol: grpc
-      connectTimeout: 1ms
-      messageTimeout: 1ms
-    config:
-      addresses: [127.0.0.1:1]
-      protocol: grpc
-      connectTimeout: 1ms
-      messageTimeout: 1ms
-  location:
-    providers:
-      - name: local
-        options: {}
-  client:
-    id: sdk-entry-client
-    labels: {}
-consumer:
-  serviceRouter:
-    beforeChain: []
-    coreChain: []
-    afterChain: []
-  loadBalancer:
-    defaultPolicy: weightedRandom
-    plugins: []
-  localCache:
-    name: memory
-    serviceExpireEnable: false
-    serviceExpireTime: 1s
-    serviceRefreshInterval: 1s
-    serviceListRefreshInterval: 1s
-    persistEnable: false
-    persistDir: ./target/test-cache
-provider:
-  lossless:
-    host: 127.0.0.1
-    port: 0
-    delayRegisterInterval: 1ms
-    healthCheckInterval: 1ms
-config:
-  propertiesValueCacheSize: 1
-  propertiesValueExpireTime: 1
-  configFilter:
-    enable: false
-    chain: []
-    plugin: {}
-"#,
-        );
-        connector_map
-            .or_else(|_| {
-                serde_yaml::from_str(
-                    r#"
-global:
-  api:
-    timeout: 1s
-    maxRetryTimes: 1
-    retryInterval: 1ms
-    reportInterval: 1s
-  serverConnectors:
-    addresses: [127.0.0.1:1]
-    protocol: grpc
-    connectTimeout: 1ms
-    serverSwitchInterval: 1s
-    messageTimeout: 1ms
-    connectionIdleTimeout: 1s
-    reconnectInterval: 1ms
-  statReporter:
-    enable: false
-    chain: []
-  location:
-    providers:
-      - name: local
-        options: {}
-  client:
-    id: sdk-entry-client
-    labels: {}
-consumer:
-  serviceRouter:
-    beforeChain: []
-    coreChain: []
-    afterChain: []
-  circuitBreaker:
-    enable: false
-    enableRemotePull: false
-  loadBalancer:
-    defaultPolicy: weightedRandom
-    plugins: []
-  localCache:
-    name: memory
-    serviceExpireEnable: false
-    serviceExpireTime: 1s
-    serviceRefreshInterval: 1s
-    serviceListRefreshInterval: 1s
-    persistEnable: false
-    persistDir: ./target/test-cache
-provider:
-  rateLimit:
-    enable: true
-    service: pole.limiter
-    namespace: Pole
-    maxWindowCount: 100
-    fallbackOnExceedWindowCount: pass
-    remoteSyncTimeout: 1s
-    maxQueuingTime: 1s
-    reportMetrics: false
-  lossless:
-    enable: false
-    host: 127.0.0.1
-    port: 0
-    delayRegisterInterval: 1ms
-    healthCheckInterval: 1ms
-config:
-  propertiesValueCacheSize: 1
-  propertiesValueExpireTime: 1
-  configFilter:
-    enable: false
-    chain: []
-    plugin: {}
-"#,
-                )
-            })
-            .unwrap()
+        (port, observation, task)
     }
 
     fn no_traffic_label(_: ArgumentType, _: &str) -> Option<String> {
         None
     }
 
-    fn alice_header(arg_type: ArgumentType, key: &str) -> Option<String> {
-        (arg_type == ArgumentType::Header && key == "x-user").then(|| "alice".to_string())
-    }
-
-    fn bob_header(arg_type: ArgumentType, key: &str) -> Option<String> {
-        (arg_type == ArgumentType::Header && key == "x-user").then(|| "bob".to_string())
-    }
-
-    fn quota_request() -> QuotaRequest {
+    fn quota_request(resource: QuotaResource, amount: u32) -> QuotaRequest {
         QuotaRequest {
             flow_id: "flow-1".to_string(),
             timeout: Duration::from_secs(1),
             service: "orders".to_string(),
             namespace: "default".to_string(),
-            method: "GET".to_string(),
+            method: "POST /chat".to_string(),
             traffic_label_provider: no_traffic_label,
+            quotas: vec![crate::traffic::ratelimit::req::QuotaAmount { resource, amount }],
+            lease_ttl: Duration::from_secs(30),
         }
     }
 
-    fn global_rule(revision: &str) -> RateLimit {
+    fn global_consumable_rule(
+        resource: limit_trigger::Resource,
+        max_amount: u32,
+        windows: usize,
+    ) -> RateLimit {
         RateLimit {
             id: "global-rule".to_string(),
-            revision: revision.to_string(),
+            revision: "rev-1".to_string(),
             r#type: rate_limit::Type::Global.into(),
             cluster: Some(RateLimitCluster {
                 namespace: "Pole".to_string(),
                 service: "pole-limiter".to_string(),
             }),
             rules: vec![LimitTrigger {
-                name: "qps".to_string(),
-                resource: limit_trigger::Resource::Qps.into(),
-                amounts: vec![Amount {
-                    max_amount: 2,
-                    valid_duration: Some(ProstDuration {
-                        seconds: 1,
-                        nanos: 0,
-                    }),
-                    ..Default::default()
-                }],
-                amount_mode: limit_trigger::AmountMode::GlobalTotal.into(),
+                name: "quota".to_string(),
+                resource: resource.into(),
+                amounts: (0..windows)
+                    .map(|index| Amount {
+                        max_amount,
+                        valid_duration: Some(ProstDuration {
+                            seconds: 60 + index as i64,
+                            nanos: 0,
+                        }),
+                        ..Default::default()
+                    })
+                    .collect(),
+                amount_mode: AmountMode::GlobalTotal.into(),
                 ..Default::default()
             }],
             ..Default::default()
         }
+    }
+
+    fn global_concurrency_rule(max_amount: u32) -> RateLimit {
+        let mut rule = global_consumable_rule(limit_trigger::Resource::Qps, 1, 1);
+        rule.rules[0].resource = limit_trigger::Resource::Concurrency.into();
+        rule.rules[0].amounts.clear();
+        rule.rules[0].concurrency_amount = Some(ConcurrencyAmount { max_amount });
+        rule
+    }
+
+    fn global_mixed_rule() -> RateLimit {
+        let mut rule = global_consumable_rule(limit_trigger::Resource::Qps, 1, 1);
+        let token = LimitTrigger {
+            name: "token".to_string(),
+            resource: limit_trigger::Resource::Token.into(),
+            amounts: vec![Amount {
+                max_amount: 100,
+                valid_duration: Some(ProstDuration {
+                    seconds: 60,
+                    nanos: 0,
+                }),
+                ..Default::default()
+            }],
+            amount_mode: AmountMode::GlobalTotal.into(),
+            ..Default::default()
+        };
+        let concurrency = LimitTrigger {
+            name: "concurrency".to_string(),
+            resource: limit_trigger::Resource::Concurrency.into(),
+            concurrency_amount: Some(ConcurrencyAmount { max_amount: 1 }),
+            amount_mode: AmountMode::GlobalTotal.into(),
+            ..Default::default()
+        };
+        rule.rules[0].name = "qps".to_string();
+        rule.rules.extend([token, concurrency]);
+        rule
+    }
+
+    fn mixed_quota_request() -> QuotaRequest {
+        let mut req = quota_request(QuotaResource::Token, 80);
+        req.quotas = vec![
+            crate::traffic::ratelimit::req::QuotaAmount {
+                resource: QuotaResource::Qps,
+                amount: 1,
+            },
+            crate::traffic::ratelimit::req::QuotaAmount {
+                resource: QuotaResource::Token,
+                amount: 80,
+            },
+            crate::traffic::ratelimit::req::QuotaAmount {
+                resource: QuotaResource::Concurrency,
+                amount: 1,
+            },
+        ];
+        req
     }
 
     fn limiter_instance(port: u32) -> Instance {
@@ -1560,636 +1482,209 @@ config:
         }
     }
 
-    #[tokio::test]
-    async fn public_get_quota_filters_instances_and_uses_engine_client_id() {
-        let (limiter_port, observation, limiter_server) = start_test_server().await;
-        let rule = global_rule("rev-1");
-        let context =
-            Arc::new(SDKContext::create_by_configuration(entry_test_configuration()).unwrap());
-        let mut http = limiter_instance(1);
-        http.protocol = "http".to_string();
-        let api = DefaultRateLimitAPI::new_with_test_inputs(
-            context,
-            vec![rule],
-            vec![http, limiter_instance(limiter_port)],
-        );
-
-        let response = api.get_quota(quota_request()).await.unwrap();
-
-        assert!(response.allowed);
-        assert_eq!(
-            observation.client_ids.lock().unwrap().as_slice(),
-            ["sdk-entry-client"]
-        );
-        assert_eq!(observation.init_count.load(Ordering::Relaxed), 1);
-
-        limiter_server.abort();
-    }
-
-    #[tokio::test]
-    async fn global_rule_uses_rule_cluster_and_reuses_its_initialized_window() {
-        let (port, observation, server) = start_test_server().await;
-        let manager = DistributedQuotaManager::default();
-        let req = quota_request();
-        let rule = global_rule("rev-1");
-        let trigger = &rule.rules[0];
-        let instances = vec![limiter_instance(port)];
-
-        assert!(
-            manager
-                .check_with_instances(&req, &rule, trigger, &instances)
-                .await
-                .unwrap()
-                .allowed
-        );
-        assert!(
-            manager
-                .check_with_instances(&req, &rule, trigger, &instances)
-                .await
-                .unwrap()
-                .allowed
-        );
-        assert!(
-            !manager
-                .check_with_instances(&req, &rule, trigger, &instances)
-                .await
-                .unwrap()
-                .allowed
-        );
-        assert_eq!(observation.init_count.load(Ordering::Relaxed), 1);
-
-        server.abort();
-    }
-
-    #[tokio::test]
-    async fn rule_revision_change_creates_a_new_remote_window() {
-        let (port, observation, server) = start_test_server().await;
-        let manager = DistributedQuotaManager::default();
-        let req = quota_request();
-        let instances = vec![limiter_instance(port)];
-        let first = global_rule("rev-1");
-        let second = global_rule("rev-2");
-
-        manager
-            .check_with_instances(&req, &first, &first.rules[0], &instances)
-            .await
-            .unwrap();
-        manager
-            .check_with_instances(&req, &second, &second.rules[0], &instances)
-            .await
-            .unwrap();
-        assert_eq!(observation.init_count.load(Ordering::Relaxed), 2);
-        assert_eq!(manager.windows.len(), 1);
-
-        server.abort();
-    }
-
-    #[tokio::test]
-    async fn report_response_does_not_restore_quota_consumed_while_in_flight() {
-        let req = quota_request();
-        let rule = global_rule("rev-1");
-        let trigger = &rule.rules[0];
-        let key = WindowKey::from_rule(&req, &rule, trigger, "127.0.0.1:8081").unwrap();
-        let window = QuotaWindow::new(key, trigger);
-        window.state.lock().await.owner_session_id = 1;
-        window
-            .mark_initialized(
-                1,
-                7,
-                vec![QuotaCounter {
-                    duration: 1,
-                    counter_key: 101,
-                    left: 2,
-                    mode: 1,
-                    client_count: 1,
-                }],
-            )
-            .await;
-
-        assert!(window.acquire(trigger).await.unwrap().0);
-        assert!(window.acquire(trigger).await.unwrap().0);
-        window
-            .update_counters(
-                1,
-                now_millis(),
-                vec![QuotaLeft {
-                    counter_key: 101,
-                    left: 1,
-                    mode: 1,
-                    client_count: 1,
-                }],
-            )
-            .await;
-
-        assert!(!window.acquire(trigger).await.unwrap().0);
-    }
-
-    #[tokio::test]
-    async fn report_response_does_not_double_count_the_acknowledged_batch() {
-        let req = quota_request();
-        let rule = global_rule("rev-1");
-        let trigger = &rule.rules[0];
-        let key = WindowKey::from_rule(&req, &rule, trigger, "127.0.0.1:8081").unwrap();
-        let window = QuotaWindow::new(key, trigger);
-        window.state.lock().await.owner_session_id = 1;
-        window
-            .mark_initialized(
-                1,
-                7,
-                vec![QuotaCounter {
-                    duration: 1,
-                    counter_key: 101,
-                    left: 2,
-                    mode: 1,
-                    client_count: 1,
-                }],
-            )
-            .await;
-
-        let (allowed, sums, _) = window.acquire(trigger).await.unwrap();
-        assert!(allowed);
-        let timestamp = now_millis();
-        {
-            let mut state = window.state.lock().await;
-            QuotaWindow::mark_reported(&mut state, timestamp, &sums);
-        }
-        window
-            .update_counters(
-                1,
-                timestamp,
-                vec![QuotaLeft {
-                    counter_key: 101,
-                    left: 1,
-                    mode: 1,
-                    client_count: 1,
-                }],
-            )
-            .await;
-
-        assert!(window.acquire(trigger).await.unwrap().0);
-    }
-
-    #[tokio::test]
-    async fn non_positive_push_does_not_ack_local_report_fifo() {
-        let req = quota_request();
-        let rule = global_rule("rev-1");
-        let trigger = &rule.rules[0];
-        let key = WindowKey::from_rule(&req, &rule, trigger, "127.0.0.1:8081").unwrap();
-        let window = QuotaWindow::new(key, trigger);
-        window.state.lock().await.owner_session_id = 1;
-        window
-            .mark_initialized(
-                1,
-                7,
-                vec![QuotaCounter {
-                    duration: 1,
-                    counter_key: 101,
-                    left: 1,
-                    mode: 1,
-                    client_count: 1,
-                }],
-            )
-            .await;
-
-        let (_, used, _) = window.acquire(trigger).await.unwrap();
-        let (_, limited, _) = window.acquire(trigger).await.unwrap();
-        let timestamp = now_millis();
-        {
-            let mut state = window.state.lock().await;
-            QuotaWindow::mark_reported(&mut state, timestamp, &used);
-            QuotaWindow::mark_reported(&mut state, timestamp, &limited);
-        }
-        for _ in 0..2 {
-            window
-                .update_counters(
-                    1,
-                    timestamp,
-                    vec![QuotaLeft {
-                        counter_key: 101,
-                        left: 0,
-                        mode: 1,
-                        client_count: 1,
-                    }],
-                )
-                .await;
-        }
-
-        let state = window.state.lock().await;
-        let counter = state.counters.get(&1).unwrap();
-        assert_eq!(counter.inflight_used.len(), 2);
-        assert!(counter.left <= 0);
-    }
-
-    #[tokio::test]
-    async fn revision_init_is_serialized_for_the_same_remote_target() {
-        let (port, observation, server) = start_test_server().await;
-        observation.init_delay_ms.store(50, Ordering::Relaxed);
-        let manager = Arc::new(DistributedQuotaManager::default());
-        let req = quota_request();
-        let instances = vec![limiter_instance(port)];
-        let first = global_rule("rev-1");
-        let second = global_rule("rev-2");
-
-        let first_check = {
-            let manager = manager.clone();
-            let req = req.clone();
-            let instances = instances.clone();
-            tokio::spawn(async move {
-                manager
-                    .check_with_instances(&req, &first, &first.rules[0], &instances)
-                    .await
+    async fn reserve_lease(
+        manager: &DistributedQuotaManager,
+        req: &QuotaRequest,
+        rule: &RateLimit,
+        port: u32,
+    ) -> Result<QuotaLease, String> {
+        let specs = rule
+            .rules
+            .iter()
+            .filter_map(|trigger| {
+                let resource = quota_resource(trigger.resource()).ok()?;
+                req.amount_for(resource).map(|amount| DistributedQuotaSpec {
+                    rule,
+                    trigger,
+                    amount,
+                })
             })
-        };
-        timeout(Duration::from_secs(1), async {
-            while observation.init_count.load(Ordering::Relaxed) == 0 {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .unwrap();
-        let second_check = {
-            let manager = manager.clone();
-            let req = req.clone();
-            let instances = instances.clone();
-            tokio::spawn(async move {
-                manager
-                    .check_with_instances(&req, &second, &second.rules[0], &instances)
-                    .await
-            })
-        };
-
-        tokio::time::sleep(Duration::from_millis(10)).await;
-        assert_eq!(observation.init_count.load(Ordering::Relaxed), 1);
-        first_check.await.unwrap().unwrap();
-        second_check.await.unwrap().unwrap();
-        assert_eq!(observation.init_count.load(Ordering::Relaxed), 2);
-
-        server.abort();
-    }
-
-    #[tokio::test]
-    async fn global_rule_sticks_to_one_grpc_endpoint() {
-        let (first_port, first_observation, first_server) = start_test_server().await;
-        let (second_port, second_observation, second_server) = start_test_server().await;
-        let manager = DistributedQuotaManager::default();
-        let req = quota_request();
-        let rule = global_rule("rev-1");
-        let instances = vec![limiter_instance(first_port), limiter_instance(second_port)];
-
-        assert!(
-            manager
-                .check_with_instances(&req, &rule, &rule.rules[0], &instances)
-                .await
-                .unwrap()
-                .allowed
-        );
-        assert!(
-            manager
-                .check_with_instances(&req, &rule, &rule.rules[0], &instances)
-                .await
-                .unwrap()
-                .allowed
-        );
-
-        assert_eq!(
-            first_observation.init_count.load(Ordering::Relaxed)
-                + second_observation.init_count.load(Ordering::Relaxed),
-            1
-        );
-        assert_eq!(manager.windows.len(), 1);
-
-        first_server.abort();
-        second_server.abort();
-    }
-
-    #[tokio::test]
-    async fn endpoint_affinity_is_isolated_by_limiter_cluster() {
-        let (first_port, _, first_server) = start_test_server().await;
-        let (second_port, _, second_server) = start_test_server().await;
-        let manager = DistributedQuotaManager::default();
-        let req = quota_request();
-        let first = global_rule("rev-1");
-        let mut second = global_rule("rev-1");
-        second.cluster.as_mut().unwrap().service = "pole-limiter-canary".to_string();
-
-        manager
-            .check_with_instances(
-                &req,
-                &first,
-                &first.rules[0],
-                &[limiter_instance(first_port)],
-            )
+            .collect::<Vec<_>>();
+        match manager
+            .reserve_many(req, &specs, &[limiter_instance(port)], "test-client")
             .await
-            .unwrap();
-        manager
-            .check_with_instances(
-                &req,
-                &second,
-                &second.rules[0],
-                &[limiter_instance(second_port)],
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(manager.endpoint_bindings.len(), 2);
-        assert_eq!(manager.windows.len(), 2);
-
-        first_server.abort();
-        second_server.abort();
-    }
-
-    #[tokio::test]
-    async fn expired_window_cleanup_closes_unused_endpoint_session() {
-        let (port, _, server) = start_test_server().await;
-        let manager = DistributedQuotaManager::default();
-        let req = quota_request();
-        let rule = global_rule("rev-1");
-        let endpoint = format!("127.0.0.1:{port}");
-        manager
-            .check_with_instances(&req, &rule, &rule.rules[0], &[limiter_instance(port)])
-            .await
-            .unwrap();
-        let window = manager.windows.iter().next().unwrap().value().clone();
-        window
-            .last_used_ms
-            .store(now_millis() - window.idle_ttl_ms - 1, Ordering::Release);
-        manager
-            .check_count
-            .store(WINDOW_CLEANUP_INTERVAL, Ordering::Relaxed);
-
-        manager.cleanup_windows_if_needed();
-
-        assert!(manager.windows.is_empty());
-        assert!(!manager.sessions.contains_key(&endpoint));
-        server.abort();
-    }
-
-    #[tokio::test]
-    async fn active_window_does_not_move_when_new_grpc_instances_appear() {
-        let (port, observation, server) = start_test_server().await;
-        let manager = DistributedQuotaManager::default();
-        let req = quota_request();
-        let rule = global_rule("rev-1");
-        let affinity = window_affinity(&req, &rule, &rule.rules[0]).unwrap();
-        let active = limiter_instance(port);
-        let mut expanded = vec![active.clone()];
-        for candidate_port in 1..=128 {
-            if candidate_port == port {
-                continue;
-            }
-            expanded.push(limiter_instance(candidate_port));
-            if select_endpoint(&expanded, &affinity).unwrap() != format!("127.0.0.1:{port}") {
-                break;
-            }
+            .map_err(|error| error.to_string())?
+        {
+            DistributedReserveResult::Reserved(backend) => Ok(QuotaLease::new(
+                req.quotas.clone(),
+                req.quotas
+                    .iter()
+                    .map(|quota| QuotaConsumption {
+                        resource: quota.resource,
+                        consumed_total: if quota.resource == QuotaResource::Qps {
+                            1
+                        } else {
+                            0
+                        },
+                    })
+                    .collect(),
+                backend,
+            )),
+            DistributedReserveResult::Rejected(message) => Err(message),
         }
-        assert_ne!(
-            select_endpoint(&expanded, &affinity).unwrap(),
-            format!("127.0.0.1:{port}")
-        );
+    }
 
-        manager
-            .check_with_instances(&req, &rule, &rule.rules[0], std::slice::from_ref(&active))
-            .await
-            .unwrap();
-        manager
-            .check_with_instances(&req, &rule, &rule.rules[0], &expanded)
-            .await
-            .unwrap();
+    #[tokio::test]
+    async fn distributed_tpm_updates_every_counter_and_returns_unused_quota() {
+        let (port, observation, server) = start_server().await;
+        let manager = DistributedQuotaManager::default();
+        let rule = global_consumable_rule(limit_trigger::Resource::Token, 100, 2);
+        let lease = reserve_lease(
+            &manager,
+            &quota_request(QuotaResource::Token, 80),
+            &rule,
+            port,
+        )
+        .await
+        .unwrap();
 
-        assert_eq!(observation.init_count.load(Ordering::Relaxed), 1);
-        assert_eq!(manager.windows.len(), 1);
+        lease.update(40).await.unwrap();
+        lease.update(40).await.unwrap();
+        lease.finish(60).await.unwrap();
+        reserve_lease(
+            &manager,
+            &quota_request(QuotaResource::Token, 40),
+            &rule,
+            port,
+        )
+        .await
+        .unwrap();
+        assert!(reserve_lease(
+            &manager,
+            &quota_request(QuotaResource::Token, 41),
+            &rule,
+            port,
+        )
+        .await
+        .is_err());
 
+        assert_eq!(observation.update_count.load(Ordering::Relaxed), 1);
+        let updates = observation.update_consumptions.lock().unwrap();
+        assert_eq!(updates[0].len(), 2);
+        assert!(updates[0]
+            .iter()
+            .all(|consumption| consumption.consumed_total == 40));
         server.abort();
     }
 
     #[tokio::test]
-    async fn global_rule_ignores_http_instances_registered_with_limiter_service() {
-        let (grpc_port, observation, server) = start_test_server().await;
+    async fn distributed_rpm_commits_at_finish() {
+        let (port, _, server) = start_server().await;
         let manager = DistributedQuotaManager::default();
-        let req = quota_request();
-        let rule = global_rule("rev-1");
-        let mut http = limiter_instance(1);
-        http.protocol = "http".to_string();
-        let instances = vec![http, limiter_instance(grpc_port)];
+        let rule = global_consumable_rule(limit_trigger::Resource::Qps, 1, 1);
+        let lease = reserve_lease(&manager, &quota_request(QuotaResource::Qps, 1), &rule, port)
+            .await
+            .unwrap();
 
+        lease.finish(1).await.unwrap();
         assert!(
-            manager
-                .check_with_instances(&req, &rule, &rule.rules[0], &instances)
+            reserve_lease(&manager, &quota_request(QuotaResource::Qps, 1), &rule, port,)
                 .await
-                .unwrap()
-                .allowed
+                .is_err()
         );
-        assert_eq!(observation.init_count.load(Ordering::Relaxed), 1);
-
         server.abort();
     }
 
     #[tokio::test]
-    async fn remote_counter_labels_follow_the_canonical_method_dimension() {
-        let (port, observation, server) = start_test_server().await;
+    async fn distributed_concurrency_releases_occupancy() {
+        let (port, _, server) = start_server().await;
         let manager = DistributedQuotaManager::default();
-        let rule = global_rule("rev-1");
-        let mut get = quota_request();
-        get.method = "GET".to_string();
-        let mut post = quota_request();
-        post.method = "POST".to_string();
-        let instances = vec![limiter_instance(port)];
+        let rule = global_concurrency_rule(1);
+        let req = quota_request(QuotaResource::Concurrency, 1);
+        let lease = reserve_lease(&manager, &req, &rule, port).await.unwrap();
 
-        manager
-            .check_with_instances(&get, &rule, &rule.rules[0], &instances)
-            .await
-            .unwrap();
-        manager
-            .check_with_instances(&post, &rule, &rule.rules[0], &instances)
-            .await
-            .unwrap();
-
-        assert_eq!(
-            observation.labels.lock().unwrap().as_slice(),
-            ["GET|", "POST|"]
-        );
-
+        assert!(reserve_lease(&manager, &req, &rule, port).await.is_err());
+        lease.finish(0).await.unwrap();
+        reserve_lease(&manager, &req, &rule, port).await.unwrap();
         server.abort();
     }
 
     #[tokio::test]
-    async fn remote_counter_labels_follow_canonical_dynamic_argument_dimensions() {
-        let (port, observation, server) = start_test_server().await;
+    async fn distributed_drop_settles_once_with_last_confirmed_total() {
+        let (port, observation, server) = start_server().await;
         let manager = DistributedQuotaManager::default();
-        let mut rule = global_rule("rev-1");
-        rule.rules[0].arguments = vec![MatchArgument {
-            r#type: match_argument::Type::Header.into(),
-            key: "x-user".to_string(),
-            value: Some(MatchString {
-                r#type: match_string::MatchStringType::Exact.into(),
-                value: String::new(),
-                value_type: match_string::ValueType::Parameter.into(),
-            }),
-        }];
-        let mut alice = quota_request();
-        alice.traffic_label_provider = alice_header;
-        let mut bob = quota_request();
-        bob.traffic_label_provider = bob_header;
-        let instances = vec![limiter_instance(port)];
+        let rule = global_consumable_rule(limit_trigger::Resource::Token, 100, 1);
+        let lease = reserve_lease(
+            &manager,
+            &quota_request(QuotaResource::Token, 80),
+            &rule,
+            port,
+        )
+        .await
+        .unwrap();
+        lease.update(30).await.unwrap();
 
-        manager
-            .check_with_instances(&alice, &rule, &rule.rules[0], &instances)
-            .await
-            .unwrap();
-        manager
-            .check_with_instances(&bob, &rule, &rule.rules[0], &instances)
-            .await
-            .unwrap();
-
-        assert_eq!(
-            observation.labels.lock().unwrap().as_slice(),
-            ["GET|HEADER:x-user:alice", "GET|HEADER:x-user:bob"]
-        );
-
-        server.abort();
-    }
-
-    #[tokio::test]
-    async fn acquire_report_uses_time_adjusted_server_timestamp() {
-        const CLOCK_OFFSET_MS: i64 = 60_000;
-        let (port, observation, server) =
-            start_test_server_with_clock_offset(CLOCK_OFFSET_MS).await;
-        let manager = DistributedQuotaManager::default();
-        let req = quota_request();
-        let rule = global_rule("rev-1");
-        let instances = vec![limiter_instance(port)];
-        let earliest = now_millis() + CLOCK_OFFSET_MS;
-
-        manager
-            .check_with_instances(&req, &rule, &rule.rules[0], &instances)
-            .await
-            .unwrap();
-
+        drop(lease);
         timeout(Duration::from_secs(1), async {
-            loop {
-                if !observation.report_timestamps.lock().unwrap().is_empty() {
-                    break;
-                }
+            while observation.settle_count.load(Ordering::Relaxed) == 0 {
                 tokio::task::yield_now().await;
             }
         })
         .await
         .unwrap();
-        let latest = now_millis() + CLOCK_OFFSET_MS;
-        let timestamp = observation.report_timestamps.lock().unwrap()[0];
-        assert!(((earliest - 20)..=(latest + 20)).contains(&timestamp));
-        assert_eq!(observation.time_adjust_count.load(Ordering::Relaxed), 1);
-
+        reserve_lease(
+            &manager,
+            &quota_request(QuotaResource::Token, 70),
+            &rule,
+            port,
+        )
+        .await
+        .unwrap();
+        assert_eq!(observation.settle_count.load(Ordering::Relaxed), 1);
         server.abort();
     }
 
     #[tokio::test]
-    async fn healthy_session_periodically_refreshes_its_clock_offset() {
-        let (port, observation, server) = start_test_server().await;
+    async fn distributed_mixed_metrics_share_one_protocol_lease() {
+        let (port, observation, server) = start_server().await;
         let manager = DistributedQuotaManager::default();
-        let req = quota_request();
-        let rule = global_rule("rev-1");
-        let instances = vec![limiter_instance(port)];
-
-        manager
-            .check(&req, &rule, &rule.rules[0], &instances, "sdk-instance-id")
-            .await
-            .unwrap();
-        let endpoint = format!("127.0.0.1:{port}");
-        manager
-            .sessions
-            .get(&endpoint)
-            .unwrap()
-            .last_time_adjust_ms
-            .store(0, Ordering::Release);
-        manager
-            .check(&req, &rule, &rule.rules[0], &instances, "sdk-instance-id")
+        let rule = global_mixed_rule();
+        let lease = reserve_lease(&manager, &mixed_quota_request(), &rule, port)
             .await
             .unwrap();
 
-        assert_eq!(observation.time_adjust_count.load(Ordering::Relaxed), 2);
-        assert_eq!(
-            observation.client_ids.lock().unwrap().as_slice(),
-            ["sdk-instance-id"]
+        assert_eq!(observation.reserve_count.load(Ordering::Relaxed), 1);
+        assert!(lease.update(40).await.is_err());
+        lease
+            .update_consumptions(&[QuotaConsumption {
+                resource: QuotaResource::Token,
+                consumed_total: 40,
+            }])
+            .await
+            .unwrap();
+        lease
+            .finish_consumptions(&[QuotaConsumption {
+                resource: QuotaResource::Token,
+                consumed_total: 60,
+            }])
+            .await
+            .unwrap();
+
+        {
+            let updates = observation.update_consumptions.lock().unwrap();
+            assert_eq!(updates[0].len(), 3);
+        }
+        reserve_lease(
+            &manager,
+            &quota_request(QuotaResource::Concurrency, 1),
+            &rule,
+            port,
+        )
+        .await
+        .unwrap();
+        reserve_lease(
+            &manager,
+            &quota_request(QuotaResource::Token, 40),
+            &rule,
+            port,
+        )
+        .await
+        .unwrap();
+        assert!(
+            reserve_lease(&manager, &quota_request(QuotaResource::Qps, 1), &rule, port,)
+                .await
+                .is_err()
         );
-
-        server.abort();
-    }
-
-    #[tokio::test]
-    async fn acquire_not_found_reinitializes_windows_on_the_same_stream() {
-        let (port, observation, server) = start_test_server().await;
-        observation
-            .report_code_once
-            .store(RATE_LIMIT_NOT_FOUND_CODE, Ordering::Relaxed);
-        let manager = DistributedQuotaManager::default();
-        let req = quota_request();
-        let rule = global_rule("rev-1");
-        let instances = vec![limiter_instance(port)];
-
-        manager
-            .check_with_instances(&req, &rule, &rule.rules[0], &instances)
-            .await
-            .unwrap();
-        timeout(Duration::from_secs(1), async {
-            loop {
-                manager
-                    .check_with_instances(&req, &rule, &rule.rules[0], &instances)
-                    .await
-                    .unwrap();
-                if observation.init_count.load(Ordering::Relaxed) >= 2 {
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .unwrap();
-
-        assert_eq!(observation.init_count.load(Ordering::Relaxed), 2);
-        assert_eq!(observation.stream_count.load(Ordering::Relaxed), 1);
-        assert_eq!(observation.time_adjust_count.load(Ordering::Relaxed), 1);
-
-        server.abort();
-    }
-
-    #[tokio::test]
-    async fn invalid_counter_reconnects_and_reinitializes_before_reuse() {
-        let (port, observation, server) = start_test_server().await;
-        observation
-            .report_code_once
-            .store(RATE_LIMIT_INVALID_COUNTER_CODE, Ordering::Relaxed);
-        observation
-            .close_after_report_error
-            .store(true, Ordering::Relaxed);
-        let manager = DistributedQuotaManager::default();
-        let req = quota_request();
-        let rule = global_rule("rev-1");
-        let instances = vec![limiter_instance(port)];
-
-        manager
-            .check_with_instances(&req, &rule, &rule.rules[0], &instances)
-            .await
-            .unwrap();
-        timeout(Duration::from_secs(1), async {
-            loop {
-                manager
-                    .check_with_instances(&req, &rule, &rule.rules[0], &instances)
-                    .await
-                    .unwrap();
-                if observation.init_count.load(Ordering::Relaxed) >= 2 {
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .unwrap();
-
-        assert_eq!(observation.init_count.load(Ordering::Relaxed), 2);
-        assert_eq!(observation.stream_count.load(Ordering::Relaxed), 2);
-        assert_eq!(observation.time_adjust_count.load(Ordering::Relaxed), 2);
-
         server.abort();
     }
 }

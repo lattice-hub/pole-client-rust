@@ -11,7 +11,6 @@ use pole_rust::{
     },
     discovery::req::InstanceResponse,
     faultdetect::FaultDetectResult,
-    ratelimit::req::QuotaResponse,
 };
 use pole_specification::v1::MockResponse;
 
@@ -65,14 +64,11 @@ fn security_assertion_fails_when_sdk_request_is_allowed() {
 #[test]
 fn ratelimit_assertion_passes_when_second_quota_is_rejected() {
     let result = assert_ratelimit_quota(
-        Ok(QuotaResponse {
-            allowed: true,
-            message: "ok".to_string(),
-        }),
-        Ok(QuotaResponse {
-            allowed: false,
-            message: "limited".to_string(),
-        }),
+        Ok(()),
+        Err(PoleError::new(
+            ErrorCode::RequestLimit,
+            "limited".to_string(),
+        )),
     );
 
     assert!(result.unwrap().contains("ratelimit matched"));
@@ -80,16 +76,7 @@ fn ratelimit_assertion_passes_when_second_quota_is_rejected() {
 
 #[test]
 fn ratelimit_assertion_fails_when_second_quota_is_allowed() {
-    let result = assert_ratelimit_quota(
-        Ok(QuotaResponse {
-            allowed: true,
-            message: "ok".to_string(),
-        }),
-        Ok(QuotaResponse {
-            allowed: true,
-            message: "unexpected".to_string(),
-        }),
-    );
+    let result = assert_ratelimit_quota(Ok(()), Ok(()));
 
     assert_eq!(
         result.unwrap_err(),

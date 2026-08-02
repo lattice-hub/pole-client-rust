@@ -20,6 +20,19 @@ use crate::core::model::{
     ArgumentType,
 };
 
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum QuotaResource {
+    Qps,
+    Token,
+    Concurrency,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct QuotaAmount {
+    pub resource: QuotaResource,
+    pub amount: u32,
+}
+
 /// QuotaRequest 获取请求配额
 #[derive(Clone, Debug)]
 pub struct QuotaRequest {
@@ -33,6 +46,10 @@ pub struct QuotaRequest {
     pub method: String,
     // traffic_label_provider 流量标签提供者
     pub traffic_label_provider: fn(ArgumentType, &str) -> Option<String>,
+    // quotas 本次请求按逻辑资源预留的最大配额
+    pub quotas: Vec<QuotaAmount>,
+    // lease_ttl 租约最长存活时间；调用方应在此时间内完成结算
+    pub lease_ttl: Duration,
 }
 
 impl QuotaRequest {
@@ -50,13 +67,49 @@ impl QuotaRequest {
                 "namespace is empty".to_string(),
             ));
         }
+        if self.quotas.is_empty() {
+            return Err(PoleError::new(
+                ErrorCode::ApiInvalidArgument,
+                "quota request must contain at least one resource".to_string(),
+            ));
+        }
+        let mut resources = std::collections::HashSet::new();
+        for quota in &self.quotas {
+            if quota.amount == 0 {
+                return Err(PoleError::new(
+                    ErrorCode::ApiInvalidArgument,
+                    "quota amount must be greater than zero".to_string(),
+                ));
+            }
+            if !resources.insert(quota.resource) {
+                return Err(PoleError::new(
+                    ErrorCode::ApiInvalidArgument,
+                    format!("duplicate quota resource {:?}", quota.resource),
+                ));
+            }
+        }
+        if self.lease_ttl.is_zero() {
+            return Err(PoleError::new(
+                ErrorCode::ApiInvalidArgument,
+                "quota lease ttl must be greater than zero".to_string(),
+            ));
+        }
+        if self.lease_ttl.as_secs() > u64::from(u32::MAX)
+            || (self.lease_ttl.as_secs() == u64::from(u32::MAX)
+                && self.lease_ttl.subsec_nanos() > 0)
+        {
+            return Err(PoleError::new(
+                ErrorCode::ApiInvalidArgument,
+                "quota lease ttl exceeds the protocol limit".to_string(),
+            ));
+        }
         Ok(())
     }
-}
 
-/// QuotaResponse 配额响应
-#[derive(Clone, Debug)]
-pub struct QuotaResponse {
-    pub allowed: bool,
-    pub message: String,
+    pub(crate) fn amount_for(&self, resource: QuotaResource) -> Option<u32> {
+        self.quotas
+            .iter()
+            .find(|quota| quota.resource == resource)
+            .map(|quota| quota.amount)
+    }
 }
