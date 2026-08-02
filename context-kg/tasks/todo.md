@@ -2,11 +2,30 @@
 title: 切换 pole specification 依赖
 tags: [task, review]
 links: [lessons]
-updated: 2026-07-20
+updated: 2026-07-30
 sources: 1
 ---
 
 # 切换 pole specification 依赖
+
+## 本轮计划：核查最新配置模板渲染支持
+
+- [x] 检查仓库索引、历史记录与既有经验
+- [x] 定位客户端配置模板模型、请求与渲染执行链
+- [x] 对照最新 specification 配置协议与版本
+- [x] 运行针对性验证并确认支持边界
+- [x] 补充本轮 review 与最终结论
+
+## 本轮 review：核查最新配置模板渲染支持
+
+- 结论：当前 `develop` 客户端尚未支持最新的客户端配置模板渲染契约，只支持普通配置内容的发布、发现、缓存和监听。
+- 版本证据：客户端仍依赖 `pole-specification v0.1.0-ALPHA.38`；模板契约由 specification `be8c35c feat(config): define client-rendered template contract` 在该 tag 之后引入，目前尚未包含在客户端依赖中。
+- 能力协商缺失：配置发现请求初始 `filter` 为 `None`，加密过滤器只填充 `public_key`，未声明 `supported_template_engines = pole-mustache/v1`。
+- 执行链缺失：客户端未消费 `ConfigDiscoverResponse.render_snapshot`，没有 `pole-mustache-v1` 本地渲染、参数 schema/type 校验、目标格式校验、SHA-256 对照和失败时保留 last-known-good 的实现。
+- 模型与缓存缺失：公开 `ConfigFile` 和 `ConfigFileCacheItem` 仍只承载服务端 `ConfigFileRelease.content`，没有模板绑定、模板发布、Value Release、组合 revision 或渲染诊断模型。
+- 测试缺失：客户端没有运行 specification 的 `CONFIG_TEMPLATE_TEST_VECTORS.json`，也没有能力协商、模板快照切换、渲染失败回退、格式/哈希不一致等测试。
+- 已验证：`PROTOC=/Users/chuntao.liao/Github/pole-io/specification/source/protoc/protoc-darwin-arm64/bin/protoc RUSTFLAGS='-D warnings' cargo test --workspace config -- --nocapture` 通过；主库命中的 27 个配置相关测试、e2e 相关 3 个测试均通过，但均不覆盖模板渲染。
+- 已验证：`git diff --check` 通过；本轮仅更新任务 review，没有修改客户端实现。
 
 ## 本轮计划：升级版本并完整实现配置与治理多灰度
 
