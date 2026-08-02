@@ -19,7 +19,7 @@ exclude = ["examples/*", "benches/*", "tests/*", "e2e_tests/*", ".gitignore"]
 [dependencies]
 
 # pole spec dep
-pole-specification = { package = "pole-specification", git = "https://github.com/lattice-hub/specification.git", tag = "v0.1.0-ALPHA.38" }
+pole-specification = { package = "pole-specification", git = "https://github.com/lattice-hub/specification.git", tag = "v0.1.0-ALPHA.39" }
 
 # common dep
 bytes = {version = "1.4.0"}
