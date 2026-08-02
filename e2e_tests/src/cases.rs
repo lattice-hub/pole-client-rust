@@ -446,14 +446,8 @@ async fn run_ratelimit_behavior(
     ctx: &CaseContext<'_>,
     resource: &FlowResource,
 ) -> (
-    Result<
-        pole_rust::traffic::ratelimit::req::QuotaResponse,
-        pole_rust::core::model::error::PoleError,
-    >,
-    Result<
-        pole_rust::traffic::ratelimit::req::QuotaResponse,
-        pole_rust::core::model::error::PoleError,
-    >,
+    Result<(), pole_rust::core::model::error::PoleError>,
+    Result<(), pole_rust::core::model::error::PoleError>,
 ) {
     use pole_rust::traffic::ratelimit::api::{new_ratelimit_api_by_context, RateLimitAPI};
 
@@ -466,8 +460,14 @@ async fn run_ratelimit_behavior(
         Err(err) => return (Err(err.clone()), Err(err)),
     };
     let inputs = ratelimit_flow_inputs(resource);
-    let first = api.get_quota(inputs.quota.clone()).await;
-    let second = api.get_quota(inputs.quota).await;
+    let first = match api.reserve_quota(inputs.quota.clone()).await {
+        Ok(lease) => lease.finish(1).await,
+        Err(error) => Err(error),
+    };
+    let second = match api.reserve_quota(inputs.quota).await {
+        Ok(lease) => lease.finish(1).await,
+        Err(error) => Err(error),
+    };
     (first, second)
 }
 

@@ -47,6 +47,25 @@ fn traffic_domain_exposes_all_governance_capabilities() {
 }
 
 #[test]
+fn ratelimit_exposes_quota_lease_and_multi_resource_types() {
+    use pole_rust::traffic::ratelimit::{
+        api::{QuotaConsumption, QuotaLease},
+        req::{QuotaAmount, QuotaRequest, QuotaResource},
+    };
+
+    let _lease = std::mem::size_of::<QuotaLease>();
+    let _request = std::mem::size_of::<QuotaRequest>();
+    let _amount = QuotaAmount {
+        resource: QuotaResource::Token,
+        amount: 1,
+    };
+    let _consumption = QuotaConsumption {
+        resource: QuotaResource::Token,
+        consumed_total: 1,
+    };
+}
+
+#[test]
 fn observability_exposes_public_semantic_boundaries() {
     use pole_rust::observability::{
         api::{NoopObservabilityRecorder, ObservabilityRecorder},

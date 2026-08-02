@@ -2,7 +2,6 @@ use pole_rust::{
     core::model::{circuitbreaker::CheckResult, error::PoleError},
     discovery::req::InstanceResponse,
     faultdetect::FaultDetectResult,
-    ratelimit::req::QuotaResponse,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -51,23 +50,19 @@ pub fn assert_security_denied(
 }
 
 pub fn assert_ratelimit_quota(
-    first: Result<QuotaResponse, PoleError>,
-    second: Result<QuotaResponse, PoleError>,
+    first: Result<(), PoleError>,
+    second: Result<(), PoleError>,
 ) -> Result<String, String> {
-    let first = first.map_err(|err| format!("ratelimit first quota failed: {err}"))?;
-    if !first.allowed {
-        return Err(format!(
-            "ratelimit first quota unexpectedly rejected: {}",
-            first.message
-        ));
+    first.map_err(|err| format!("ratelimit first quota failed: {err}"))?;
+    match second {
+        Ok(()) => Err("ratelimit second quota unexpectedly allowed".to_string()),
+        Err(error) if error.to_string().contains("RequestLimit") => {
+            Ok("ratelimit matched local QPS quota".to_string())
+        }
+        Err(error) => Err(format!(
+            "ratelimit second quota failed with unexpected error: {error}"
+        )),
     }
-
-    let second = second.map_err(|err| format!("ratelimit second quota failed: {err}"))?;
-    if second.allowed {
-        return Err("ratelimit second quota unexpectedly allowed".to_string());
-    }
-
-    Ok("ratelimit matched local QPS quota".to_string())
 }
 
 pub fn assert_instance_metadata(

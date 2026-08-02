@@ -213,6 +213,11 @@ pub fn ratelimit_flow_inputs(resource: &FlowResource) -> RateLimitFlowInputs {
             namespace,
             method: "GET /e2e".to_string(),
             traffic_label_provider: ratelimit_traffic_label_provider,
+            quotas: vec![pole_rust::traffic::ratelimit::req::QuotaAmount {
+                resource: pole_rust::traffic::ratelimit::req::QuotaResource::Qps,
+                amount: 1,
+            }],
+            lease_ttl: Duration::from_secs(30),
         },
     }
 }
